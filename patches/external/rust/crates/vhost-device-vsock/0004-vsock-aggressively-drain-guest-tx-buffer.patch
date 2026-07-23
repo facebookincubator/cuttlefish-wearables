@@ -1,0 +1,133 @@
+From 407c00d3c85f75fb38ea9a1f4d7d86925ebfa1c1 Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Fri, 12 Sep 2025 16:52:20 -0700
+Subject: [PATCH 4/6] vsock: aggressively drain guest tx buffer
+
+Summary:
+Aggressively drain the guest -> host TX buffer, mitigating the flood of buffer fills when VSCode RL extention calls dumpsys display.
+
+Real fix is to have a thread per buffer, but that is more involved and this will do for now.
+
+Test Plan: ADB does not go down after 1min
+
+Rollback Plan:
+
+Reviewers: olja, achong
+
+Reviewed By: olja
+
+Subscribers: #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D82502239
+
+Tags: autoknowledge_diff_eligible
+---
+ src/vhu_vsock_thread.rs | 59 ++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 56 insertions(+), 3 deletions(-)
+
+diff --git a/src/vhu_vsock_thread.rs b/src/vhu_vsock_thread.rs
+index 5cce0a8..5764c7f 100644
+--- a/src/vhu_vsock_thread.rs
++++ b/src/vhu_vsock_thread.rs
+@@ -17,7 +17,7 @@ use std::{
+     thread,
+ };
+ 
+-use log::warn;
++use log::{warn, debug};
+ use vhost_user_backend::{VringEpollHandler, VringRwLock, VringT};
+ use virtio_queue::QueueOwnedT;
+ use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
+@@ -26,7 +26,6 @@ use vmm_sys_util::{
+     epoll::EventSet,
+     eventfd::{EventFd, EFD_NONBLOCK},
+ };
+-
+ use crate::{
+     rxops::*,
+     thread_backend::*,
+@@ -644,6 +643,7 @@ impl VhostUserVsockThread {
+             None => return Err(Error::NoMemoryConfigured),
+         };
+ 
++        let mut high_buffer_utilization_count = 0;
+         while let Some(mut avail_desc) = vring
+             .get_mut()
+             .get_queue_mut()
+@@ -667,6 +667,13 @@ impl VhostUserVsockThread {
+                 }
+             };
+ 
++            // Check if this connection is experiencing buffer pressure
++            if let Some(conn) = self.thread_backend.conn_map.get(&ConnMapKey::new(pkt.dst_port(), pkt.src_port())) {
++                if !conn.tx_buf.is_empty() {
++                    high_buffer_utilization_count += 1;
++                }
++            }
++
+             if self.thread_backend.send_pkt(&pkt).is_err() {
+                 vring
+                     .get_mut()
+@@ -691,15 +698,61 @@ impl VhostUserVsockThread {
+                 })
+                 .unwrap();
+         }
++        
++        // If many connections have high buffer utilization, perform aggressive drain
++        if high_buffer_utilization_count > 0 {
++            debug!(
++                "High buffer utilization detected in {} connections, performing aggressive drain",
++                high_buffer_utilization_count
++            );
++            self.aggressive_tx_drain();
++        }
+ 
+         Ok(used_any)
+     }
+ 
++    /// Aggressive TX buffer draining for improved flow control
++    fn aggressive_tx_drain(&mut self) {
++        let mut drained_connections = 0;
++        let mut total_bytes_drained = 0;
++        
++        // Drain all connections with pending TX data
++        for conn in self.thread_backend.conn_map.values_mut() {
++            if !conn.tx_buf.is_empty() {
++                match conn.tx_buf.flush_to(&mut conn.stream) {
++                    Ok(bytes_drained) => {
++                        if bytes_drained > 0 {
++                            conn.fwd_cnt += std::num::Wrapping(bytes_drained as u32);
++                            conn.rx_queue.enqueue(RxOps::CreditUpdate);
++                            drained_connections += 1;
++                            total_bytes_drained += bytes_drained;
++                            
++                            // Add to RX queue for processing credit update
++                            self.thread_backend.backend_rxq.push_back(
++                                ConnMapKey::new(conn.local_port, conn.peer_port)
++                            );
++                        }
++                    }
++                    Err(e) => {
++                        debug!("Failed to drain TX buffer for connection: {:?}", e);
++                    }
++                }
++            }
++        }
++        
++        if total_bytes_drained > 0 {
++            debug!(
++                "Aggressive TX drain: {} connections, {} bytes drained",
++                drained_connections, total_bytes_drained
++            );
++        }
++    }
++
+     /// Wrapper to process tx queue based on whether event idx is enabled or not.
+     pub fn process_tx(&mut self, vring_lock: &VringRwLock, event_idx: bool) -> Result<bool> {
+         if event_idx {
+             // To properly handle EVENT_IDX we need to keep calling
+-            // process_rx_queue until it stops finding new requests
++            // process_tx_queue until it stops finding new requests
+             // on the queue, as vm-virtio's Queue implementation
+             // only checks avail_index once
+             loop {

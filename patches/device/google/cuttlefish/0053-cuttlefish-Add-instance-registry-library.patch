@@ -1,0 +1,472 @@
+From 1f2f3bd0ecf386e33fab7ecfc9f341817491fe82 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 25 Mar 2026 16:03:36 -0700
+Subject: [PATCH 53/63] [cuttlefish] Add instance registry library
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+# Motivation:
+Developers running multiple emulator types simultaneously on macOS need independently-launched Cuttlefish instances to coexist. The existing single global config symlink only supports one launch_cvd invocation at a time, and the monolithic launch/stop model requires all instances to be managed together.
+
+# Overview:
+Add a new instance registry library (instance_registry.h/.cpp) that tracks
+independently-launched Cuttlefish instances via a shared JSON file
+(/tmp/cuttlefish_instances_<uid>.json).
+
+The registry supports:
+- RegisterInstance / UnregisterInstance for lifecycle management
+- LookupInstance / ListInstances for querying state
+- ClaimNextFreeInstance for atomic instance number assignment
+- IsInstanceRunning / GetInstanceConfigPath convenience helpers
+
+Concurrent access is protected by flock() and writes are atomic
+(write-to-temp + rename). Stale entries (dead PIDs) are cleaned up
+automatically during ListInstances and ClaimNextFreeInstance.
+
+No consumers yet; subsequent commits will wire this into assemble_cvd,
+launch_cvd, and stop_cvd.
+
+```
+  Registry library API (this commit):
+
+  ┌─────────────────────────────────────────────────┐
+  │          instance_registry.h/.cpp                │
+  │                                                  │
+  │  RegisterInstance(num, config_path, pid)          │
+  │  UnregisterInstance(num)                          │
+  │  LookupInstance(num) -> optional<Entry>           │
+  │  ListInstances() -> vector<Entry>  [cleans stale]│
+  │  ClaimNextFreeInstance(start) -> int              │
+  │  IsInstanceRunning(num) -> bool                  │
+  │  GetInstanceConfigPath(num) -> string            │
+  └──────────────────────┬──────────────────────────┘
+                         │ flock() + atomic write
+                         v
+    /tmp/cuttlefish_instances_<uid>.json
+    {
+      "instances": {
+        "1": { "config_path": "...", "run_cvd_pid": 100, "status": "running" },
+        "2": { "config_path": "...", "run_cvd_pid": 200, "status": "running" }
+      }
+    }
+
+  Intended usage (subsequent commits):
+
+  launch_cvd (phone)    launch_cvd (watch)
+       |                     |
+       v                     v
+  assemble_cvd           assemble_cvd
+    ClaimNextFreeInstance   ClaimNextFreeInstance
+    RegisterInstance         RegisterInstance
+       |                     |
+       v                     v
+  run_cvd (pid 100)     run_cvd (pid 200)
+
+  stop_cvd --instance_num=1     stop_cvd (no args)
+       |                             |
+       v                             v
+  LookupInstance(1)             ListInstances()
+  stop + UnregisterInstance     stop all + UnregisterInstance
+```
+
+Test Plan:
+cd /Volumes/AOSP && source build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+
+cd ~/.device/cache/emulators/greatwhite_cf_emu_arm64-37930000003761-2086149158896680 && python3 start_cuttlefish.py
+cd ~/.device/cache/emulators/tiki_cf_emu_arm64-18190000003691-1898856074838218 && python3 start_cuttlefish.py
+
+cat ~/.cuttlefish_instances.json
+HOME=~/.device/cache/emulators/greatwhite_cf_emu_arm64-37930000003761-2086149158896680 ./bin/stop_cvd --instance_num=1
+
+Reviewers: shaochi, #wearables_emulators, josephknox, guolinliu, hzalek
+
+Reviewed By: shaochi
+
+Subscribers: #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D96518711
+
+Tags: aarch64
+---
+ host/libs/config/Android.bp            |   1 +
+ host/libs/config/instance_registry.cpp | 286 +++++++++++++++++++++++++
+ host/libs/config/instance_registry.h   |  63 ++++++
+ 3 files changed, 350 insertions(+)
+ create mode 100644 host/libs/config/instance_registry.cpp
+ create mode 100644 host/libs/config/instance_registry.h
+
+diff --git a/host/libs/config/Android.bp b/host/libs/config/Android.bp
+index e357dd5c8..e43a18a07 100644
+--- a/host/libs/config/Android.bp
++++ b/host/libs/config/Android.bp
+@@ -33,6 +33,7 @@ cc_library {
+         "fetcher_config.cpp",
+         "host_tools_version.cpp",
+         "instance_nums.cpp",
++        "instance_registry.cpp",
+         "kernel_args.cpp",
+         "known_paths.cpp",
+         "logging.cpp",
+diff --git a/host/libs/config/instance_registry.cpp b/host/libs/config/instance_registry.cpp
+new file mode 100644
+index 000000000..3493184c7
+--- /dev/null
++++ b/host/libs/config/instance_registry.cpp
+@@ -0,0 +1,286 @@
++/* Copyright (c) 2026 Meta Platforms Inc. All rights reserved. */
++
++#include "host/libs/config/instance_registry.h"
++
++#include <errno.h>
++#include <signal.h>
++#include <sys/file.h>
++#include <unistd.h>
++
++#include <fstream>
++#include <set>
++#include <sstream>
++#include <string>
++#include <vector>
++
++#include <android-base/logging.h>
++#include <json/json.h>
++
++#include "common/libs/utils/environment.h"
++#include "common/libs/utils/files.h"
++#include "common/libs/utils/result.h"
++
++namespace cuttlefish {
++namespace {
++
++static constexpr char kInstances[] = "instances";
++static constexpr char kConfigPath[] = "config_path";
++static constexpr char kRunCvdPid[] = "run_cvd_pid";
++static constexpr char kStatus[] = "status";
++static constexpr char kStatusRunning[] = "running";
++
++// RAII wrapper for file-based locking via flock().
++class FileLock {
++ public:
++  static Result<FileLock> Acquire(const std::string& path) {
++    int fd = open(path.c_str(), O_RDWR | O_CREAT, 0600);
++    CF_EXPECT(fd >= 0, "Failed to open registry file: " << path);
++    int ret = flock(fd, LOCK_EX);
++    if (ret != 0) {
++      close(fd);
++      return CF_ERR("Failed to lock registry file: " << strerror(errno));
++    }
++    return FileLock(fd);
++  }
++
++  ~FileLock() {
++    if (fd_ >= 0) {
++      flock(fd_, LOCK_UN);
++      close(fd_);
++    }
++  }
++
++  FileLock(FileLock&& other) : fd_(other.fd_) { other.fd_ = -1; }
++  FileLock& operator=(FileLock&& other) {
++    if (this != &other) {
++      if (fd_ >= 0) {
++        flock(fd_, LOCK_UN);
++        close(fd_);
++      }
++      fd_ = other.fd_;
++      other.fd_ = -1;
++    }
++    return *this;
++  }
++
++  FileLock(const FileLock&) = delete;
++  FileLock& operator=(const FileLock&) = delete;
++
++ private:
++  explicit FileLock(int fd) : fd_(fd) {}
++  int fd_;
++};
++
++bool IsProcessAlive(pid_t pid) {
++  if (pid <= 0) return false;
++  return kill(pid, 0) == 0;
++}
++
++Result<Json::Value> ReadRegistry(const std::string& path) {
++  Json::Value root;
++  if (!FileExists(path)) {
++    root[kInstances] = Json::Value(Json::objectValue);
++    return root;
++  }
++  Json::CharReaderBuilder builder;
++  std::ifstream ifs(path);
++  std::string errors;
++  if (!Json::parseFromStream(builder, ifs, &root, &errors)) {
++    LOG(WARNING) << "Failed to parse registry file, starting fresh: " << errors;
++    root = Json::Value();
++    root[kInstances] = Json::Value(Json::objectValue);
++  }
++  if (!root.isMember(kInstances)) {
++    root[kInstances] = Json::Value(Json::objectValue);
++  }
++  return root;
++}
++
++Result<void> WriteRegistry(const std::string& path, const Json::Value& root) {
++  // Atomic write: write to temp file then rename
++  auto tmp_path = path + ".tmp";
++  {
++    std::ofstream ofs(tmp_path);
++    CF_EXPECT(ofs.is_open(), "Failed to open temp registry file: " << tmp_path);
++    Json::StreamWriterBuilder writer;
++    writer["indentation"] = "  ";
++    ofs << Json::writeString(writer, root);
++    CF_EXPECT(!ofs.fail(), "Failed to write temp registry file");
++  }
++  CF_EXPECT(rename(tmp_path.c_str(), path.c_str()) == 0,
++            "Failed to rename temp registry file: " << strerror(errno));
++  return {};
++}
++
++}  // namespace
++
++std::string GetRegistryFilePath() {
++  // Use a global per-user path in /tmp so that all emulator instances (which
++  // each have HOME set to their own directory) share a single registry.
++  // This lets ClaimNextFreeInstance() assign globally-unique instance numbers
++  // for port/CID allocation, while each emulator's directory is always cvd-1
++  // (local to its own HOME) via display_name.
++  return "/tmp/cuttlefish_instances_" + std::to_string(getuid()) + ".json";
++}
++
++Result<void> RegisterInstance(int instance_num,
++                              const std::string& config_path,
++                              pid_t run_cvd_pid) {
++  auto registry_path = GetRegistryFilePath();
++  auto lock = CF_EXPECT(FileLock::Acquire(registry_path));
++  auto root = CF_EXPECT(ReadRegistry(registry_path));
++
++  auto key = std::to_string(instance_num);
++  Json::Value entry;
++  entry[kConfigPath] = config_path;
++  entry[kRunCvdPid] = static_cast<int>(run_cvd_pid);
++  entry[kStatus] = kStatusRunning;
++  root[kInstances][key] = entry;
++
++  CF_EXPECT(WriteRegistry(registry_path, root));
++  return {};
++}
++
++Result<void> UnregisterInstance(int instance_num) {
++  auto registry_path = GetRegistryFilePath();
++  auto lock = CF_EXPECT(FileLock::Acquire(registry_path));
++  auto root = CF_EXPECT(ReadRegistry(registry_path));
++
++  auto key = std::to_string(instance_num);
++  root[kInstances].removeMember(key);
++
++  CF_EXPECT(WriteRegistry(registry_path, root));
++  return {};
++}
++
++Result<std::optional<InstanceRegistryEntry>> LookupInstance(int instance_num) {
++  auto registry_path = GetRegistryFilePath();
++  auto lock = CF_EXPECT(FileLock::Acquire(registry_path));
++  auto root = CF_EXPECT(ReadRegistry(registry_path));
++
++  auto key = std::to_string(instance_num);
++  if (!root[kInstances].isMember(key)) {
++    return std::nullopt;
++  }
++
++  const auto& entry = root[kInstances][key];
++  InstanceRegistryEntry result;
++  result.instance_num = instance_num;
++  result.config_path = entry[kConfigPath].asString();
++  result.run_cvd_pid = static_cast<pid_t>(entry[kRunCvdPid].asInt());
++  result.status = entry[kStatus].asString();
++  return result;
++}
++
++Result<std::vector<InstanceRegistryEntry>> ListInstances() {
++  auto registry_path = GetRegistryFilePath();
++  auto lock = CF_EXPECT(FileLock::Acquire(registry_path));
++  auto root = CF_EXPECT(ReadRegistry(registry_path));
++
++  std::vector<InstanceRegistryEntry> result;
++  bool cleaned = false;
++  auto& instances = root[kInstances];
++  std::vector<std::string> to_remove;
++
++  for (const auto& key : instances.getMemberNames()) {
++    const auto& entry = instances[key];
++    pid_t pid = static_cast<pid_t>(entry[kRunCvdPid].asInt());
++    // Clean up stale entries (dead PIDs)
++    if (!IsProcessAlive(pid)) {
++      to_remove.push_back(key);
++      cleaned = true;
++      continue;
++    }
++    InstanceRegistryEntry e;
++    e.instance_num = std::stoi(key);
++    e.config_path = entry[kConfigPath].asString();
++    e.run_cvd_pid = pid;
++    e.status = entry[kStatus].asString();
++    result.push_back(e);
++  }
++
++  for (const auto& key : to_remove) {
++    instances.removeMember(key);
++  }
++
++  if (cleaned) {
++    CF_EXPECT(WriteRegistry(registry_path, root));
++  }
++
++  return result;
++}
++
++Result<int> ClaimNextFreeInstance(int start) {
++  auto registry_path = GetRegistryFilePath();
++  auto lock = CF_EXPECT(FileLock::Acquire(registry_path));
++  auto root = CF_EXPECT(ReadRegistry(registry_path));
++
++  // Clean stale entries and collect occupied instance numbers.
++  // Also check if we already claimed an instance (Calculate() is called
++  // multiple times within a single assemble_cvd process).
++  auto& instances = root[kInstances];
++  std::set<int> occupied;
++  std::vector<std::string> to_remove;
++  auto my_pid = getpid();
++  auto parent_pid = getppid();
++  for (const auto& key : instances.getMemberNames()) {
++    pid_t pid = static_cast<pid_t>(instances[key][kRunCvdPid].asInt());
++    if (!IsProcessAlive(pid)) {
++      to_remove.push_back(key);
++    } else {
++      int key_num = std::stoi(key);
++      if ((pid == my_pid || pid == parent_pid) && key_num >= start) {
++        // We (or our parent launch_cvd) already claimed this slot.
++        // Return it instead of claiming a new one.
++        // Only match slots >= start so that a process claiming multiple
++        // instances doesn't keep returning the first one.
++        for (const auto& rm_key : to_remove) {
++          instances.removeMember(rm_key);
++        }
++        if (!to_remove.empty()) {
++          CF_EXPECT(WriteRegistry(registry_path, root));
++        }
++        return key_num;
++      }
++      occupied.insert(std::stoi(key));
++    }
++  }
++  for (const auto& key : to_remove) {
++    instances.removeMember(key);
++  }
++
++  // Find the lowest free instance number.
++  int candidate = start;
++  while (occupied.count(candidate)) {
++    candidate++;
++  }
++
++  // Register a placeholder so concurrent launchers see this slot as taken.
++  auto key = std::to_string(candidate);
++  Json::Value entry;
++  entry[kConfigPath] = "";
++  entry[kRunCvdPid] = static_cast<int>(my_pid);
++  entry[kStatus] = kStatusRunning;
++  root[kInstances][key] = entry;
++
++  CF_EXPECT(WriteRegistry(registry_path, root));
++  return candidate;
++}
++
++Result<bool> IsInstanceRunning(int instance_num) {
++  auto entry = CF_EXPECT(LookupInstance(instance_num));
++  if (!entry.has_value()) {
++    return false;
++  }
++  return IsProcessAlive(entry->run_cvd_pid);
++}
++
++Result<std::string> GetInstanceConfigPath(int instance_num) {
++  auto entry = CF_EXPECT(LookupInstance(instance_num));
++  if (!entry.has_value()) {
++    return "";
++  }
++  return entry->config_path;
++}
++
++}  // namespace cuttlefish
+diff --git a/host/libs/config/instance_registry.h b/host/libs/config/instance_registry.h
+new file mode 100644
+index 000000000..04056f724
+--- /dev/null
++++ b/host/libs/config/instance_registry.h
+@@ -0,0 +1,63 @@
++/* Copyright (c) 2026 Meta Platforms Inc. All rights reserved. */
++
++#pragma once
++
++#include <string>
++#include <vector>
++
++#include "common/libs/utils/result.h"
++
++namespace cuttlefish {
++
++// Tracks independently-launched Cuttlefish instances so that multiple
++// launch_cvd invocations can coexist without a monolithic config file.
++//
++// Registry file: /tmp/cuttlefish_instances_<uid>.json (global, shared across HOMEs)
++// Format:
++//   {
++//     "instances": {
++//       "1": { "config_path": "...", "run_cvd_pid": 12345, "status": "running" },
++//       "3": { "config_path": "...", "run_cvd_pid": 12350, "status": "running" }
++//     }
++//   }
++//
++// Concurrent access is protected by flock() on the registry file.
++// Writes are atomic (write-to-temp + rename).
++
++struct InstanceRegistryEntry {
++  int instance_num;
++  std::string config_path;
++  pid_t run_cvd_pid;
++  std::string status;  // "running" or "stopped"
++};
++
++// Returns the path to the registry file (~/.cuttlefish_instances.json).
++std::string GetRegistryFilePath();
++
++// Register an instance in the registry. Creates the file if it doesn't exist.
++Result<void> RegisterInstance(int instance_num,
++                              const std::string& config_path,
++                              pid_t run_cvd_pid);
++
++// Remove an instance from the registry.
++Result<void> UnregisterInstance(int instance_num);
++
++// Look up a single instance. Returns empty if not found.
++Result<std::optional<InstanceRegistryEntry>> LookupInstance(int instance_num);
++
++// List all registered instances, cleaning up stale entries (dead PIDs).
++Result<std::vector<InstanceRegistryEntry>> ListInstances();
++
++// Atomically find the lowest free instance number starting from `start`,
++// register a placeholder for it, and return the claimed number.
++// Used by InstanceNumsCalculator to prevent races between concurrent launches.
++Result<int> ClaimNextFreeInstance(int start);
++
++// Check if an instance is currently running (registered and PID alive).
++Result<bool> IsInstanceRunning(int instance_num);
++
++// Get the config path for a specific instance from the registry.
++// Returns empty string if not found.
++Result<std::string> GetInstanceConfigPath(int instance_num);
++
++}  // namespace cuttlefish

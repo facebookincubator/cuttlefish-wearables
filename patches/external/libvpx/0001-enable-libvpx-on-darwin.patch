@@ -1,0 +1,61 @@
+From bd70cf9b1b28e01782c0b198bd5e9e4d2d1c1dbb Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 22 Jul 2025 16:11:40 -0700
+Subject: [PATCH] enable libvpx on darwin
+
+Summary:
+# Motivation:
+This is required by target:
+```
+//device/google/cuttlefish/host/frontend/webrtc:webRTC
+```
+# Overview:
+- support building on mac
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79589017
+
+Tags: aarch64
+---
+ Android.bp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/Android.bp b/Android.bp
+index eac2642b0..85895ce7b 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -1425,7 +1425,7 @@ cc_defaults {
+ 
+     target: {
+         darwin: {
+-            enabled: false,
++            enabled: true,
+         },
+         android: {
+             sanitize: {
+@@ -1745,6 +1745,11 @@ cc_library {
+         misc_undefined: ["bounds"],
+         blocklist: "libvpx_blocklist.txt",
+     },
++    target: {
++        darwin: {
++            enabled: true
++        },
++    },
+ }
+ 
+ cc_library {

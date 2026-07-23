@@ -1,0 +1,577 @@
+From accb1d63af21e78da74a72f753e7f8a4f3032548 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 25 Mar 2026 16:05:09 -0700
+Subject: [PATCH 54/63] [cuttlefish] Add registry-aware config loading and
+ instance number auto-assignment
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+# Motivation:
+We want to make launching and stopping emulators on macOS for multi-constellation easy. Keeping track of base_instance_num argument is not easy for users and over-complicates things. The current device implementation leads to race conditions where devices fail to launch.
+
+Adding an instance registry with atomic operations allows us to provide an easy start/stop interface to users running multiple emulators.
+
+# Overview:
+Wire the instance registry into assemble_cvd, launch_cvd, run_cvd, and the
+config/instance-number subsystems so that concurrent launches get distinct
+instance numbers, register themselves in the shared registry, and can find
+their configs through a multi-step fallback.
+
+## assemble_cvd
+- Register each instance in the registry with a placeholder PID (parent
+  launch_cvd PID so the entry survives the assemble→start transition)
+- Always create the global config symlink, removing stale ones first
+- Downgrade symlink creation failure from error to warning (another
+  instance may have created it concurrently)
+- CleanPriorFiles: only delete the global config symlink if no other
+  instances are registered and alive
+
+## launch_cvd (start/main.cc)
+- Check registry for conflicts before launching (skip our own placeholder
+  entries from assemble_cvd)
+- Update registry with actual run_cvd PIDs after spawning
+
+## run_cvd (boot_state_machine.cc)
+- After daemonizing, re-register with the daemon child PID so the registry
+  tracks the long-lived process
+
+## CuttlefishConfig
+- GetForInstance(num): load config for a specific instance via registry lookup
+- Get(): add fallback chain: env var → global symlink → registry lookup via
+  $CUTTLEFISH_INSTANCE env var
+
+## InstanceNumsCalculator
+- Calculate(): replace sequential assignment with ClaimNextFreeInstance() loop
+  so concurrent launches get distinct ports, CIDs, and device IDs. Falls back
+  to sequential if registry unavailable.
+
+```
+  Launch lifecycle with registry:
+
+  launch_cvd
+       │
+       ├── assemble_cvd
+       │     ├── ClaimNextFreeInstance(start) ──> auto-assign instance num
+       │     ├── SaveConfig
+       │     │     ├── save cuttlefish_config.json
+       │     │     ├── RegisterInstance(num, config, parent_pid)
+       │     │     └── create $HOME/.cuttlefish_config.json symlink
+       │     └── CleanPriorFiles
+       │           └── only remove symlink if no other instances alive
+       │
+       ├── conflict check: registry lookup, reject if instance already running
+       │
+       └── for each instance:
+             ├── start run_cvd ──> RegisterInstance(num, config, run_cvd_pid)
+             └── (daemon mode) run_cvd re-registers with daemon child PID
+
+  CuttlefishConfig::Get() fallback chain:
+
+    $CUTTLEFISH_CONFIG_FILE set?
+        │
+        ├── yes ──> load from env var path
+        │
+        └── no
+             │
+             ├── $HOME/.cuttlefish_config.json exists?
+             │       │
+             │       ├── yes ──> load from global symlink
+             │       │
+             │       └── no ──> $CUTTLEFISH_INSTANCE set?
+             │                    │
+             │                    ├── yes ──> registry lookup ──> load config
+             │                    │
+             │                    └── no ──> fail gracefully
+
+  InstanceNumsCalculator::Calculate():
+
+    explicit --instance_nums? ──> use as-is
+         │
+         no ──> for each of num_instances:
+                  ClaimNextFreeInstance(start)
+                    ├── ok ──> use claimed num, advance start
+                    └── err ──> fallback: sequential (start + i)
+
+  PID registration timeline:
+
+    assemble_cvd        launch_cvd           run_cvd
+    RegisterInstance     RegisterInstance      (daemon mode)
+    pid = parent_pid     pid = run_cvd.pid()   RegisterInstance
+    (placeholder)        (actual runner)       pid = daemon_child
+```
+
+Test Plan:
+```
+cd /Volumes/AOSP
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+Launch two emulator types simultaneously:
+```
+cd ~/.device/cache/emulators/greatwhite_.../ && python3 start_cuttlefish.py
+cd ~/.device/cache/emulators/tiki_.../ && python3 start_cuttlefish.py
+```
+Verify both appear in: cat /tmp/cuttlefish_instances_501.json
+
+Reviewers: shaochi, #wearables_emulators, drahul, jeffreyeffendy
+
+Reviewed By: shaochi
+
+Subscribers: #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D98224591
+
+Tags: aarch64
+---
+ host/commands/assemble_cvd/assemble_cvd.cc    | 23 ++++++++--
+ host/commands/assemble_cvd/clean.cc           | 23 ++++++++--
+ host/commands/assemble_cvd/flags.cc           |  7 +++
+ host/commands/run_cvd/boot_state_machine.cc   | 17 +++++++
+ host/commands/start/main.cc                   | 45 +++++++++++++++++++
+ host/libs/config/cuttlefish_config.cpp        | 43 +++++++++++++++++-
+ host/libs/config/cuttlefish_config.h          |  7 +++
+ .../config/cuttlefish_config_instance.cpp     | 21 ++++++++-
+ host/libs/config/instance_nums.cpp            | 21 +++++++--
+ 9 files changed, 194 insertions(+), 13 deletions(-)
+
+diff --git a/host/commands/assemble_cvd/assemble_cvd.cc b/host/commands/assemble_cvd/assemble_cvd.cc
+index cd42a929f..2c5391685 100644
+--- a/host/commands/assemble_cvd/assemble_cvd.cc
++++ b/host/commands/assemble_cvd/assemble_cvd.cc
+@@ -45,6 +45,7 @@
+ #include "host/libs/config/fastboot/fastboot.h"
+ #include "host/libs/config/fetcher_config.h"
+ #include "host/libs/config/inject.h"
++#include "host/libs/config/instance_registry.h"
+ 
+ using cuttlefish::StringFromEnv;
+ 
+@@ -100,7 +101,6 @@ std::string GetLegacyConfigFilePath(const CuttlefishConfig& config) {
+ 
+ Result<void> SaveConfig(const CuttlefishConfig& tmp_config_obj) {
+   auto config_file = GetConfigFilePath(tmp_config_obj);
+-  auto config_link = GetGlobalConfigFileLink();
+   // Save the config object before starting any host process
+   CF_EXPECT(tmp_config_obj.SaveToFile(config_file),
+             "Failed to save to \"" << config_file << "\"");
+@@ -109,11 +109,28 @@ Result<void> SaveConfig(const CuttlefishConfig& tmp_config_obj) {
+             "Failed to save to \"" << legacy_config_file << "\"");
+ 
+   setenv(kCuttlefishConfigEnvVarName, config_file.c_str(), true);
++
++  // Always register each instance in the registry for multi-instance tracking.
++  for (const auto& instance : tmp_config_obj.Instances()) {
++    // PID will be updated later by launch_cvd when run_cvd starts.
++    // Use the parent (launch_cvd) PID so the entry stays alive after
++    // assemble_cvd exits, preventing concurrent launches from reclaiming
++    // this slot during the assemble→start transition.
++    CF_EXPECT(RegisterInstance(
++        instance.adb_host_port() - 6520 + 1,  // instance num
++        config_file, getppid()));
++  }
++
++  // Always create the global config symlink (unless in sandbox mode).
++  // Remove any stale symlink from a previous run first.
++  auto config_link = GetGlobalConfigFileLink();
+   // TODO(schuffelen): Find alternative for host-sandboxing mode
+   if (!InSandbox()) {
++    unlink(config_link.c_str());  // ignore error if it doesn't exist
+     if (symlink(config_file.c_str(), config_link.c_str()) != 0) {
+-      return CF_ERRNO("symlink(\"" << config_file << "\", \"" << config_link
+-                                   << ") failed");
++      LOG(WARNING) << "Could not create config symlink \"" << config_link
++                   << "\" -> \"" << config_file << "\": " << strerror(errno)
++                   << ". Another instance may have created it.";
+     }
+   }
+ 
+diff --git a/host/commands/assemble_cvd/clean.cc b/host/commands/assemble_cvd/clean.cc
+index 00736353c..7c4843c4b 100644
+--- a/host/commands/assemble_cvd/clean.cc
++++ b/host/commands/assemble_cvd/clean.cc
+@@ -17,6 +17,7 @@
+ 
+ #include <dirent.h>
+ #include <errno.h>
++#include <signal.h>
+ #include <sys/stat.h>
+ 
+ #include <vector>
+@@ -29,6 +30,7 @@
+ #include "common/libs/utils/result.h"
+ #include "common/libs/utils/subprocess.h"
+ #include "host/libs/config/config_utils.h"
++#include "host/libs/config/instance_registry.h"
+ 
+ namespace cuttlefish {
+ namespace {
+@@ -135,10 +137,23 @@ Result<void> CleanPriorFiles(const std::vector<std::string>& paths,
+ 
+ Result<void> CleanPriorFiles(const std::set<std::string>& preserving,
+                              const std::vector<std::string>& clean_dirs) {
+-  std::vector<std::string> paths = {
+-      // The global link to the config file
+-      GetGlobalConfigFileLink(),
+-  };
++  std::vector<std::string> paths;
++
++  // Only delete the global symlink if no other instances are registered and alive
++  auto instances = ListInstances();
++  bool others_running = false;
++  if (instances.ok()) {
++    for (const auto& entry : *instances) {
++      if (kill(entry.run_cvd_pid, 0) == 0) {
++        others_running = true;
++        break;
++      }
++    }
++  }
++  if (!others_running) {
++    paths.push_back(GetGlobalConfigFileLink());
++  }
++
+   paths.insert(paths.end(), clean_dirs.begin(), clean_dirs.end());
+   using android::base::Join;
+   CF_EXPECT(CleanPriorFiles(paths, preserving),
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index febc8b926..411e2e1c6 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -1666,6 +1666,13 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+                                 << guest_configs.size());
+     instance.set_target_arch(guest_configs[instance_index].target_arch);
+     instance.set_device_type(guest_configs[instance_index].device_type);
++
++    // Set display_name to the batch-local index so the instance directory
++    // is always cvd-1 (for single instance) regardless of the globally-
++    // assigned instance number used for port allocation.
++    instance.set_display_name(kCvdNamePrefix +
++                              std::to_string(instance_index + 1));
++
+     instance.set_guest_android_version(
+         guest_configs[instance_index].android_version_number);
+     instance.set_console(console_vec[instance_index]);
+diff --git a/host/commands/run_cvd/boot_state_machine.cc b/host/commands/run_cvd/boot_state_machine.cc
+index d9fb1e511..55d669911 100644
+--- a/host/commands/run_cvd/boot_state_machine.cc
++++ b/host/commands/run_cvd/boot_state_machine.cc
+@@ -23,6 +23,7 @@
+ 
+ #include <android-base/file.h>
+ #include <android-base/logging.h>
++#include <android-base/parseint.h>
+ #include <gflags/gflags.h>
+ #include <grpc/grpc.h>
+ #include <grpcpp/channel.h>
+@@ -38,6 +39,8 @@
+ #include "host/commands/kernel_log_monitor/kernel_log_server.h"
+ #include "host/commands/kernel_log_monitor/utils.h"
+ #include "host/commands/run_cvd/validate.h"
++#include "host/libs/config/config_constants.h"
++#include "host/libs/config/instance_registry.h"
+ #include "host/libs/command_util/runner/defs.h"
+ #include "host/libs/command_util/util.h"
+ #include "host/libs/config/feature.h"
+@@ -169,6 +172,20 @@ Result<SharedFD> DaemonizeLauncher(const CuttlefishConfig& config) {
+       LOG(ERROR) << "Failed to daemonize child process: " << strerror(errno);
+       std::exit(RunnerExitCodes::kDaemonizationError);
+     }
++    // Re-register with the daemon PID so the registry tracks the
++    // long-lived process, not the short-lived parent.
++    {
++      int32_t instance_num;
++      if (android::base::ParseInt(instance.id(), &instance_num)) {
++        const char* conf = getenv(kCuttlefishConfigEnvVarName);
++        auto result = RegisterInstance(instance_num, conf ? conf : "",
++                                       getpid());
++        if (!result.ok()) {
++          LOG(WARNING) << "Failed to re-register after daemonize: "
++                       << result.error().FormatForEnv();
++        }
++      }
++    }
+     // Redirect standard I/O
+     auto log_path = instance.launcher_log_path();
+     auto log = SharedFD::Open(log_path.c_str(), O_CREAT | O_WRONLY | O_APPEND,
+diff --git a/host/commands/start/main.cc b/host/commands/start/main.cc
+index 1c39e3e05..6760c2d5e 100644
+--- a/host/commands/start/main.cc
++++ b/host/commands/start/main.cc
+@@ -39,6 +39,7 @@
+ #include "host/libs/config/fetcher_config.h"
+ #include "host/libs/config/host_tools_version.h"
+ #include "host/libs/config/instance_nums.h"
++#include "host/libs/config/instance_registry.h"
+ 
+ DEFINE_int32(num_instances, CF_DEFAULTS_NUM_INSTANCES,
+              "Number of Android guests to launch");
+@@ -242,6 +243,30 @@ int CvdInternalStartMain(int argc, char** argv) {
+   setenv(kCuttlefishInstanceEnvVarName, instance_num_str.c_str(),
+          /* overwrite */ 1);
+ 
++  // Check registry for conflicts with already-running instances.
++  // Skip entries registered by the current launch pipeline (assemble_cvd
++  // registers a placeholder with getpid() which may be launch_cvd itself
++  // when running in-process).
++  auto my_pid = getpid();
++  auto parent_pid = getppid();
++  for (auto num : *instance_nums) {
++    auto running = IsInstanceRunning(num);
++    if (running.ok() && *running) {
++      auto entry = LookupInstance(num);
++      if (entry.ok() && entry->has_value()) {
++        auto registered_pid = entry->value().run_cvd_pid;
++        if (registered_pid == my_pid || registered_pid == parent_pid) {
++          continue;  // Placeholder from our own assemble phase
++        }
++        LOG(ERROR) << "Instance " << num << " is already running (pid "
++                   << registered_pid
++                   << "). Stop it first with: stop_cvd --instance_num="
++                   << num;
++        return -1;
++      }
++    }
++  }
++
+ #if defined(__BIONIC__)
+   // These environment variables are needed in case when Bionic is used.
+   // b/171754977
+@@ -286,6 +311,20 @@ int CvdInternalStartMain(int argc, char** argv) {
+ 
+     auto run_proc = StartRunner(std::move(runner_stdin), instance,
+                                 forwarder.ArgvForSubprocess(RunnerPath()));
++
++    // Update the registry with the actual run_cvd PID.
++    {
++      int32_t instance_id;
++      if (android::base::ParseInt(instance.id(), &instance_id)) {
++        auto reg_result = RegisterInstance(instance_id, conf_path,
++                                           run_proc.pid());
++        if (!reg_result.ok()) {
++          LOG(ERROR) << "Failed to register instance " << instance_id
++                     << " in registry: " << reg_result.error().FormatForEnv();
++        }
++      }
++    }
++
+     runners.push_back(std::move(run_proc));
+   }
+ 
+@@ -299,6 +338,12 @@ int CvdInternalStartMain(int argc, char** argv) {
+       LOG(DEBUG) << "run_cvd exited successfully.";
+     }
+   }
++
++  // Don't explicitly unregister here. In daemon mode, run_cvd re-registers
++  // with the daemon child PID, and unregistering would remove that entry.
++  // In foreground mode, the dead PID will be cleaned up automatically by
++  // ListInstances the next time it runs.
++
+   return run_cvd_failure ? -1 : 0;
+ }
+ 
+diff --git a/host/libs/config/cuttlefish_config.cpp b/host/libs/config/cuttlefish_config.cpp
+index 9a9358daa..4ee5c02c8 100644
+--- a/host/libs/config/cuttlefish_config.cpp
++++ b/host/libs/config/cuttlefish_config.cpp
+@@ -34,6 +34,7 @@
+ 
+ #include "common/libs/utils/environment.h"
+ #include "common/libs/utils/files.h"
++#include "host/libs/config/instance_registry.h"
+ #include "host/libs/vm_manager/crosvm_manager.h"
+ #include "host/libs/vm_manager/gem5_manager.h"
+ #include "host/libs/vm_manager/qemu_manager.h"
+@@ -607,12 +608,45 @@ CuttlefishConfig::GetFromFile(const std::string& path) {
+   return std::unique_ptr<const CuttlefishConfig>(BuildConfigImpl(path));
+ }
+ 
++/*static*/ std::unique_ptr<const CuttlefishConfig>
++CuttlefishConfig::GetForInstance(int instance_num) {
++  auto result = GetInstanceConfigPath(instance_num);
++  if (!result.ok() || result->empty()) {
++    LOG(ERROR) << "No config found in registry for instance " << instance_num;
++    return nullptr;
++  }
++  return GetFromFile(*result);
++}
++
+ // Creates the (initially empty) config object and populates it with values from
+ // the config file if the CUTTLEFISH_CONFIG_FILE env variable is present.
++// Falls back to the global config symlink, then to the instance registry.
+ // Returns nullptr if there was an error loading from file
+ /*static*/ const CuttlefishConfig* CuttlefishConfig::Get() {
+   auto config_file_path =
+-      StringFromEnv(kCuttlefishConfigEnvVarName, GetGlobalConfigFileLink());
++      StringFromEnv(kCuttlefishConfigEnvVarName, "");
++  if (config_file_path.empty()) {
++    // Try global config symlink first
++    auto global_link = GetGlobalConfigFileLink();
++    if (FileExists(global_link)) {
++      config_file_path = global_link;
++    } else {
++      // Fall back to instance registry: check CUTTLEFISH_INSTANCE env var
++      auto instance_str = StringFromEnv("CUTTLEFISH_INSTANCE", "");
++      if (!instance_str.empty()) {
++        int instance_num = std::atoi(instance_str.c_str());
++        if (instance_num > 0) {
++          auto result = GetInstanceConfigPath(instance_num);
++          if (result.ok() && !result->empty()) {
++            config_file_path = *result;
++          }
++        }
++      }
++      if (config_file_path.empty()) {
++        config_file_path = global_link;  // will fail gracefully
++      }
++    }
++  }
+   static std::shared_ptr<CuttlefishConfig> config(
+       BuildConfigImpl(config_file_path));
+   return config.get();
+@@ -721,6 +755,13 @@ CuttlefishConfig::InstanceSpecific CuttlefishConfig::ForInstance(int num) const
+ 
+ CuttlefishConfig::InstanceSpecific CuttlefishConfig::ForInstanceName(
+     const std::string& name) const {
++  // Try matching by display_name first (handles type-based names like "cvd-phone").
++  for (const auto& instance : Instances()) {
++    if (instance.display_name() == name) {
++      return instance;
++    }
++  }
++  // Legacy fallback: parse as numeric instance.
+   return ForInstance(InstanceFromString(name));
+ }
+ 
+diff --git a/host/libs/config/cuttlefish_config.h b/host/libs/config/cuttlefish_config.h
+index 2609d7556..35e2e333c 100644
+--- a/host/libs/config/cuttlefish_config.h
++++ b/host/libs/config/cuttlefish_config.h
+@@ -90,6 +90,9 @@ class CuttlefishConfig {
+   static const CuttlefishConfig* Get();
+   static std::unique_ptr<const CuttlefishConfig> GetFromFile(
+       const std::string& path);
++  // Load config for a specific instance number using the instance registry.
++  static std::unique_ptr<const CuttlefishConfig> GetForInstance(
++      int instance_num);
+   static bool ConfigExists();
+ 
+   CuttlefishConfig();
+@@ -600,6 +603,9 @@ class CuttlefishConfig {
+ 
+     DeviceType device_type() const;
+ 
++    // User-facing name (e.g. "cvd-phone"). Falls back to "cvd-N" if unset.
++    std::string display_name() const;
++
+     Arch target_arch() const;
+ 
+     int cpus() const;
+@@ -843,6 +849,7 @@ class CuttlefishConfig {
+     void set_enable_virtiofs(const bool enable_virtiofs);
+     void set_kgdb(bool kgdb);
+     void set_device_type(DeviceType type);
++    void set_display_name(const std::string& name);
+     void set_target_arch(Arch target_arch);
+     void set_cpus(int cpus);
+     void set_vcpu_config_path(const std::string& vcpu_config_path);
+diff --git a/host/libs/config/cuttlefish_config_instance.cpp b/host/libs/config/cuttlefish_config_instance.cpp
+index e12098ac3..d594bd93c 100644
+--- a/host/libs/config/cuttlefish_config_instance.cpp
++++ b/host/libs/config/cuttlefish_config_instance.cpp
+@@ -188,7 +188,7 @@ const Json::Value* CuttlefishConfig::InstanceSpecific::Dictionary() const {
+ }
+ 
+ std::string CuttlefishConfig::InstanceSpecific::instance_dir() const {
+-  return config_->InstancesPath(IdToName(id_));
++  return config_->InstancesPath(display_name());
+ }
+ 
+ std::string CuttlefishConfig::InstanceSpecific::instance_internal_dir() const {
+@@ -196,6 +196,8 @@ std::string CuttlefishConfig::InstanceSpecific::instance_internal_dir() const {
+ }
+ 
+ std::string CuttlefishConfig::InstanceSpecific::instance_uds_dir() const {
++  // UDS paths are under /tmp (global), so use the globally-unique instance
++  // number, not display_name which is local to each HOME.
+   return config_->InstancesUdsPath(IdToName(id_));
+ }
+ 
+@@ -1442,6 +1444,21 @@ DeviceType CuttlefishConfig::InstanceSpecific::device_type() const {
+   return static_cast<DeviceType>((*Dictionary())[kDeviceType].asInt());
+ }
+ 
++static constexpr char kDisplayName[] = "display_name";
++void CuttlefishConfig::MutableInstanceSpecific::set_display_name(
++    const std::string& name) {
++  (*Dictionary())[kDisplayName] = name;
++  // Update legacy instance_dir for acloud compatibility
++  (*Dictionary())[kInstanceDir] = config_->InstancesPath(name);
++}
++std::string CuttlefishConfig::InstanceSpecific::display_name() const {
++  const auto& val = (*Dictionary())[kDisplayName];
++  if (val.isNull() || val.asString().empty()) {
++    return IdToName(id_);
++  }
++  return val.asString();
++}
++
+ static constexpr char kEnableSandbox[] = "enable_sandbox";
+ void CuttlefishConfig::MutableInstanceSpecific::set_enable_sandbox(const bool enable_sandbox) {
+   (*Dictionary())[kEnableSandbox] = enable_sandbox;
+@@ -2178,7 +2195,7 @@ std::string CuttlefishConfig::InstanceSpecific::PerInstanceLogPath(
+ }
+ 
+ std::string CuttlefishConfig::InstanceSpecific::instance_name() const {
+-  return IdToName(id_);
++  return display_name();
+ }
+ 
+ std::string CuttlefishConfig::InstanceSpecific::id() const { return id_; }
+diff --git a/host/libs/config/instance_nums.cpp b/host/libs/config/instance_nums.cpp
+index 5cf2a7c90..ea4c82cb2 100644
+--- a/host/libs/config/instance_nums.cpp
++++ b/host/libs/config/instance_nums.cpp
+@@ -22,6 +22,7 @@
+ #include "common/libs/utils/contains.h"
+ #include "common/libs/utils/flag_parser.h"
+ #include "host/libs/config/config_utils.h"
++#include "host/libs/config/instance_registry.h"
+ 
+ namespace cuttlefish {
+ 
+@@ -240,13 +241,27 @@ Result<std::vector<std::int32_t>> InstanceNumsCalculator::CalculateFromFlags() {
+ Result<std::vector<std::int32_t>> InstanceNumsCalculator::Calculate() {
+   CF_EXPECT(Result<void>(setter_result_));
+ 
+-  if (!instance_nums_.empty() || base_instance_num_) {
++  // If explicit --instance_nums were given, use them as-is (no auto-assign).
++  if (!instance_nums_.empty()) {
+     return CalculateFromFlags();
+   }
+ 
++  // Determine the starting instance number from flags or system default.
++  std::int32_t start = base_instance_num_.value_or(GetInstance());
++  int num = num_instances_.value_or(1);
++
++  // Atomically claim free instance numbers from the registry so that
++  // concurrent launches get distinct ports, CIDs, and device IDs.
+   std::vector<std::int32_t> instance_nums;
+-  for (int i = 0; i < num_instances_.value_or(1); i++) {
+-    instance_nums.push_back(i + GetInstance());
++  for (int i = 0; i < num; i++) {
++    auto claimed = ClaimNextFreeInstance(start);
++    if (!claimed.ok()) {
++      // Registry unavailable, fall back to sequential assignment.
++      instance_nums.push_back(start + i);
++      continue;
++    }
++    instance_nums.push_back(*claimed);
++    start = *claimed + 1;
+   }
+   CF_EXPECT(instance_nums.size() > 0, "no instance nums");
+   return instance_nums;

@@ -1,0 +1,46 @@
+From 7a1eddf97015add40eb5212601b64f1d135e0e13 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:40:03 -0700
+Subject: [PATCH 04/11] dont use asan on darwin for rust modules
+
+Summary:
+# Motivation:
+One of the host tools tries to build an asan version of a rust binary. The asan tool chain does not exist for darwin.
+# Overview:
+- add darwin to check for asan platform
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ilyatsunaev, jmgao, ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79567167
+
+Tags: aarch64
+---
+ rust/sanitize.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/rust/sanitize.go b/rust/sanitize.go
+index 50f55ce75..4f1558379 100644
+--- a/rust/sanitize.go
++++ b/rust/sanitize.go
+@@ -111,7 +111,7 @@ func (sanitize *sanitize) begin(ctx BaseModuleContext) {
+ 	}
+ 
+ 	// Disable sanitizers for musl x86 modules, rustc does not support any sanitizers.
+-	if ctx.Os() == android.LinuxMusl && ctx.Arch().ArchType == android.X86 {
++	if (ctx.Os() == android.LinuxMusl && ctx.Arch().ArchType == android.X86) || ctx.Darwin() {
+ 		s.Never = proptools.BoolPtr(true)
+ 	}
+ 

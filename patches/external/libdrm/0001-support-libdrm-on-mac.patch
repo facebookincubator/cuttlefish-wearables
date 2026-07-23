@@ -1,0 +1,105 @@
+From 6d9eea4f14e74cd9e99902424d275c7f27cb7cd9 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:51:49 -0700
+Subject: [PATCH] support libdrm on mac
+
+Summary:
+# Motivation:
+libdrm is needed by webrtc
+# Overview:
+- add darwin support to libdrm
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79567881
+
+Tags: aarch64
+---
+ Android.bp | 30 +++++++++++++++++++++++++++---
+ 1 file changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/Android.bp b/Android.bp
+index 149aed68..7eddcbac 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -45,12 +45,10 @@ cc_defaults {
+         "-D_GNU_SOURCE",
+ 
+         // XXX: Consider moving these to config.h analogous to autoconf.
+-        "-DMAJOR_IN_SYSMACROS=1",
+         "-DHAVE_VISIBILITY=1",
+         "-DHAVE_LIBDRM_ATOMIC_PRIMITIVES=1",
+ 
+         "-Wall",
+-        "-Werror",
+         "-Wno-deprecated-declarations",
+         "-Wno-format",
+         "-Wno-gnu-variable-sized-type-not-at-end",
+@@ -61,6 +59,14 @@ cc_defaults {
+         "-Wno-unused-variable",
+     ],
+     export_system_include_dirs: ["."],
++    target: {
++        linux: {
++            cflags: [
++                "-DMAJOR_IN_SYSMACROS=1",
++                "-Werror",
++            ],
++        },
++    },
+ }
+ 
+ cc_library_headers {
+@@ -69,13 +75,18 @@ cc_library_headers {
+     host_supported: true,
+     defaults: ["libdrm_defaults"],
+     export_include_dirs: [
+-        "include/drm",
++        "include",
+         "android",
+     ],
+     apex_available: [
+         "//apex_available:platform",
+         "com.android.virt",
+     ],
++    target: {
++        darwin: {
++            enabled: true
++        }
++    }
+ }
+ 
+ genrule {
+@@ -118,6 +129,19 @@ cc_library {
+         "-Wno-sign-compare",
+         "-Wno-tautological-compare",
+     ],
++    target: {
++        darwin: {
++            enabled: true,
++            cflags: [
++                "-Wno-error",
++            ],
++        },
++        linux: {
++            cflags: [
++                "-Werror",
++            ],
++        },
++    },
+ }
+ 
+ // Rust bindings for libdrm, generated in a way compatible with drm-ffi crate.

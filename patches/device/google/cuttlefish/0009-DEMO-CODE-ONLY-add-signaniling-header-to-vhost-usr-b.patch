@@ -1,0 +1,42 @@
+From 4cfafc1a6300faf301a0bb7eb345e1129318f0a3 Mon Sep 17 00:00:00 2001
+From: Olya Arkhangelskaia <olja@meta.com>
+Date: Wed, 6 Aug 2025 11:58:49 +0100
+Subject: [PATCH 09/63] DEMO CODE ONLY add signaniling header to
+ vhost-usr-block dev
+
+Summary: This is a part of D77880815.
+
+Test Plan:
+ build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+Rollback Plan:
+
+Reviewers: achong, tcare, benthomas
+
+Reviewed By: achong
+
+Subscribers: ryanyu
+
+Differential Revision: https://phabricator.intern.facebook.com/D79719273
+
+Tags: aarch64
+
+Privacy Context Container: L1248481
+---
+ host/libs/vm_manager/vhost_user_block.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/host/libs/vm_manager/vhost_user_block.cpp b/host/libs/vm_manager/vhost_user_block.cpp
+index bc7005546..e3dc841e5 100644
+--- a/host/libs/vm_manager/vhost_user_block.cpp
++++ b/host/libs/vm_manager/vhost_user_block.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "host/libs/vm_manager/vhost_user.h"
+ 
++#include <signal.h>
+ #include <sys/socket.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>

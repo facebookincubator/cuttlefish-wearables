@@ -1,0 +1,38 @@
+From 6ee23a004ba2622d1b2ed0ad0fb3a81b85d34c19 Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Mon, 7 Jul 2025 11:34:47 -0700
+Subject: [PATCH] Gatekeeper darwin fixes
+
+Summary: Build fixes for gatekeeper
+
+Test Plan: mmm system/gatekeeper
+
+Rollback Plan:
+
+Reviewers: olja, achong, benthomas
+
+Reviewed By: olja
+
+Subscribers: ryanyu
+
+Differential Revision: https://phabricator.intern.facebook.com/D77881129
+---
+ gatekeeper.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/gatekeeper.cpp b/gatekeeper.cpp
+index cc6b1a3..4639e9c 100644
+--- a/gatekeeper.cpp
++++ b/gatekeeper.cpp
+@@ -20,6 +20,11 @@
+ #include <winsock2.h>
+ #define htobe32 htonl
+ #define htobe64 htonll_gk
++#elif defined(__APPLE__)
++#include <machine/endian.h>
++#include <libkern/OSByteOrder.h>
++#define htobe32 OSSwapHostToBigInt32
++#define htobe64 OSSwapHostToBigInt64
+ #else
+ #include <endian.h>
+ #endif

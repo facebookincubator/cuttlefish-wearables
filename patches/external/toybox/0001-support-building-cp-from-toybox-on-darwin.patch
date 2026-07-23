@@ -1,0 +1,87 @@
+From c748980d8959aff955219f7761d11a951ec752cf Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:53:52 -0700
+Subject: [PATCH] support building cp from toybox on darwin
+
+Summary:
+# Motivation:
+Building cuttlefish darwin host tools
+```
+FAILED: out/soong/.intermediates/external/toybox/toybox/darwin_x86_64/obj/external/toybox/toys/posix/cp.o
+ prebuilts/clang/host/darwin-x86/clang-r547379/bin/clang -c  -fPIC -funwind-tables -fno-omit-frame-pointer -isysroot /Applications/Xcode_16.4.0_16F6_fb.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk -mmacosx-version-min=10.14 -DMACOSX_DEPLOYMENT_TARGET=10.14 -m64 -integrated-as -fstack-protector-strong -O2 -Wall -Wextra -Winit-self -Wpointer-arith -Wunguarded-availability -Werror=date-time -Werror=int-conversion -Werror=pragma-pack -Werror=pragma-pack-suspicious-include -Werror=sizeof-array-div -Werror=string-plus-int -Werror=unreachable-code-loop-increment -Wno-error=deprecated-declarations -Wno-c23-extensions -Wno-c99-designator -Wno-gnu-folding-constant -Wno-inconsistent-missing-override -Wno-error=reorder-init-list -Wno-reorder-init-list -Wno-sign-compare -Wno-unused -DANDROID -DNDEBUG -UDEBUG -D__compiler_offsetof=__builtin_offsetof -D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__ -faddrsig -fdebug-default-version=5 -Wno-unused-command-line-argument -fcolor-diagnostics -ffp-contract=off -fno-exceptions -fno-strict-aliasing -fmessage-length=0 -gsimple-template-names -no-canonical-prefixes -ftrivial-auto-var-init=zero -g  -Wno-enum-compare -Wno-enum-compare-switch -Wno-null-pointer-arithmetic -Wno-null-dereference -Wno-pointer-compare -Wno-final-dtor-non-final-class -Wno-psabi -Wno-null-pointer-subtraction -Wno-string-concatenation -Wno-deprecated-non-prototype -Wno-unused -Wno-deprecated -Wno-error=format -B/Applications/Xcode_16.4.0_16F6_fb.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin -target x86_64-apple-darwin -fPIE  -Iexternal/toybox/android/mac -Iexternal/toybox -Iexternal/boringssl/src/include -Iexternal/zlib -Os -Wall -Werror -Wno-char-subscripts -Wno-deprecated-declarations -Wno-invalid-source-encoding -Wno-missing-field-initializers -Wno-pointer-arith -Wno-sign-compare -Wno-string-plus-int -Wno-unused-parameter -Wno-unused-variable -funsigned-char -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables '-DTOYBOX_VENDOR="-android"' -Wno-pointer-sign -Wno-macro-redefined -std=gnu23 -Isystem/core/include -Isystem/logging/liblog/include -Isystem/media/audio/include -Ihardware/libhardware/include -Ihardware/libhardware_legacy/include -Ihardware/ril/include -Iframeworks/native/include -Iframeworks/native/opengl/include -Iframeworks/av/include  -Werror=bool-operation -Werror=dangling -Werror=format-insufficient-args -Werror=implicit-int-float-conversion -Werror=int-in-bool-context -Werror=int-to-pointer-cast -Werror=pointer-to-int-cast -Werror=xor-used-as-pow -Wimplicit-int-float-conversion -Wno-void-pointer-to-enum-cast -Wno-void-pointer-to-int-cast -Wno-pointer-to-int-cast -Wno-unused-variable -Wno-missing-field-initializers -Wno-packed-non-pod -Werror=address-of-temporary -Werror=incompatible-function-pointer-types -Werror=null-dereference -Werror=return-type -Wno-tautological-constant-compare -Wno-tautological-type-limit-compare -Wno-implicit-int-float-conversion -Wno-tautological-overlap-compare -Wno-deprecated-copy -Wno-range-loop-construct -Wno-zero-as-null-pointer-constant -Wno-deprecated-anon-enum-enum-conversion -Wno-deprecated-enum-enum-conversion -Wno-error=pessimizing-move -Wno-non-c-typedef-for-linkage -Wno-align-mismatch -Wno-error=unused-but-set-variable -Wno-error=unused-but-set-parameter -Wno-error=deprecated-builtins -Wno-error=deprecated -Wno-error=invalid-offsetof -Wno-reorder-init-list -Wno-implicit-fallthrough -Wno-c99-designator -Wno-implicit-int-float-conversion -Wno-int-in-bool-context -Wno-alloca -Wno-dangling-gsl -Wno-pointer-compare -Wno-final-dtor-non-final-class -Wno-incomplete-setjmp-declaration -Wno-sizeof-array-div -Wno-xor-used-as-pow -Wno-c++17-extensions -flax-vector-conversions=all -Wno-tautological-overlap-compare -Wno-range-loop-analysis -Wno-invalid-partial-specialization -Wno-deprecated-copy -Wno-misleading-indentation -Wno-zero-as-null-pointer-constant -Wno-deprecated-enum-enum-conversion -Wno-deprecated-anon-enum-enum-conversion -Wno-bool-operation -Wno-unused-comparison -Wno-string-compare -Wno-wrong-info -Wno-unsequenced -Wno-unknown-warning-option -Wno-unused-variable -Wno-unused-value -Wno-unused-parameter -Wno-non-c-typedef-for-linkage -Wno-typedef-redefinition -Wno-format -Wno-void-pointer-to-int-cast -Wno-pointer-to-int-cast -Wno-string-concatenation -Wno-void-pointer-to-enum-cast -Wno-incompatible-pointer-types -Wno-format-invalid-specifier-fcommon  -Wno-self-assign -Wno-format -Wno-unused-label -Wno-pointer-sign -Wno-writable-strings -Wno-missing-declarations -Wno-reorder-ctor -Wno-unused-function -Wno-deprecated-dynamic-exception-spec -Wno-vla-cxx-extension -Wno-cast-function-type-mismatch  -fcommon -Wno-format-insufficient-args -Wno-misleading-indentation -Wno-bitwise-instead-of-logical -Wno-unused -Wno-unused-parameter -Wno-unused-but-set-parameter -Wno-unqualified-std-cast-call -Wno-array-parameter -Wno-gnu-offsetof-extensions -Wno-pessimizing-move -MD -MF out/soong/.intermediates/external/toybox/toybox/darwin_x86_64/obj/external/toybox/toys/posix/cp.o.d -o out/soong/.intermediates/external/toybox/toybox/darwin_x86_64/obj/external/toybox/toys/posix/cp.o external/toybox/toys/posix/cp.c
+external/toybox/toys/posix/cp.c:280:16: error: 'mknodat' is only available on macOS 13.0 or newer [-Werror,-Wunguarded-availability-new]
+  280 |             : !mknodat(cfd, catch, try->st.st_mode, try->st.st_rdev))
+      |                ^~~~~~~
+/Applications/Xcode_16.4.0_16F6_fb.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/usr/include/sys/stat.h:396:9: note: 'mknodat' has been marked as being introduced in macOS 13.0 here, but the deployment target is macOS 10.14.0
+  396 | int     mknodat(int, const char *, mode_t, dev_t) __API_AVAILABLE(macos(13.0), ios(16.0), tvos(16.0), watchos(9.0));
+      |         ^
+external/toybox/toys/posix/cp.c:280:16: note: enclose 'mknodat' in a __builtin_available check to silence this warning
+  276 |         if (S_ISLNK(try->st.st_mode)
+  277 |             ? readlinkat0(tfd, try->name, toybuf, sizeof(toybuf)) &&
+  278 |               (!unlinkat(cfd, catch, 0) || ENOENT == errno) &&
+  279 |               !symlinkat(toybuf, cfd, catch)
+  280 |             : !mknodat(cfd, catch, try->st.st_mode, try->st.st_rdev))
+      |                ^~~~~~~
+  281 |         {
+  282 |           err = 0;
+  283 |           fdout = AT_FDCWD;
+  284 |         }
+      |
+1 error generated.
+```
+# Overview:
+- mknodat is not available with default target version
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+```
+/Applications/Xcode_16.4.0_16F6_fb.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/usr/include/sys/stat.h:396:9: note: 'mknodat' has been marked as being introduced in macOS 13.0 here, but the deployment target is macOS 10.14.0
+  396 | int     mknodat(int, const char *, mode_t, dev_t) __API_AVAILABLE(macos(13.0), ios(16.0), tvos(16.0), watchos(9.0));
+      |         ^
+external/toybox/toys/posix/cp.c:280:16: note: enclose 'mknodat' in a __builtin_available check to silence this warning
+  276 |         if (S_ISLNK(try->st.st_mode)
+  277 |             ? readlinkat0(tfd, try->name, toybuf, sizeof(toybuf)) &&
+  278 |               (!unlinkat(cfd, catch, 0) || ENOENT == errno) &&
+  279 |               !symlinkat(toybuf, cfd, catch)
+  280 |             : !mknodat(cfd, catch, try->st.st_mode, try->st.st_rdev))
+      |                ^~~~~~~
+  281 |         {
+  282 |           err = 0;
+  283 |           fdout = AT_FDCWD;
+  284 |         }
+      |
+1 warning generated.
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas, olja
+
+Reviewed By: tcare
+
+Subscribers: tcare, ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79568013
+
+Tags: aarch64
+---
+ Android.bp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Android.bp b/Android.bp
+index 70e9c99c..0049f900 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -475,6 +475,7 @@ cc_defaults {
+                 // diff.c defines MIN and MAX which (only on macOS) we're
+                 // also getting from <sys/param.h>.
+                 "-Wno-macro-redefined",
++                "-Wno-error=unguarded-availability-new",
+             ],
+             ldflags: [
+                 "-Wl,-dead_strip",

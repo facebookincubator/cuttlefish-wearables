@@ -1,0 +1,115 @@
+From a53706fb6a2af47e7ae58e6f216b002e6314b87d Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 21 Jul 2025 16:12:22 -0700
+Subject: [PATCH 1/2] compile libwebsockets
+
+Summary:
+# Motivation:
+This is required by target:
+```
+//device/google/cuttlefish/host/frontend/webrtc:webRTC
+```
+# Overview:
+- support building on mac
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas, dmolnar, forrestm
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79585660
+
+Tags: aarch64
+---
+ Android.bp                   | 2 +-
+ include/lws_config.h         | 7 ++++++-
+ include/lws_config_private.h | 5 +++--
+ 3 files changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/Android.bp b/Android.bp
+index 2f5ea2ba..f6539329 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -187,7 +187,7 @@ cc_library_static {
+     },
+     target: {
+         darwin: {
+-            enabled: false,
++            enabled: true,
+         },
+         android: {
+             shared_libs: [
+diff --git a/include/lws_config.h b/include/lws_config.h
+index 62110b71..6b5a4100 100644
+--- a/include/lws_config.h
++++ b/include/lws_config.h
+@@ -63,7 +63,9 @@
+ #define LWS_HAVE_HMAC_CTX_new
+ #define LWS_HAVE_MALLOC_H
+ #define LWS_HAVE_MALLOC_TRIM
++#ifndef __APPLE__
+ #define LWS_HAVE_MALLOC_USABLE_SIZE
++#endif
+ /* #undef LWS_HAVE_mbedtls_md_setup */
+ /* #undef LWS_HAVE_mbedtls_net_init */
+ /* #undef LWS_HAVE_mbedtls_rsa_complete */
+@@ -81,8 +83,10 @@
+ /* #undef LWS_HAVE_NEW_UV_VERSION_H */
+ #define LWS_HAVE_OPENSSL_ECDH_H
+ /* #undef LWS_HAVE_OPENSSL_STACK */
++#ifndef __APPLE__
+ #define LWS_HAVE_PIPE2
+ #define LWS_HAVE_EVENTFD
++#endif
+ #define LWS_HAVE_PTHREAD_H
+ #define LWS_HAVE_RSA_SET0_KEY
+ #define LWS_HAVE_RSA_verify_pss_mgf1
+@@ -100,7 +104,9 @@
+ /* #undef LWS_HAVE_SSL_SESSION_up_ref */
+ /* #undef LWS_HAVE__STAT32I64 */
+ #define LWS_HAVE_STDINT_H
++#ifndef __APPLE__
+ #define LWS_HAVE_SYS_CAPABILITY_H
++#endif
+ #define LWS_HAVE_TIMEGM
+ /* #undef LWS_HAVE_TLS_CLIENT_METHOD */
+ /* #undef LWS_HAVE_TLSV1_2_CLIENT_METHOD */
+@@ -236,4 +242,3 @@
+ /* #undef LWS_WITH_LIBUV_INTERNAL */
+ /* #undef LWS_WITH_PLUGINS_API */
+ /* #undef LWS_HAVE_RTA_PREF */
+-
+diff --git a/include/lws_config_private.h b/include/lws_config_private.h
+index f5b430a3..d711d1c9 100644
+--- a/include/lws_config_private.h
++++ b/include/lws_config_private.h
+@@ -7,7 +7,7 @@
+ #endif
+ /* #undef LWIP_PROVIDE_ERRNO */
+ 
+-/* Define to 1 to use CyaSSL as a replacement for OpenSSL. 
++/* Define to 1 to use CyaSSL as a replacement for OpenSSL.
+  * LWS_OPENSSL_SUPPORT needs to be set also for this to work. */
+ /* #undef USE_CYASSL */
+ 
+@@ -46,8 +46,9 @@
+ #define LWS_HAVE_STRING_H
+ 
+ /* Define to 1 if you have the <sys/prctl.h> header file. */
++#ifndef __APPLE__
+ #define LWS_HAVE_SYS_PRCTL_H
+-
++#endif
+ /* Define to 1 if you have the <sys/resource.h> header file. */
+ #define LWS_HAVE_SYS_RESOURCE_H
+ 

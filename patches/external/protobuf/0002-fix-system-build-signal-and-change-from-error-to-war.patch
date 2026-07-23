@@ -1,0 +1,105 @@
+From 060d1c860531f964cfb37e775d4251bf309c2dab Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Fri, 8 Aug 2025 11:49:33 -0700
+Subject: [PATCH 2/2] fix system build signal and change from error to warning
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+# Motivation:
+olya and I seem to be running into this error. see chat group
+```
+GOOGLE_LOG(ERROR) << "File already exists in database: " << file.name();
+```
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+...
+[100% 38/38 3s remaining] Install: out/host/darwin-x86/cvd-host_package.tar.gz
+
+[0;32m#### build completed successfully (05:10 (mm:ss)) ####[00m
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79910290
+
+Tags: aarch64
+---
+ src/google/protobuf/descriptor.cc          | 17 ++++++++++-------
+ src/google/protobuf/descriptor_database.cc |  2 +-
+ 2 files changed, 11 insertions(+), 8 deletions(-)
+
+diff --git a/src/google/protobuf/descriptor.cc b/src/google/protobuf/descriptor.cc
+index 4dc1333d0..86b1c959f 100644
+--- a/src/google/protobuf/descriptor.cc
++++ b/src/google/protobuf/descriptor.cc
+@@ -1987,13 +1987,14 @@ void DescriptorPool::InternalAddGeneratedFile(
+   // Therefore, when we parse one, we have to be very careful to avoid using
+   // any descriptor-based operations, since this might cause infinite recursion
+   // or deadlock.
++#ifdef __APPLE__
+   // Parse the descriptor to get the file name for debugging
+   FileDescriptorProto temp_proto;
+   std::string file_name = "unknown";
+   if (temp_proto.ParseFromArray(encoded_file_descriptor, size)) {
+     file_name = temp_proto.name();
+   }
+-  
++
+   // Get library information using dladdr (macOS/Unix specific)
+   void* caller_addr = __builtin_return_address(0);
+   Dl_info dl_info;
+@@ -2006,20 +2007,22 @@ void DescriptorPool::InternalAddGeneratedFile(
+       library_name = last_slash + 1;
+     }
+   }
+-  
+-  // GOOGLE_LOG(INFO) << "Attempting to register protobuf descriptor: " << file_name 
++  // GOOGLE_LOG(INFO) << "Attempting to register protobuf descriptor: " << file_name
+   //                  << " from library: " << library_name;
+-  
++
+   if (!GeneratedDatabase()->Add(encoded_file_descriptor, size)) {
+     // On macOS, multiple libraries may try to register the same descriptors
+     // due to different dynamic linking behavior. Just log a warning instead of crashing.
+-    GOOGLE_LOG(WARNING) << "Failed to add descriptor '" << file_name 
+-                        << "' from library '" << library_name 
++    GOOGLE_LOG(WARNING) << "Failed to add descriptor '" << file_name
++                        << "' from library '" << library_name
+                         << "' to GeneratedDatabase - likely already exists";
+   } else {
+-    // GOOGLE_LOG(INFO) << "Successfully registered protobuf descriptor: " << file_name 
++    // GOOGLE_LOG(INFO) << "Successfully registered protobuf descriptor: " << file_name
+     //                  << " from library: " << library_name;
+   }
++#else
++  GOOGLE_CHECK(GeneratedDatabase()->Add(encoded_file_descriptor, size));
++#endif
+ }
+ 
+ 
+diff --git a/src/google/protobuf/descriptor_database.cc b/src/google/protobuf/descriptor_database.cc
+index 203000d67..d161063d2 100644
+--- a/src/google/protobuf/descriptor_database.cc
++++ b/src/google/protobuf/descriptor_database.cc
+@@ -639,7 +639,7 @@ bool EncodedDescriptorDatabase::DescriptorIndex::AddFile(const FileProto& file,
+                                EncodeString(file.name())}) ||
+       std::binary_search(by_name_flat_.begin(), by_name_flat_.end(),
+                          file.name(), by_name_.key_comp())) {
+-    GOOGLE_LOG(ERROR) << "File already exists in database: " << file.name();
++    GOOGLE_LOG(WARNING) << "File already exists in database: " << file.name();
+     return false;
+   }
+ 

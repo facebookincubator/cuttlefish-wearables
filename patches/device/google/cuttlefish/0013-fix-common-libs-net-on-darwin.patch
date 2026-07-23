@@ -1,0 +1,43 @@
+From 13cc0b0c4139a2edea16e1504119ff6d5c652921 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 7 Aug 2025 10:24:41 -0700
+Subject: [PATCH 13/63] fix common/libs/net on darwin
+
+Summary: This header is only used by cuttlefish_net_tests
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79567257
+
+Tags: aarch64
+---
+ common/libs/net/netlink_request.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/common/libs/net/netlink_request.h b/common/libs/net/netlink_request.h
+index 77782d946..f17d6bd7c 100644
+--- a/common/libs/net/netlink_request.h
++++ b/common/libs/net/netlink_request.h
+@@ -18,7 +18,9 @@
+ 
+ #include <stddef.h>
+ 
++#ifdef __linux__
+ #include <linux/netlink.h>
++#endif
+ 
+ #include <array>
+ #include <cstdint>

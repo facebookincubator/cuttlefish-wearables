@@ -1,0 +1,54 @@
+From ad50605e11abf022efc1fe9d40690da834c4d22c Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 20 Aug 2025 11:06:13 -0700
+Subject: [PATCH 25/63] hardcode mask for macos slirp networking
+
+Summary:
+# Motivation:
+The net argument is empty for some reason. Let's set a default? @tcare set it here: D79088873
+# Overview:
+- hardcode slirp net mask and address
+
+Test Plan:
+```
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+HOME=/Users/achong/n-16/out/host/darwin-x86 out/host/darwin-x86/bin/launch_cvd  \
+--use-overlay=false --vm_manager=qemu_cli  --system_image_dir=/Users/achong/n-16/out/host/darwin-x86 \
+--qemu_binary_dir=/Users/achong/qemu/build \
+--enable_host_uwb=false -device_external_network=slirp \
+--vhost_user_vsock --enable_audio=true
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas, josephknox
+
+Reviewed By: tcare
+
+Subscribers: tcare, ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D80636879
+---
+ host/libs/vm_manager/qemu_manager.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index fdc152b6f..6135102ba 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -852,9 +852,15 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+       break;
+     case cuttlefish::ExternalNetworkMode::kSlirp: {
+       has_network_devices = true;
++#ifndef __APPLE__
+       const std::string net =
+           fmt::format("{}/{}", instance.ril_ipaddr(), instance.ril_prefixlen());
+       const std::string& host = instance.ril_gateway();
++#else
++      const std::string net =
++        fmt::format("{}/{}", "10.0.2.15", "24");
++      const std::string& host = "10.0.2.2";
++#endif
+       qemu_cmd.AddParameter("-netdev");
+       // TODO(schuffelen): `dns` needs to match the first `nameserver` in
+       // `/etc/resolv.conf`. Implement something that generalizes beyond

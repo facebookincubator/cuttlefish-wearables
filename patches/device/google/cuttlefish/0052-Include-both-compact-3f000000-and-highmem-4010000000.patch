@@ -1,0 +1,159 @@
+From 99d30a9982be0992d5fbf32c72209f7b0d4c4ce0 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 27 Apr 2026 13:21:39 -1000
+Subject: [PATCH 52/63] Include both compact (3f000000) and highmem
+ (4010000000) ECAM  addresses
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+# Motivation:
+The boot tests are not passing in CI because this address value should be generated dynamically by querying hvf.
+
+https://www.internalfb.com/code/arvr-qemu/[stable-9.2-meta]/
+```
+Here's the chain:
+
+  1. include/hw/arm/virt.h:185 — The selector macro:
+  #define VIRT_ECAM_ID(high) (high ? VIRT_HIGH_PCIE_ECAM : VIRT_PCIE_ECAM)
+  2. hw/arm/virt.c:190 — Low/compact ECAM address:
+  [VIRT_PCIE_ECAM] = { 0x3f000000, 0x01000000 },
+  3. hw/arm/virt.c:214 — High ECAM (base computed dynamically):
+  [VIRT_HIGH_PCIE_ECAM] = { 0x0, 256 * MiB },
+  4. hw/arm/virt.c:3298 — Default: highmem_ecam starts as true (for machine >= 3.0):
+  vms->highmem_ecam = !vmc->no_highmem_ecam;
+  5. hw/arm/virt.c:2400 — Gated on firmware + arch:
+  vms->highmem_ecam &= (!firmware_loaded || aarch64);
+  6. hw/arm/virt.c:1825 — The critical check in virt_set_high_memmap:
+  fits = (region_base + region_size) <= BIT_ULL(pa_bits);
+  *region_enabled &= fits;
+  6. If the high ECAM address doesn't fit in the IPA (physical address bits), highmem_ecam gets set to false → falls back to 0x3f000000.
+  7. hw/arm/virt.c:1858 — And pa_bits comes from:
+  if (!vms->highmem) { pa_bits = 32; }
+  7. Otherwise pa_bits comes from the HVF IPA size (target/arm/hvf/hvf.c:934-948):
+  hv_vm_config_get_default_ipa_size(&default_ipa_size);
+
+  So: HVF queries the chip → IPA too small → high ECAM doesn't fit → falls back to 0x3f000000. Different Apple Silicon chips (M1 vs M2 vs M3) can report different default IPA sizes.
+```
+
+previously modified here: D80563549
+# Overview:
+- add both values so the boot test can work in sandcastle too
+
+Test Plan:
+```
+. build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+```
+$ upload to manifold and run boot test
+manifold put out/host/darwin-x86/cvd-host_package.tar.gz maui_android_phone_cf/flat/test-ecam-cvd-host_package.tar.gz
+```
+{F1989024481}
+
+https://www.internalfb.com/sandcastle/workflow/4300937644155057167/insights
+
+Reviewers: guolinliu, #wearables_emulators, hzalek, spelliott, josephknox
+
+Reviewed By: guolinliu
+
+Subscribers: #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D102697364
+
+Tags: aarch64
+---
+ host/libs/vm_manager/Android.bp              |  6 ++++
+ host/libs/vm_manager/hypervisor.entitlements |  8 +++++
+ host/libs/vm_manager/qemu_manager.cpp        | 31 ++++++++++++++++----
+ 3 files changed, 40 insertions(+), 5 deletions(-)
+ create mode 100644 host/libs/vm_manager/hypervisor.entitlements
+
+diff --git a/host/libs/vm_manager/Android.bp b/host/libs/vm_manager/Android.bp
+index 23a399f24..54cace73d 100644
+--- a/host/libs/vm_manager/Android.bp
++++ b/host/libs/vm_manager/Android.bp
+@@ -49,6 +49,12 @@ cc_library {
+     target: {
+         darwin: {
+             enabled: true,
++            host_ldlibs: [
++                "-framework Hypervisor",
++            ],
++            data: [
++                "hypervisor.entitlements",
++            ],
+         },
+     },
+ }
+diff --git a/host/libs/vm_manager/hypervisor.entitlements b/host/libs/vm_manager/hypervisor.entitlements
+new file mode 100644
+index 000000000..154f3308e
+--- /dev/null
++++ b/host/libs/vm_manager/hypervisor.entitlements
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++    <key>com.apple.security.hypervisor</key>
++    <true/>
++</dict>
++</plist>
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index d7688d2d1..fedb02f72 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -35,6 +35,10 @@
+ #include <android-base/logging.h>
+ #include <vulkan/vulkan.h>
+ 
++#if defined(__APPLE__) && defined(__aarch64__)
++#include <Hypervisor/Hypervisor.h>
++#endif
++
+ #include "common/libs/utils/architecture.h"
+ #include "common/libs/utils/files.h"
+ #include "common/libs/utils/result.h"
+@@ -52,6 +56,25 @@ namespace cuttlefish {
+ namespace vm_manager {
+ namespace {
+ 
++// QEMU's ARM virt machine places the PCI ECAM at one of two addresses:
++//   Compact: 0x3f000000 (always available)
++//   Highmem: 0x4010000000 (requires >= 40-bit IPA)
++// On macOS, query HVF for the host's max IPA size to predict which one
++// QEMU will use. On Linux, KVM on ARM64 always has >= 40-bit IPA.
++bool QemuUsesHighmemEcam() {
++#if defined(__APPLE__) && defined(__aarch64__)
++  uint32_t max_ipa;
++  if (hv_vm_config_get_max_ipa_size(&max_ipa) != HV_SUCCESS) {
++    LOG(WARNING) << "Failed to query HVF max IPA size";
++    return true;
++  }
++  LOG(INFO) << "HVF max IPA size: " << max_ipa << " bits";
++  return max_ipa >= 40;
++#else
++  return true;
++#endif
++}
++
+ std::string GetMonitorPath(const CuttlefishConfig& config) {
+   return config.ForDefaultInstance().PerInstanceInternalUdsPath(
+       "qemu_monitor.sock");
+@@ -231,11 +254,9 @@ QemuManager::ConfigureBootDevices(
+     case Arch::Arm:
+       return {{{"androidboot.boot_devices", "3f000000.pcie"}}};
+     case Arch::Arm64:
+-// #ifdef __APPLE__
+-//       return {{{"androidboot.boot_devices", "3f000000.pcie"}}};
+-// #else
+-      return {{{"androidboot.boot_devices", "4010000000.pcie"}}};
+-// #endif
++      return {{{"androidboot.boot_devices",
++                QemuUsesHighmemEcam() ? "4010000000.pcie"
++                                      : "3f000000.pcie"}}};
+     case Arch::RiscV64:
+       return {{{"androidboot.boot_devices", "soc/30000000.pci"}}};
+     case Arch::X86:

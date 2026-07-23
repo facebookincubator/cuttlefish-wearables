@@ -1,0 +1,53 @@
+From ecfc4bc660a2f3a8bc1d0e6c770220c135376a63 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 7 Aug 2025 10:26:43 -0700
+Subject: [PATCH 2/2] move libcap to linux only static_lib - libwebsockets
+
+Summary: remove libcap from static_libs for libwebsockets
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79819970
+
+Tags: aarch64
+---
+ Android.bp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/Android.bp b/Android.bp
+index f6539329..1fef0a51 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -175,7 +175,6 @@ cc_library_static {
+     export_include_dirs: ["include"],
+     static_libs: [
+         "libssl",
+-        "libcap",
+     ],
+     host_supported: true,
+     product_variables: {
+@@ -198,6 +197,11 @@ cc_library_static {
+                 "-Wno-missing-field-initializers",
+             ],
+         },
++        linux: {
++            static_libs: [
++                "libcap",
++            ]
++        },
+         host: {
+             static_libs: [
+                 "libcrypto",

@@ -1,0 +1,73 @@
+From c1325ad53c5c930ab1a3bac52ac521a39ea731f8 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 19 Mar 2026 14:38:30 -0700
+Subject: [PATCH 44/63] [cuttlefish] Fix AdbHandler shutdown on macOS to
+ prevent thread leak
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+# Motivation:
+Refreshing webrtc page will eventually freeze and fail to reconnect.
+
+AdbHandler uses SharedFD::Event() for its shutdown signal. On macOS, Event() is emulated with a pipe and the returned SharedFD wraps the read end. The destructor called Write() on this fd, which silently fails because you can't write to the read end of a pipe.
+
+This caused ReadLoop's Select() to never wake up, blocking the read_thread_.join() call forever. Each browser refresh leaked the AdbHandler read thread plus the cleanup thread waiting on join().
+
+# Overview:
+- use EventfdWrite() which looks up the pipe's write end from an internal map. This is backwards compatible — on Linux, EventfdWrite() calls the native eventfd_write() which works identically.
+
+Test Plan:
+# before:
+refresh webrtc page like crazy, fails to connect after 5 times
+
+# after:
+rebuild host tools
+```
+cd /Volumes/AOSP && source build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+```
+rm -r bin com.android.i18n lib64 nativetest64/ framework etc usr
+ln -s  /Volumes/AOSP/out/host/darwin-x86/cvd-host_package/*
+start_cuttlefish.py
+```
+
+{F1987038615}
+
+refresh webrtc page like crazy, still works
+
+Reviewers: shaochi, #wearables_emulators, ivantsou
+
+Reviewed By: shaochi
+
+Subscribers: #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D97374839
+
+Tags: aarch64
+---
+ host/frontend/webrtc/adb_handler.cpp | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/host/frontend/webrtc/adb_handler.cpp b/host/frontend/webrtc/adb_handler.cpp
+index b26aba5a7..49eac7943 100644
+--- a/host/frontend/webrtc/adb_handler.cpp
++++ b/host/frontend/webrtc/adb_handler.cpp
+@@ -67,10 +67,11 @@ AdbHandler::AdbHandler(
+ 
+ 
+ AdbHandler::~AdbHandler() {
+-    // Send a message to the looper to shut down.
+-    uint64_t v = 1;
+-    shutdown_->Write(&v, sizeof(v));
+-    // Shut down the socket as well.  Not srictly necessary.
++    // Signal the ReadLoop to exit. Must use EventfdWrite (not Write) because
++    // on macOS, Event() is emulated with a pipe and the SharedFD wraps the
++    // read end — Write() to the read end silently fails.
++    shutdown_->EventfdWrite(1);
++    // Shut down the socket as well.  Not strictly necessary.
+     adb_socket_->Shutdown(SHUT_RDWR);
+     read_thread_.join();
+ }

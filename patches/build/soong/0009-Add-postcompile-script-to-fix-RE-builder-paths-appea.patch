@@ -1,0 +1,102 @@
+From b315698f291798e7c786445c7664d4c443efc3dc Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Fri, 31 Oct 2025 14:38:38 -0700
+Subject: [PATCH 09/11] Add postcompile script to fix RE builder paths
+ appearing in depfiles
+
+Summary:
+The clang flag -MD supplies a list of dependencies which is fed to ninja and determines whether a build is dirty - useful for incremental builds.
+
+When using a remote builder, we end up with paths that are specific to the remote builder e.g. /paragon/blah. This makes our local build look always dirty because that path doesn't exist.
+
+Normally you would solve this by using -isystem flags passed to clang, but Soong has docs that say they were explicitly moving away from this to avoid some other behavior. I guess most of their builds aren't incremental or they consider it an acceptable tradeoff. I have seen a few places that fix the paths (Google's builder paths looks like /b/w/p or similar.)
+
+For now, we can run a postbuild script to remove any paragon worker directories when creating the depsfile. This restores local incremental build functionality with RBE enabled.
+
+Test Plan:
+USE_RBE=true
+
+NINJA_REMOTE_NUM_JOBS=100 m out/host/darwin-x86/cvd-host_package.tar.gz -k
+
+Check the .d files to make sure no /paragon dirs
+
+Rollback Plan:
+
+Reviewers: achong, olja, benthomas
+
+Reviewed By: achong
+
+Subscribers: ilyatsunaev, jmgao, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D85988961
+---
+ cc/builder.go              |  6 ++++--
+ scripts/fix_rbe_depfile.sh | 37 +++++++++++++++++++++++++++++++++++++
+ 2 files changed, 41 insertions(+), 2 deletions(-)
+ create mode 100755 scripts/fix_rbe_depfile.sh
+
+diff --git a/cc/builder.go b/cc/builder.go
+index 3046e7b27..cbfc2ac12 100644
+--- a/cc/builder.go
++++ b/cc/builder.go
+@@ -42,13 +42,15 @@ const (
+ var (
+ 	pctx = android.NewPackageContext("android/soong/cc")
+ 
++	_ = pctx.SourcePathVariable("fixRbeDepfile", "build/soong/scripts/fix_rbe_depfile.sh")
++
+ 	// Rule to invoke gcc with given command, flags, and dependencies. Outputs a .d depfile.
+ 	cc = pctx.AndroidRemoteStaticRule("cc", android.RemoteRuleSupports{Goma: true, RBE: true},
+ 		blueprint.RuleParams{
+ 			Depfile:     "${out}.d",
+ 			Deps:        blueprint.DepsGCC,
+-			Command:     "$relPwd ${config.CcWrapper}$ccCmd -c $cFlags -MD -MF ${out}.d -o $out $in$postCmd",
+-			CommandDeps: []string{"$ccCmd"},
++			Command:     "$relPwd ${config.CcWrapper}$ccCmd -c $cFlags -MD -MF ${out}.d -o $out $in$postCmd && $fixRbeDepfile ${out}.d",
++			CommandDeps: []string{"$ccCmd", "$fixRbeDepfile"},
+ 		},
+ 		"ccCmd", "cFlags", "postCmd")
+ 
+diff --git a/scripts/fix_rbe_depfile.sh b/scripts/fix_rbe_depfile.sh
+new file mode 100755
+index 000000000..3496578ad
+--- /dev/null
++++ b/scripts/fix_rbe_depfile.sh
+@@ -0,0 +1,37 @@
++#!/bin/bash
++# Copyright 2024 Google Inc. All rights reserved.
++#
++# Script to fix RBE remote worker absolute paths in depfiles
++# Usage: fix_rbe_depfile.sh <depfile>
++
++set -e
++
++if [ $# -ne 1 ]; then
++    echo "Usage: $0 <depfile>"
++    exit 1
++fi
++
++DEPFILE="$1"
++
++if [ ! -f "$DEPFILE" ]; then
++    exit 0  # Depfile doesn't exist yet, nothing to fix
++fi
++
++# Use sed to strip RBE remote worker path prefixes
++# Matches patterns like:
++#   /paragon/pods/291584906/home/execution/0/9fa6f/work/./prebuilts/...
++#   /paragon/pods/291699223/home/execution/0/722bf/work/prebuilts/...
++# And replaces them with just: prebuilts/...
++# Use temporary file approach for better portability
++
++TMPFILE="${DEPFILE}.tmp"
++
++# First pass: remove paths with work/./
++# Second pass: remove paths with just work/
++sed \
++  -e 's|/[^/][^/]*/pods/[^/][^/]*/home/execution/[^/][^/]*/[^/][^/]*/work/\./||g' \
++  -e 's|/[^/][^/]*/pods/[^/][^/]*/home/execution/[^/][^/]*/[^/][^/]*/work/||g' \
++  "$DEPFILE" > "$TMPFILE"
++
++# Replace original file with cleaned version
++mv "$TMPFILE" "$DEPFILE"

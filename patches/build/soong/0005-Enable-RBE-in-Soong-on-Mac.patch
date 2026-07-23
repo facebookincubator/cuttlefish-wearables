@@ -1,0 +1,58 @@
+From fedf5875460738198a074c0c45bf91a32cdd55c2 Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Thu, 2 Oct 2025 14:46:48 -0700
+Subject: [PATCH 05/11] Enable RBE in Soong on Mac
+
+Summary:
+Remove the artificial platform block which prevents 'unknown pool local_pool' errors in ninja. Also add an exception for `vm_stat` which is how RBE monitors resource management on Mac.
+
+Note using RBE on Mac will still require setting USE_RBE=true.
+
+Test Plan:
+USE_RBE=true
+m nothing
+m soong_ui
+
+We now see the 'Starting RBE...' message and ninja parses correctly.
+
+Rollback Plan:
+
+Reviewers: achong, olja, benthomas
+
+Reviewed By: achong
+
+Subscribers: ilyatsunaev, jmgao, ryanyu
+
+Differential Revision: https://phabricator.intern.facebook.com/D83785858
+---
+ ui/build/config.go       | 4 ++--
+ ui/build/paths/config.go | 1 +
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/ui/build/config.go b/ui/build/config.go
+index 1b3e559a4..535dc7276 100644
+--- a/ui/build/config.go
++++ b/ui/build/config.go
+@@ -1371,8 +1371,8 @@ func (c *configImpl) StartGoma() bool {
+ }
+ 
+ func (c *configImpl) canSupportRBE() bool {
+-	// Only supported on linux
+-	if runtime.GOOS != "linux" {
++	// Only supported on linux and macos.
++	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+ 		return false
+ 	}
+ 
+diff --git a/ui/build/paths/config.go b/ui/build/paths/config.go
+index f431a2e30..cebff088f 100644
+--- a/ui/build/paths/config.go
++++ b/ui/build/paths/config.go
+@@ -206,6 +206,7 @@ var Configuration = map[string]PathConfig{
+ func init() {
+ 	if runtime.GOOS == "darwin" {
+ 		Configuration["sw_vers"] = Allowed
++		Configuration["vm_stat"] = Allowed
+ 		Configuration["xcrun"] = Allowed
+ 
+ 		// We don't have darwin prebuilts for some tools,

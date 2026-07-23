@@ -1,0 +1,168 @@
+From 1ccb9fe075c4ca0bcf81ed5fc6d3893e45bbbbb8 Mon Sep 17 00:00:00 2001
+From: Jeffrey Effendy <jeffreyeffendy@fb.com>
+Date: Mon, 30 Mar 2026 04:09:42 -0700
+Subject: [PATCH] Fix Casimir startup on macOS using inherited_fd_support
+ feature flag
+
+Summary:
+On macOS, `inherited_fd::init_once()` fails because it reads
+`/proc/self/fd` which does not exist on Darwin. Instead of hardcoding
+OS checks with `#[cfg(target_os = "linux")]`, this uses a Cargo feature
+flag `inherited_fd_support` controlled by Android.bp's per-target config.
+
+- Added `inherited_fd_support` feature to Cargo.toml
+- In Android.bp, enabled `inherited_fd_support` feature and added
+  `librustutils` dependency only in the `target.linux` block
+- Added `take_fd()` helper gated on the feature flag:
+  - With feature: delegates to `inherited_fd::take_fd_ownership()`
+  - Without feature: wraps raw FD with `OwnedFd::from_raw_fd()` directly
+- Gated `inherited_fd::init_once()` behind the feature flag
+
+This keeps the build system in control of platform behavior rather than
+scattering OS checks throughout the source. The trade-off is that on
+non-Linux platforms, we lose the safety validation that inherited_fd
+provides.
+
+Test Plan:
+casimir library is runnable on macos, run below on mac
+```
+$ . build/envsetup.sh
+$ lunch aosp_cf_arm64_phone-userdebug
+$ m out/host/darwin-x86/cvd-host_package.tar.gz
+$ out/host/darwin-x86/cvd-host_package/bin/casimir
+[INFO  casimir] Listening for NCI connections at address 127.0.0.1:7000
+[INFO  casimir] Listening for RF connections at address 127.0.0.1:7001
+```
+
+this does not change the behaviour on linux, run below on OD
+```
+$ . build/envsetup.sh
+$ lunch blueshark_cf_emu_x86_64-userdebug
+$ m hosttar
+$ out/host/linux-x86/cvd-host_package/bin/casimir
+[INFO  casimir] Listening for NCI connections at address 127.0.0.1:7000
+[INFO  casimir] Listening for RF connections at address 127.0.0.1:7001
+```
+
+Reviewers: achong, #cuttlefish-cross-platform, sorokin
+
+Reviewed By: achong
+
+Subscribers: #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D98717154
+
+Tags: aarch64
+---
+ libnfc-nci/tools/casimir/Android.bp  | 14 ++++++++++++--
+ libnfc-nci/tools/casimir/Cargo.toml  |  3 +++
+ libnfc-nci/tools/casimir/src/main.rs | 18 ++++++++++++++++--
+ 3 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/libnfc-nci/tools/casimir/Android.bp b/libnfc-nci/tools/casimir/Android.bp
+index f4f77c861..c5b375f60 100644
+--- a/libnfc-nci/tools/casimir/Android.bp
++++ b/libnfc-nci/tools/casimir/Android.bp
+@@ -55,9 +55,14 @@ rust_binary_host {
+         "libfutures",
+         "liblog_rust",
+         "libpdl_runtime",
+-        "librustutils",
+         "libtokio",
+     ],
++    target: {
++        linux: {
++            features: ["inherited_fd_support"],
++            rustlibs: ["librustutils"],
++        },
++    },
+     visibility: ["//device/google/cuttlefish:__subpackages__"],
+ }
+ 
+@@ -77,9 +82,14 @@ rust_test_host {
+         "libfutures",
+         "liblog_rust",
+         "libpdl_runtime",
+-        "librustutils",
+         "libtokio",
+     ],
++    target: {
++        linux: {
++            features: ["inherited_fd_support"],
++            rustlibs: ["librustutils"],
++        },
++    },
+ }
+ 
+ genrule {
+diff --git a/libnfc-nci/tools/casimir/Cargo.toml b/libnfc-nci/tools/casimir/Cargo.toml
+index 47c861464..4a38ddc18 100644
+--- a/libnfc-nci/tools/casimir/Cargo.toml
++++ b/libnfc-nci/tools/casimir/Cargo.toml
+@@ -26,6 +26,9 @@ tokio-stream = { version = "0.1", features = ["sync"] }
+ grpcio = "0.13"
+ protobuf = "2.8.0"
+ 
++[features]
++inherited_fd_support = []
++
+ [build-dependencies]
+ pdl-compiler = "0.3.0"
+ protoc-grpcio = "3.0.0"
+diff --git a/libnfc-nci/tools/casimir/src/main.rs b/libnfc-nci/tools/casimir/src/main.rs
+index fc5adfa4c..84eb12420 100644
+--- a/libnfc-nci/tools/casimir/src/main.rs
++++ b/libnfc-nci/tools/casimir/src/main.rs
+@@ -17,6 +17,7 @@
+ use anyhow::Result;
+ use argh::FromArgs;
+ use log::{error, info, warn};
++#[cfg(feature = "inherited_fd_support")]
+ use rustutils::inherited_fd;
+ use std::future::Future;
+ use std::net::{Ipv4Addr, SocketAddrV4};
+@@ -35,6 +36,18 @@ pub mod packets;
+ use controller::Controller;
+ use packets::{nci, rf};
+ 
++#[cfg(feature = "inherited_fd_support")]
++fn take_fd(raw_fd: i32) -> Result<std::os::fd::OwnedFd> {
++    Ok(inherited_fd::take_fd_ownership(raw_fd)?)
++}
++
++#[cfg(not(feature = "inherited_fd_support"))]
++fn take_fd(raw_fd: i32) -> Result<std::os::fd::OwnedFd> {
++    use std::os::fd::FromRawFd;
++    // SAFETY: Parent process (CVD) passed a valid open FD
++    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(raw_fd) })
++}
++
+ const MAX_DEVICES: usize = 128;
+ type Id = u16;
+ 
+@@ -340,7 +353,7 @@ async fn run() -> Result<()> {
+ 
+     let nci_listener = match (opt.nci_port, opt.nci_unix_fd) {
+         (None, Some(unix_fd)) => {
+-            let owned_fd = inherited_fd::take_fd_ownership(unix_fd)?;
++            let owned_fd = take_fd(unix_fd)?;
+             let nci_listener = std::os::unix::net::UnixListener::from(owned_fd);
+             nci_listener.set_nonblocking(true)?;
+             let nci_listener = UnixListener::from_std(nci_listener)?;
+@@ -359,7 +372,7 @@ async fn run() -> Result<()> {
+ 
+     let rf_listener = match (opt.rf_port, opt.rf_unix_fd) {
+         (None, Some(unix_fd)) => {
+-            let owned_fd = inherited_fd::take_fd_ownership(unix_fd)?;
++            let owned_fd = take_fd(unix_fd)?;
+             let nci_listener = std::os::unix::net::UnixListener::from(owned_fd);
+             nci_listener.set_nonblocking(true)?;
+             let nci_listener = UnixListener::from_std(nci_listener)?;
+@@ -407,6 +420,7 @@ async fn run() -> Result<()> {
+ 
+ fn main() -> Result<()> {
+     // Safety: First function call in the `main` function, before any other library calls
++    #[cfg(feature = "inherited_fd_support")]
+     unsafe { inherited_fd::init_once()? };
+     run()
+ }

@@ -1,0 +1,42 @@
+From 7b152cd5d28f06a8fff8e7d10aa7aa07ea51941c Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 5 May 2026 07:57:30 -1000
+Subject: [PATCH 11/11] allow list hypervisor to soong build for macOS host
+ tools
+
+Summary:
+# Motivation:
+D102697364 needs to link with this dylib
+# Overview:
+- add framework Hypervisor to list of allowed dylibs
+
+Test Plan:
+```
+ . build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+Reviewers: josephknox, #wearables_emulators, drahul
+
+Reviewed By: josephknox
+
+Subscribers: ilyatsunaev, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D103888988
+
+Tags: aarch64
+---
+ cc/config/darwin_host.go | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/cc/config/darwin_host.go b/cc/config/darwin_host.go
+index 898bbd8b3..f29fb412f 100644
+--- a/cc/config/darwin_host.go
++++ b/cc/config/darwin_host.go
+@@ -80,6 +80,7 @@ var (
+ 		"-framework AppKit",
+ 		"-framework CoreFoundation",
+ 		"-framework Foundation",
++		"-framework Hypervisor",
+ 		"-framework IOKit",
+ 		"-framework IOSurface",
+ 		"-framework Metal",

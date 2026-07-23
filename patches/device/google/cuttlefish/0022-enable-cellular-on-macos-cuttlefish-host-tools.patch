@@ -1,0 +1,195 @@
+From 5dc09bdc9abc114774c132cc5d2070197502a1cb Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 18 Aug 2025 18:40:56 -0700
+Subject: [PATCH 22/63] enable cellular on macos cuttlefish host tools
+
+Summary:
+# Motivation:
+Cellular features are needed on mac hosts for wearable devices. This is used in cases like asking meta ai to place a phone call or asking meta ai to make a text. The phone paired with the wearable device must have cellular capabilities.
+# Overview:
+AF_UNIX sockets cannot be abstract on macOS -> sun_path starting with `"/0"`
+
+https://man7.org/linux/man-pages/man7/unix.7.html
+
+Test Plan:
+# demo making a phone call
+https://pxl.cl/7Wh2W
+
+Rollback Plan:
+
+Reviewers: olja, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: olja
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D80504671
+---
+ host/commands/cvd_send_id_disclosure/main.cc        | 12 +++++++++---
+ host/commands/cvd_update_security_algorithm/main.cc | 10 ++++++++--
+ host/commands/modem_simulator/main.cpp              | 11 +++++++++--
+ host/commands/run_cvd/Android.bp                    |  2 +-
+ host/commands/run_cvd/launch/modem.cpp              | 11 +++++++++--
+ host/commands/run_cvd/main.cc                       |  2 +-
+ 6 files changed, 37 insertions(+), 11 deletions(-)
+
+diff --git a/host/commands/cvd_send_id_disclosure/main.cc b/host/commands/cvd_send_id_disclosure/main.cc
+index b4fe0b289..752a738b8 100644
+--- a/host/commands/cvd_send_id_disclosure/main.cc
++++ b/host/commands/cvd_send_id_disclosure/main.cc
+@@ -21,6 +21,7 @@
+ 
+ #include "common/libs/fs/shared_buf.h"
+ #include "common/libs/fs/shared_fd.h"
++#include "common/libs/utils/known_paths.h"
+ #include "host/commands/cvd_send_id_disclosure/cellular_identifier_disclosure_command_builder.h"
+ #include "host/libs/config/cuttlefish_config.h"
+ 
+@@ -68,11 +69,16 @@ int SendIdDisclosureMain(int argc, char **argv) {
+ 
+   auto cf_config = config->ForInstance(FLAGS_instance_num);
+   std::string socket_name =
+-      fmt::format("modem_simulator{}", cf_config.modem_simulator_host_id());
++      fmt::format("{}/modem_simulator{}", TempDir(), cf_config.modem_simulator_host_id());
+ 
+   LOG(INFO) << "Connecting over local socket: " << socket_name;
++#ifdef __APPLE__
++  bool abstract_monitor_socket = false;
++#else
++  bool abstract_monitor_socket = true;
++#endif
+   SharedFD modem_simulator_fd =
+-      cuttlefish::SharedFD::SocketLocalClient(socket_name, true, SOCK_STREAM);
++      cuttlefish::SharedFD::SocketLocalClient(socket_name, abstract_monitor_socket, SOCK_STREAM);
+ 
+   SendDisclosure(modem_simulator_fd);
+ 
+@@ -84,4 +90,4 @@ int SendIdDisclosureMain(int argc, char **argv) {
+ 
+ int main(int argc, char **argv) {
+   return cuttlefish::SendIdDisclosureMain(argc, argv);
+-}
+\ No newline at end of file
++}
+diff --git a/host/commands/cvd_update_security_algorithm/main.cc b/host/commands/cvd_update_security_algorithm/main.cc
+index c661622ee..4ad2f4f76 100644
+--- a/host/commands/cvd_update_security_algorithm/main.cc
++++ b/host/commands/cvd_update_security_algorithm/main.cc
+@@ -21,6 +21,7 @@
+ 
+ #include "common/libs/fs/shared_buf.h"
+ #include "common/libs/fs/shared_fd.h"
++#include "common/libs/utils/known_paths.h"
+ #include "host/commands/cvd_update_security_algorithm/update_security_algorithm_command_builder.h"
+ #include "host/libs/config/cuttlefish_config.h"
+ 
+@@ -70,11 +71,16 @@ int UpdateSecurityAlgorithmMain(int argc, char **argv) {
+ 
+   auto cf_config = config->ForInstance(FLAGS_instance_num);
+   std::string socket_name =
+-      fmt::format("modem_simulator{}", cf_config.modem_simulator_host_id());
++      fmt::format("{}/modem_simulator{}", TempDir(), cf_config.modem_simulator_host_id());
++#ifdef __APPLE__
++  bool abstract_monitor_socket = false;
++#else
++  bool abstract_monitor_socket = true;
++#endif
+ 
+   LOG(INFO) << "Connecting over local socket: " << socket_name;
+   SharedFD modem_simulator_fd =
+-      cuttlefish::SharedFD::SocketLocalClient(socket_name, true, SOCK_STREAM);
++      cuttlefish::SharedFD::SocketLocalClient(socket_name, abstract_monitor_socket, SOCK_STREAM);
+ 
+   UpdateSecurityAlgorithm(modem_simulator_fd);
+ 
+diff --git a/host/commands/modem_simulator/main.cpp b/host/commands/modem_simulator/main.cpp
+index b0ebf6474..a672de3a2 100644
+--- a/host/commands/modem_simulator/main.cpp
++++ b/host/commands/modem_simulator/main.cpp
+@@ -20,6 +20,7 @@
+ #include <fmt/format.h>
+ #include <gflags/gflags.h>
+ 
++#include "common/libs/utils/known_paths.h"
+ #include "common/libs/fs/shared_buf.h"
+ #include "common/libs/fs/shared_fd.h"
+ #include "common/libs/fs/shared_select.h"
+@@ -116,10 +117,16 @@ int ModemSimulatorMain(int argc, char** argv) {
+   // Monitor exit request and
+   // remote call, remote sms from other cuttlefish instance
+   std::string monitor_socket_name =
+-      fmt::format("modem_simulator{}", instance.modem_simulator_host_id());
++      fmt::format("{}/modem_simulator{}", TempDir(), instance.modem_simulator_host_id());
++
++#ifdef __APPLE__
++  bool abstract_monitor_socket = false;
++#else
++  bool abstract_monitor_socket = true;
++#endif
+ 
+   auto monitor_socket = SharedFD::SocketLocalServer(monitor_socket_name.c_str(),
+-                                                    true, SOCK_STREAM, 0666);
++                                                    abstract_monitor_socket, SOCK_STREAM, 0666);
+   if (!monitor_socket->IsOpen()) {
+     LOG(ERROR) << "Unable to create monitor socket for modem simulator";
+     std::exit(kServerError);
+diff --git a/host/commands/run_cvd/Android.bp b/host/commands/run_cvd/Android.bp
+index 8b5dbb516..f1b43b801 100644
+--- a/host/commands/run_cvd/Android.bp
++++ b/host/commands/run_cvd/Android.bp
+@@ -101,7 +101,7 @@ cc_binary_host {
+             ],
+             srcs: [
+                 // "launch/mcu.cpp",
+-                // "launch/modem.cpp",
++                "launch/modem.cpp",
+                 // "launch/open_wrt.cpp",
+                 // "launch/ti50_emulator.cpp",
+                 // "launch/tombstone_receiver.cpp",
+diff --git a/host/commands/run_cvd/launch/modem.cpp b/host/commands/run_cvd/launch/modem.cpp
+index af6c0dc57..f3afa7852 100644
+--- a/host/commands/run_cvd/launch/modem.cpp
++++ b/host/commands/run_cvd/launch/modem.cpp
+@@ -22,8 +22,10 @@
+ #include <vector>
+ 
+ #include <android-base/logging.h>
++#include <fmt/format.h>
+ 
+ #include "common/libs/fs/shared_fd.h"
++#include "common/libs/utils/known_paths.h"
+ #include "common/libs/utils/result.h"
+ #include "common/libs/utils/subprocess.h"
+ #include "host/libs/config/cuttlefish_config.h"
+@@ -32,9 +34,14 @@
+ namespace cuttlefish {
+ 
+ static StopperResult StopModemSimulator(int id) {
+-  std::string socket_name = "modem_simulator" + std::to_string(id);
++  std::string socket_name = fmt::format("{}/modem_simulator{}", TempDir(), std::to_string(id));
++#ifdef __APPLE__
++  bool abstract_monitor_socket = false;
++#else
++  bool abstract_monitor_socket = true;
++#endif
+   auto monitor_sock =
+-      SharedFD::SocketLocalClient(socket_name, true, SOCK_STREAM);
++      SharedFD::SocketLocalClient(socket_name, abstract_monitor_socket, SOCK_STREAM);
+   if (!monitor_sock->IsOpen()) {
+     LOG(ERROR) << "The connection to modem simulator is closed";
+     return StopperResult::kStopFailure;
+diff --git a/host/commands/run_cvd/main.cc b/host/commands/run_cvd/main.cc
+index a2622d22d..ffbac9e48 100644
+--- a/host/commands/run_cvd/main.cc
++++ b/host/commands/run_cvd/main.cc
+@@ -132,9 +132,9 @@ fruit::Component<> runCvdComponent(
+       .bindInstance(*config)
+       .bindInstance(*instance)
+       .bindInstance(*environment)
++      .install(AutoCmd<ModemSimulator>::Component)
+ //#ifdef __linux__
+       // .install(AutoCmd<AutomotiveProxyService>::Component)
+-      // .install(AutoCmd<ModemSimulator>::Component)
+       // .install(AutoCmd<TombstoneReceiver>::Component)
+       // .install(McuComponent)
+       .install(VhostDeviceVsockComponent)

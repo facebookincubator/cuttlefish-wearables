@@ -1,0 +1,55 @@
+From 4dc2839cbe09bc60aa675da2bbe2f8eee295930d Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:58:23 -0700
+Subject: [PATCH] add endian conversion for darwin - libsrtp2
+
+Summary:
+# Motivation:
+This is a dependency of one of the cuttlefish host binaries.
+
+# Overview:
+- add byte swap for darwin target
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79568338
+
+Tags: aarch64
+---
+ crypto/include/datatypes.h | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/crypto/include/datatypes.h b/crypto/include/datatypes.h
+index 6a588d0..07af809 100644
+--- a/crypto/include/datatypes.h
++++ b/crypto/include/datatypes.h
+@@ -272,10 +272,16 @@ void octet_string_set_to_zero(void *s, size_t len);
+ #define be32_to_cpu(x) (x)
+ #define be64_to_cpu(x) (x)
+ #elif defined(HAVE_BYTESWAP_H)
++#ifdef __APPLE__
++#include <libkern/OSByteOrder.h>
++#define be32_to_cpu(x) OSSwapBigToHostInt32(x)
++#define be64_to_cpu(x) OSSwapBigToHostInt64(x)
++#else
+ /* We have (hopefully) optimized versions in byteswap.h */
+ #include <byteswap.h>
+ #define be32_to_cpu(x) bswap_32((x))
+ #define be64_to_cpu(x) bswap_64((x))
++#endif /* __APPLE__ */
+ #else /* WORDS_BIGENDIAN */
+ 
+ #if defined(__GNUC__) && defined(HAVE_X86)

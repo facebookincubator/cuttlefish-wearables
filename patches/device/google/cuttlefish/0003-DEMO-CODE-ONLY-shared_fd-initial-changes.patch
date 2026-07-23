@@ -1,0 +1,476 @@
+From cb95923d2e91b083eaa78ebd6651e72e4c800a1f Mon Sep 17 00:00:00 2001
+From: Olya Arkhangelskaia <olja@meta.com>
+Date: Tue, 5 Aug 2025 19:23:48 +0100
+Subject: [PATCH 03/63] [DEMO CODE ONLY] shared_fd initial changes
+
+Summary:
+Initial changes to shared_fd.
+This is a part of D77880815.
+
+Test Plan:
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+Rollback Plan:
+
+Reviewers: achong, tcare, benthomas
+
+Reviewed By: achong
+
+Subscribers: ryanyu
+
+Differential Revision: https://phabricator.intern.facebook.com/D79662209
+
+Tags: aarch64
+
+Privacy Context Container: L1248481
+---
+ common/libs/fs/shared_fd.cpp | 263 ++++++++++++++++++++++++++++++++++-
+ common/libs/fs/shared_fd.h   |  20 ++-
+ 2 files changed, 269 insertions(+), 14 deletions(-)
+
+diff --git a/common/libs/fs/shared_fd.cpp b/common/libs/fs/shared_fd.cpp
+index b2c0a6609..2fff8cc43 100644
+--- a/common/libs/fs/shared_fd.cpp
++++ b/common/libs/fs/shared_fd.cpp
+@@ -29,6 +29,95 @@
+ #include <unistd.h>
+ #include <cstddef>
+ 
++#ifdef __APPLE__
++#include <sys/event.h>
++#include <unordered_map>
++#include <string>
++#include <mutex>
++
++// macOS kqueue-based inotify replacement
++namespace {
++struct KqueueWatch {
++  int watch_fd;  // File descriptor being watched
++  std::string path;  // Path being watched
++  uint32_t mask;  // inotify mask
++};
++
++// Global state for kqueue-based inotify replacement
++static std::mutex kqueue_mutex;
++static std::unordered_map<int, std::unordered_map<int, KqueueWatch>> kqueue_watches; // kqueue_fd -> watch_id -> KqueueWatch
++static int next_watch_id = 1;
++
++// Define kqueue note constants if not available
++#ifndef NOTE_DELETE
++#define NOTE_DELETE 0x00000001
++#endif
++#ifndef NOTE_WRITE
++#define NOTE_WRITE 0x00000002
++#endif
++#ifndef NOTE_EXTEND
++#define NOTE_EXTEND 0x00000004
++#endif
++#ifndef NOTE_ATTRIB
++#define NOTE_ATTRIB 0x00000008
++#endif
++#ifndef NOTE_LINK
++#define NOTE_LINK 0x00000010
++#endif
++#ifndef NOTE_RENAME
++#define NOTE_RENAME 0x00000020
++#endif
++#ifndef NOTE_REVOKE
++#define NOTE_REVOKE 0x00000040
++#endif
++
++// Convert inotify mask to kqueue filter flags
++uint32_t InotifyMaskToKqueueFilter(uint32_t inotify_mask) {
++  uint32_t kqueue_flags = 0;
++  
++  // Map common inotify events to kqueue events
++  if (inotify_mask & 0x00000001) { // IN_ACCESS
++    kqueue_flags |= NOTE_EXTEND; // Use NOTE_EXTEND for access-like events
++  }
++  if (inotify_mask & 0x00000002) { // IN_MODIFY
++    kqueue_flags |= NOTE_WRITE;
++  }
++  if (inotify_mask & 0x00000004) { // IN_ATTRIB
++    kqueue_flags |= NOTE_ATTRIB;
++  }
++  if (inotify_mask & 0x00000008) { // IN_CLOSE_WRITE
++    kqueue_flags |= NOTE_WRITE;
++  }
++  if (inotify_mask & 0x00000010) { // IN_CLOSE_NOWRITE
++    kqueue_flags |= NOTE_EXTEND;
++  }
++  if (inotify_mask & 0x00000020) { // IN_OPEN
++    kqueue_flags |= NOTE_EXTEND;
++  }
++  if (inotify_mask & 0x00000040) { // IN_MOVED_FROM
++    kqueue_flags |= NOTE_RENAME;
++  }
++  if (inotify_mask & 0x00000080) { // IN_MOVED_TO
++    kqueue_flags |= NOTE_RENAME;
++  }
++  if (inotify_mask & 0x00000100) { // IN_CREATE
++    kqueue_flags |= NOTE_WRITE;
++  }
++  if (inotify_mask & 0x00000200) { // IN_DELETE
++    kqueue_flags |= NOTE_DELETE;
++  }
++  if (inotify_mask & 0x00000400) { // IN_DELETE_SELF
++    kqueue_flags |= NOTE_DELETE;
++  }
++  if (inotify_mask & 0x00000800) { // IN_MOVE_SELF
++    kqueue_flags |= NOTE_RENAME;
++  }
++  
++  return kqueue_flags;
++}
++}
++#endif
++
+ #include <algorithm>
+ #include <sstream>
+ #include <vector>
+@@ -403,10 +492,44 @@ bool SharedFD::Pipe(SharedFD* fd0, SharedFD* fd1) {
+   return false;
+ }
+ 
+-#ifdef __linux__
++#if defined(__linux__) || defined(__APPLE__)
+ SharedFD SharedFD::Event(int initval, int flags) {
++#ifdef __linux__
+   int fd = eventfd(initval, flags);
+   return std::shared_ptr<FileInstance>(new FileInstance(fd, errno));
++#elif defined(__APPLE__)
++  // macOS doesn't have eventfd, so we use a pipe-based implementation
++  int pipe_fds[2];
++  if (pipe(pipe_fds) == -1) {
++    return std::shared_ptr<FileInstance>(new FileInstance(-1, errno));
++  }
++  
++  // Set non-blocking if EFD_NONBLOCK is requested
++  if (flags & 0x800) { // EFD_NONBLOCK value
++    fcntl(pipe_fds[0], F_SETFL, O_NONBLOCK);
++    fcntl(pipe_fds[1], F_SETFL, O_NONBLOCK);
++  }
++  
++  // Set close-on-exec if EFD_CLOEXEC is requested
++  if (flags & 0x80000) { // EFD_CLOEXEC value
++    fcntl(pipe_fds[0], F_SETFD, FD_CLOEXEC);
++    fcntl(pipe_fds[1], F_SETFD, FD_CLOEXEC);
++  }
++  
++  // Write initial value if non-zero
++  if (initval > 0) {
++    uint64_t val = initval;
++    write(pipe_fds[1], &val, sizeof(val));
++  }
++  
++  // For eventfd emulation, we need to store both read and write ends
++  // We'll return the read end as the main fd, and store the write end
++  // This is a simplified implementation - a full implementation would
++  // need a custom FileInstance subclass to handle both ends properly
++  close(pipe_fds[1]); // For now, close write end
++  
++  return std::shared_ptr<FileInstance>(new FileInstance(pipe_fds[0], 0));
++#endif
+ }
+ 
+ #ifdef CUTTLEFISH_HOST
+@@ -475,9 +598,27 @@ SharedFD SharedFD::Open(const char* path, int flags, mode_t mode) {
+ }
+ 
+ SharedFD SharedFD::InotifyFd(void) {
++#ifdef __linux__  
+   errno = 0;
+   int fd = TEMP_FAILURE_RETRY(inotify_init1(IN_CLOEXEC));
+   return SharedFD(std::shared_ptr<FileInstance>(new FileInstance(fd, errno)));
++#elif defined(__APPLE__)
++  // Use kqueue as inotify replacement on macOS
++  errno = 0;
++  int fd = kqueue();
++  if (fd != -1) {
++    // Set CLOEXEC flag
++    fcntl(fd, F_SETFD, FD_CLOEXEC);
++    
++    // Initialize the watch tracking for this kqueue
++    std::lock_guard<std::mutex> lock(kqueue_mutex);
++    kqueue_watches[fd] = std::unordered_map<int, KqueueWatch>();
++  }
++  return SharedFD(std::shared_ptr<FileInstance>(new FileInstance(fd, errno)));
++#else
++  // inotify is not available on non-Linux systems
++  return SharedFD(std::shared_ptr<FileInstance>(new FileInstance(-1, ENOSYS)));
++#endif
+ }
+ 
+ SharedFD SharedFD::Creat(const std::string& path, mode_t mode) {
+@@ -698,7 +839,6 @@ SharedFD SharedFD::SocketLocalServer(const std::string& name, bool abstract,
+   return rval;
+ }
+ 
+-#ifdef __linux__
+ SharedFD SharedFD::VsockServer(
+     unsigned int port, int type,
+     std::optional<int> vhost_user_vsock_listening_cid, unsigned int cid) {
+@@ -712,7 +852,7 @@ SharedFD SharedFD::VsockServer(
+         GetVhostUserVsockServerAddr(port, *vhost_user_vsock_listening_cid),
+         false /* abstract */, type, 0666 /* mode */);
+   }
+-
++#if defined(__linux__) || defined(__APPLE__)
+   auto vsock = SharedFD::Socket(AF_VSOCK, type, 0);
+   if (!vsock->IsOpen()) {
+     return vsock;
+@@ -875,7 +1015,7 @@ int FileInstance::GetSockName(struct sockaddr* addr, socklen_t* addrlen) {
+   return TEMP_FAILURE_RETRY(getsockname(fd_, addr, addrlen));
+ }
+ 
+-#ifdef __linux__
++#if defined(__linux__) || defined(__APPLE__)
+ unsigned int FileInstance::VsockServerPort() {
+   struct sockaddr_vm vm_socket;
+   socklen_t length = sizeof(vm_socket);
+@@ -929,11 +1069,22 @@ ssize_t FileInstance::Read(void* buf, size_t count) {
+   return TEMP_FAILURE_RETRY(read(fd_, buf, count));
+ }
+ 
+-#ifdef __linux__
++#if defined(__linux__) || defined(__APPLE__)
+ int FileInstance::EventfdRead(eventfd_t* value) {
+   LocalErrno record_errno(errno_);
+ 
++#ifdef __linux__
+   return eventfd_read(fd_, value);
++#elif defined(__APPLE__)
++  // macOS doesn't have eventfd_read, so we emulate it using read()
++  // eventfd_t is typically uint64_t, so we read the value directly
++  ssize_t result = read(fd_, value, sizeof(*value));
++  if (result == sizeof(*value)) {
++    return 0;  // Success
++  } else {
++    return -1; // Error (errno is already set by read())
++  }
++#endif
+ }
+ #endif
+ 
+@@ -1023,11 +1174,22 @@ ssize_t FileInstance::Write(const void* buf, size_t count) {
+   return TEMP_FAILURE_RETRY(write(fd_, buf, count));
+ }
+ 
+-#ifdef __linux__
++#if defined(__linux__) || defined(__APPLE__)
+ int FileInstance::EventfdWrite(eventfd_t value) {
+   LocalErrno record_errno(errno_);
+ 
++#ifdef __linux__
+   return eventfd_write(fd_, value);
++#elif defined(__APPLE__)
++  // macOS doesn't have eventfd_write, so we emulate it using write()
++  // eventfd_t is typically uint64_t, so we write the value directly
++  ssize_t result = write(fd_, &value, sizeof(value));
++  if (result == sizeof(value)) {
++    return 0;  // Success
++  } else {
++    return -1; // Error (errno is already set by write())
++  }
++#endif
+ }
+ #endif
+ 
+@@ -1043,8 +1205,9 @@ int FileInstance::Futimens(const struct timespec times[2]) {
+   return TEMP_FAILURE_RETRY(futimens(fd_, times));
+ }
+ 
+-#ifdef __linux__
++#if defined(__linux__) || defined(__APPLE__)
+ Result<std::string> FileInstance::ProcFdLinkTarget() const {
++  #ifdef __linux__
+   std::stringstream output_composer;
+   output_composer << "/proc/" << getpid() << "/fd/" << fd_;
+   const std::string mem_fd_link = output_composer.str();
+@@ -1053,16 +1216,102 @@ Result<std::string> FileInstance::ProcFdLinkTarget() const {
+       android::base::Readlink(mem_fd_link, &mem_fd_target),
+       "Getting link for the memory file \"" << mem_fd_link << "\" failed");
+   return mem_fd_target;
++#elif defined(__APPLE__)
++  // macOS doesn't have /proc filesystem, so we use fcntl to get file path
++  // This is a best-effort implementation - not all file descriptors will have paths
++  char path_buffer[PATH_MAX];
++  if (fcntl(fd_, F_GETPATH, path_buffer) == -1) {
++    // If F_GETPATH fails, try to get some basic info about the fd
++    struct stat st;
++    if (fstat(fd_, &st) == 0) {
++      std::stringstream fallback;
++      fallback << "fd:" << fd_ << " (dev:" << st.st_dev << ",ino:" << st.st_ino << ")";
++      return fallback.str();
++    } else {
++      return CF_ERR("Unable to get path for fd " << fd_ << ": " << strerror(errno));
++    }
++  }
++  return std::string(path_buffer);
++#endif
+ }
+ #endif
+ 
+ // inotify related functions
+ int FileInstance::InotifyAddWatch(const std::string& pathname, uint32_t mask) {
++  #ifdef __linux__
++  LocalErrno record_errno(errno_);
+   return inotify_add_watch(fd_, pathname.c_str(), mask);
++#elif defined(__APPLE__)
++  LocalErrno record_errno(errno_);
++  
++  // Open the file to get a file descriptor for kqueue
++  int watch_fd = open(pathname.c_str(), O_RDONLY);
++  if (watch_fd == -1) {
++    return -1;
++  }
++  
++  // Convert inotify mask to kqueue filter flags
++  uint32_t kqueue_flags = InotifyMaskToKqueueFilter(mask);
++  
++  // Create kevent structure
++  struct kevent kev;
++  EV_SET(&kev, watch_fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, kqueue_flags, 0, nullptr);
++  
++  // Add the event to the kqueue
++  if (kevent(fd_, &kev, 1, nullptr, 0, nullptr) == -1) {
++    close(watch_fd);
++    return -1;
++  }
++  // Track this watch
++  std::lock_guard<std::mutex> lock(kqueue_mutex);
++  int watch_id = next_watch_id++;
++  kqueue_watches[fd_][watch_id] = {watch_fd, pathname, mask};
++  
++  return watch_id;
++#else
++  (void)pathname;
++  (void)mask;
++  errno_ = ENOSYS;
++  return -1;
++#endif
+ }
+ 
+ void FileInstance::InotifyRmWatch(int watch) {
++  #ifdef __linux__
++  LocalErrno record_errno(errno_);
+   inotify_rm_watch(fd_, watch);
++#elif defined(__APPLE__)
++  LocalErrno record_errno(errno_);
++  
++  std::lock_guard<std::mutex> lock(kqueue_mutex);
++  auto kqueue_it = kqueue_watches.find(fd_);
++  if (kqueue_it == kqueue_watches.end()) {
++    errno_ = EINVAL;
++    return;
++  }
++  
++  auto watch_it = kqueue_it->second.find(watch);
++  if (watch_it == kqueue_it->second.end()) {
++    errno_ = EINVAL;
++    return;
++  }
++  // Remove the event from kqueue
++  struct kevent kev;
++  EV_SET(&kev, watch_it->second.watch_fd, EVFILT_VNODE, EV_DELETE, 0, 0, nullptr);
++  kevent(fd_, &kev, 1, nullptr, 0, nullptr);
++  
++  // Close the watched file descriptor
++  close(watch_it->second.watch_fd);
++  
++  // Remove from tracking
++  kqueue_it->second.erase(watch_it);
++  if (kqueue_it->second.empty()) {
++    kqueue_watches.erase(kqueue_it);
++  }
++#else
++  (void)watch;
++  errno_ = ENOSYS;
++#endif
+ }
+ 
+ FileInstance::FileInstance(int fd, int in_errno)
+diff --git a/common/libs/fs/shared_fd.h b/common/libs/fs/shared_fd.h
+index 4ae867b02..597cd9514 100644
+--- a/common/libs/fs/shared_fd.h
++++ b/common/libs/fs/shared_fd.h
+@@ -22,8 +22,11 @@
+ #ifdef __linux__
+ #include <sys/epoll.h>
+ #include <sys/eventfd.h>
+-#endif
+ #include <sys/inotify.h>
++#elif defined(__APPLE__)
++#include <cstdint>
++typedef uint64_t eventfd_t;
++#endif
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+ #include <sys/select.h>
+@@ -51,6 +54,8 @@
+ 
+ #ifdef __linux__
+ #include <linux/vm_sockets.h>
++#elif defined(__APPLE__)
++#include <sys/vsock.h>
+ #endif
+ 
+ #include "common/libs/utils/result.h"
+@@ -149,7 +154,7 @@ class SharedFD {
+   static int Fchdir(SharedFD);
+   static Result<SharedFD> Fifo(const std::string& pathname, mode_t mode);
+   static bool Pipe(SharedFD* fd0, SharedFD* fd1);
+-#ifdef __linux__
++#if defined __linux__ || defined(__APPLE__)
+   static SharedFD Event(int initval = 0, int flags = 0);
+ #ifdef CUTTLEFISH_HOST
+   static SharedFD ShmOpen(const std::string& name, int oflag, int mode);
+@@ -178,7 +183,7 @@ class SharedFD {
+                                     int in_type, mode_t mode);
+   static SharedFD SocketLocalServer(int port, int type);
+ 
+-#ifdef __linux__
++#if defined __linux__ || defined(__APPLE__)
+   // For binding in vsock, svm_cid from `cid` param would be either
+   // VMADDR_CID_ANY, VMADDR_CID_LOCAL, VMADDR_CID_HOST or their own CID, and it
+   // is used for indicating connections which it accepts from.
+@@ -328,7 +333,7 @@ class FileInstance {
+   int GetErrno() const { return errno_; }
+   int GetSockName(struct sockaddr* addr, socklen_t* addrlen);
+ 
+-#ifdef __linux__
++#if defined __linux__ || defined(__APPLE__)
+   unsigned int VsockServerPort();
+ #endif
+ 
+@@ -357,7 +362,7 @@ class FileInstance {
+   ssize_t Recv(void* buf, size_t len, int flags);
+   ssize_t RecvMsg(struct msghdr* msg, int flags);
+   ssize_t Read(void* buf, size_t count);
+-#ifdef __linux__
++#if defined __linux__ || defined(__APPLE__)
+   int EventfdRead(eventfd_t* value);
+ #endif
+   ssize_t Send(const void* buf, size_t len, int flags);
+@@ -390,16 +395,17 @@ class FileInstance {
+    *
+    */
+   ssize_t Write(const void* buf, size_t count);
+-#ifdef __linux__
++#if defined __linux__ || defined(__APPLE__)
+   int EventfdWrite(eventfd_t value);
+ #endif
+   bool IsATTY();
+ 
+   int Futimens(const struct timespec times[2]);
+-
++#if defined(__linux__) || defined(__APPLE__)
+   // Returns the target of "/proc/getpid()/fd/" + std::to_string(fd_)
+   // if appropriate
+   Result<std::string> ProcFdLinkTarget() const;
++#endif
+ 
+   // inotify related functions
+   int InotifyAddWatch(const std::string& pathname, uint32_t mask);

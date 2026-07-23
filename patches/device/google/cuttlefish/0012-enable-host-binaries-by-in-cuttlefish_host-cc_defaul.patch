@@ -1,0 +1,49 @@
+From 4d5deef1a92ff814505fe8b3d81b9a21ee155302 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 7 Aug 2025 09:12:28 -0700
+Subject: [PATCH 12/63] enable host binaries by in cuttlefish_host cc_default
+ and link CoreFoundation
+
+Summary: This fixes control_env_proxy and enables all targets that use defaults cuttlefish_host
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79814335
+
+Tags: aarch64
+---
+ Android.bp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/Android.bp b/Android.bp
+index 0abefcd5d..268f476ad 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -163,6 +163,14 @@ cc_defaults {
+         "cuttlefish_base",
+         "cvd_cc_defaults",
+     ],
++    target: {
++        darwin: {
++            enabled: true,
++            host_ldlibs: [
++                "-framework CoreFoundation",
++            ],
++        },
++    }
+ }
+ 
+ // Same as "cuttlefish_host", but only for non-Android OS.

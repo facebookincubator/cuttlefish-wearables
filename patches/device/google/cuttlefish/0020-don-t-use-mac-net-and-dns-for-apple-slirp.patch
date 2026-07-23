@@ -1,0 +1,63 @@
+From 67b6fa47ade9d1234643f6029cd94ece14f2db15 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Fri, 15 Aug 2025 13:45:48 -0700
+Subject: [PATCH 20/63] don't use mac, net, and dns for apple slirp
+
+Summary:
+# Motivation:
+These arguments conflict with the setup_wifi for virt_wifi
+
+# Overview:
+- remove args for macos
+
+Test Plan:
+
+| Before | After |
+| -- |
+|{F1981262455}|{F1981262442}|
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, josephknox, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D80369417
+---
+ host/libs/vm_manager/qemu_manager.cpp | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 5adb6e990..3989f43f7 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -847,7 +847,11 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+ 
+       if (!config.virtio_mac80211_hwsim()) {
+         qemu_cmd.AddParameter("-netdev");
+-        qemu_cmd.AddParameter("user,id=hostnet2,net=10.0.2.1/24,dns=1.1.1.1");
++#ifdef __APPLE__
++qemu_cmd.AddParameter("user,id=hostnet2");
++#else
++qemu_cmd.AddParameter("user,id=hostnet2,net=10.0.2.1/24,dns=1.1.1.1");
++#endif
+       }
+       break;
+     }
+@@ -869,9 +873,14 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+         instance.ethernet_mac());
+     if (!config.virtio_mac80211_hwsim()) {
+       qemu_cmd.AddParameter("-device");
++#ifdef __APPLE__
++      qemu_cmd.AddParameter(
++          "virtio-net-pci-non-transitional,netdev=hostnet2,id=net2");
++#else
+       qemu_cmd.AddParameter(
+           "virtio-net-pci-non-transitional,netdev=hostnet2,id=net2,mac=",
+           instance.wifi_mac());
++#endif
+     }
+   }
+ 

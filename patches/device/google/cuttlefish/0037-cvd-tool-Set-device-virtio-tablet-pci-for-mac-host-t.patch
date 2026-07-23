@@ -1,0 +1,95 @@
+From 0f2c79b767ae44eaff33285d7e288eccddc72ea0 Mon Sep 17 00:00:00 2001
+From: Jeffrey Effendy <jeffreyeffendy@meta.com>
+Date: Thu, 19 Feb 2026 07:43:38 +0000
+Subject: [PATCH 37/63] [cvd-tool] Set device virtio-tablet-pci for mac host to
+ enable using host cursor
+
+Summary:
+** Context **
+
+This is part of resolving user request where user experience is degrading due to host mouse cursor is grabbed when interacting with QEMU UI window and needing to press `ctrl+opt+g` to escape.
+
+Previously, the experience with Goldfish QEMU was that user can use host cursor without switching to guest cursor. So, the same experience should be expected with Cuttlefish QEMU.
+
+See [user feedback doc](https://fburl.com/gdoc/3a669dh0)
+
+** Diff Content **
+
+- Set cocoa UI to always show cursor whenever interacting with QEMU UI.
+- Set device to `virtio-tablet-pci` so that the interaction is using absolute mode, which is set by `INPUT_EVENT_MASK_ABS` in https://fburl.com/code/3rdqimrp. This would allow auto grab/ungrab and using absolute coordinate and not relative to the QEMU window.
+
+Test Plan:
+With device set, now we can use host mouse to interact with QEMU UI.
+
+Build host tools on mac
+```
+mkdir -p ~/cvd-tools && cd ~/cvd-tools
+repo init -u ssh://git-ro.vip.facebook.com/data/gitrepos/aosp/manifest.git \
+  --repo-url=ssh://git.vip.facebook.com/data/gitrepos/osmeta/external/repo.git \
+  --repo-branch=master \
+  --current-branch --no-repo-verify --no-tags -b releases-nucleus-16.0-tiki-adhoc-cf-darwin-host-tools-system \
+  --no-clone-bundle
+repo sync -c -d --no-tags --force-sync -j12
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+Make sure QEMU change is applied D93701930
+
+Get emulator, modify the script to point to the local qemu, and start emulator
+```
+device device virtual -t device --cache-only
+cd greatwhite_cf_emu_arm64-27580000003761-742834115373444
+ln -s ~/cvd-tools/out/host/darwin-x86/cvd-host_package/* .
+sed -i '' 's/{macos_qemu_path}/\/Users\/jeffreyeffendy\/qemu\/build/g' start_cuttlefish.py
+./start_cuttlefish.py --enable_audio=false
+```
+https://pxl.cl/8VSzM
+
+Reviewers: achong, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: achong
+
+Subscribers: #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D93705557
+
+Tasks: T251649620
+
+Tags: aarch64
+---
+ host/libs/vm_manager/qemu_manager.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 9b3d1fb4e..0c9fe11da 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -486,9 +486,9 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+ #ifdef __APPLE__
+   qemu_cmd.AddParameter("-display");
+   if (qemu_help.find("use-bgra") != std::string::npos) {
+-    qemu_cmd.AddParameter("cocoa,use-bgra=on");
++    qemu_cmd.AddParameter("cocoa,use-bgra=on,show-cursor=on");
+   } else {
+-    qemu_cmd.AddParameter("cocoa");
++    qemu_cmd.AddParameter("cocoa,show-cursor=on");
+   }
+ #else
+   qemu_cmd.AddParameter("-vnc");
+@@ -808,8 +808,14 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+ 
+   // TODO: Use the vhost-user devices instead if/when qemu is accessed via
+   // webRTC instead of VNC.
++#ifdef __APPLE__
++  // Treat interaction like touch screen devices so we can use host mouse cursor
++  qemu_cmd.AddParameter("-device");
++  qemu_cmd.AddParameter("virtio-tablet-pci");
++#else
+   qemu_cmd.AddParameter("-device");
+   qemu_cmd.AddParameter("virtio-mouse-pci,disable-legacy=on");
++#endif
+ 
+   qemu_cmd.AddParameter("-device");
+   qemu_cmd.AddParameter("virtio-keyboard-pci,disable-legacy=on");

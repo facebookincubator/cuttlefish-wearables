@@ -1,0 +1,86 @@
+From 2edbdfe2b3f9fac7fe5271a04667885493310df3 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 25 Mar 2026 16:04:11 -0700
+Subject: [PATCH 47/63] [cuttlefish] Fix O_TMPFILE and null pointer dereference
+ on macOS
+
+Summary:
+Two independent macOS bugfixes:
+
+1. assemble_cvd: O_TMPFILE is Linux-specific and doesn't exist on macOS.
+   Replace with a temp file + immediate unlink to match O_TMPFILE semantics.
+
+2. stop_cvd: CuttlefishConfig::Get() can return nullptr when no config
+   file exists (e.g., when using the instance registry). Guard the
+   enable_metrics() call to prevent a null pointer dereference crash.
+
+Test Plan: Build on macOS: cd /Volumes/AOSP && source build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+
+Reviewers: jeffreyeffendy, #wearables_emulators, ivantsou
+
+Reviewed By: jeffreyeffendy
+
+Subscribers: #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D98224587
+
+Tags: aarch64
+---
+ host/commands/assemble_cvd/assemble_cvd.cc | 17 ++++++++++++++++-
+ host/commands/stop/main.cc                 |  6 ++++--
+ 2 files changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/host/commands/assemble_cvd/assemble_cvd.cc b/host/commands/assemble_cvd/assemble_cvd.cc
+index 0a99ea01c..cd42a929f 100644
+--- a/host/commands/assemble_cvd/assemble_cvd.cc
++++ b/host/commands/assemble_cvd/assemble_cvd.cc
+@@ -121,7 +121,12 @@ Result<void> SaveConfig(const CuttlefishConfig& tmp_config_obj) {
+ }
+ 
+ #ifndef O_TMPFILE
+-# define O_TMPFILE (020000000 | O_DIRECTORY)
++// O_TMPFILE is Linux-specific. On macOS, we can't use it.
++# ifdef __APPLE__
++#   define CF_O_TMPFILE_UNSUPPORTED 1
++# else
++#   define O_TMPFILE (020000000 | O_DIRECTORY)
++# endif
+ #endif
+ 
+ Result<void> CreateLegacySymlinks(
+@@ -305,8 +310,18 @@ Result<SharedFD> SetLogger(std::string runtime_dir_parent) {
+     }
+     runtime_dir_parent =
+         runtime_dir_parent.substr(0, FLAGS_instance_dir.rfind('/'));
++#ifdef CF_O_TMPFILE_UNSUPPORTED
++    // macOS doesn't support O_TMPFILE. Use a regular temp file instead.
++    auto tmp_log = runtime_dir_parent + "/assemble_cvd_tmp.log";
++    log_file = SharedFD::Open(tmp_log, O_WRONLY | O_CREAT | O_TRUNC,
++                              S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
++    // Unlink immediately so the file is deleted when the fd is closed,
++    // matching O_TMPFILE semantics on Linux.
++    unlink(tmp_log.c_str());
++#else
+     log_file = SharedFD::Open(runtime_dir_parent, O_WRONLY | O_TMPFILE,
+                               S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
++#endif
+   }
+   if (!log_file->IsOpen()) {
+     LOG(ERROR) << "Could not open initial log file: " << log_file->StrError();
+diff --git a/host/commands/stop/main.cc b/host/commands/stop/main.cc
+index 903c8e970..5419f9a7f 100644
+--- a/host/commands/stop/main.cc
++++ b/host/commands/stop/main.cc
+@@ -270,8 +270,10 @@ int main(int argc, char** argv) {
+     return 134;
+   }
+ 
+-  if (cuttlefish::CuttlefishConfig::Get()->enable_metrics() ==
+-      cuttlefish::CuttlefishConfig::Answer::kYes) {
++  auto* metrics_config = cuttlefish::CuttlefishConfig::Get();
++  if (metrics_config &&
++      metrics_config->enable_metrics() ==
++          cuttlefish::CuttlefishConfig::Answer::kYes) {
+     cuttlefish::MetricsReceiver::LogMetricsVMStop();
+   }
+ 

@@ -1,0 +1,214 @@
+From ba6f0123b20c71c56fcd59730850ebce2da7c419 Mon Sep 17 00:00:00 2001
+From: Roger Hernando <rogerhb@meta.com>
+Date: Tue, 9 Jun 2026 18:25:18 +0100
+Subject: [PATCH 63/63] [cuttlefish][darwin-host-tools] Backport
+ --extra_qemu_args passthrough
+
+Summary:
+The darwin-aarch64 cuttlefish host tools shipped with device drops are built
+from releases-nucleus-16.0-tiki-adhoc-cf-darwin-host-tools-system, which is
+substantially behind the upstream cuttlefish that carries the
+--extra_qemu_args flag. On this branch the flag is MISSING entirely:
+launch_cvd -extra_qemu_args=... fails with "unknown command line flag
+'extra_qemu_args'", so QEMU+Crashpad config cannot be forwarded through
+Cuttlefish on macOS.
+
+This ports the full feature (not just D106842176's comma-truncation fix,
+since there is nothing here to fix yet), plumbed through every layer and
+modeled on the existing qemu_binary_dir flag and the extra_bootconfig_args
+per-instance vector config:
+
+- assemble_cvd/flags_defaults.h: add CF_DEFAULTS_EXTRA_QEMU_ARGS ("").
+- assemble_cvd/flags.cc: DEFINE_string(extra_qemu_args, ...); in the
+  per-instance loop, read FLAGS_extra_qemu_args DIRECTLY (not via
+  GET_FLAG_STR_VALUE(), whose helper splits on ',' -- cuttlefish's
+  per-instance separator -- which would truncate qemu args that legitimately
+  contain commas). This carries forward D106842176's key insight so
+  comma-containing crashpad args survive intact.
+- cuttlefish_config.{h,cpp}: add InstanceSpecific extra_qemu_args() getter and
+  set_extra_qemu_args() setter. Stored as a raw string, space-split on read
+  (mirrors extra_bootconfig_args).
+- vm_manager/qemu_manager.cpp: forward each arg to the QEMU command via
+  AddParameter just before the command is finalized.
+
+Net effect matches the live Linux behavior: a single comma-joined
+-extra_qemu_args="-crashpad enable=on,database=...,url=...,annotation=..."
+reaches qemu without truncation.
+
+Test Plan:
+E2e tets by compiling host tools, patching and running via device:
+
+Sync mac host repo:
+```
+mkdir -p ~/cvd-tools && cd ~/cvd-tools
+repo init -u ssh://git-ro.vip.facebook.com/data/gitrepos/aosp/manifest.git \
+  --repo-url=ssh://git.vip.facebook.com/data/gitrepos/osmeta/external/repo.git \
+  --repo-branch=master \
+  --current-branch --no-repo-verify --no-tags -b releases-nucleus-16.0-tiki-adhoc-cf-darwin-host-tools-system \
+  --no-clone-bundle
+repo sync -c -d --no-tags --force-sync -j12
+```
+Do changes and build teh host tools:
+```
+source build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+Patched host tools into the device cache.. --skip-build-hash-check
+stops device from re-validating and clobbering the patched binaries.
+```
+device=~/.device/cache/emulators/greatwhite_cf_emu_arm64-83500000003761-2029679934606809
+cp out/host/darwin-x86/bin/{assemble_cvd,run_cvd} "$device/bin/"
+rm -rf "$device/cuttlefish"   # force fresh assembly
+mkdir -p ~/cvd-e2e/crashpad-db-bundled
+
+device device emulator -t device --skip-build-hash-check \
+  --extra-emu-args='-extra_qemu_args="-crashpad enable=on,database=/Users/rogerhb/cvd-e2e/crashpad-db-bundled,url=https://developer.147447.od.oculus.com/emulator/crash/,handler='"$device"'/qemu-cf/darwin-aarch64/libexec/crashpad_handler,annotation=maui_command_id:rogerhb-T275117255-e2e"'
+```
+
+Check the QEMU cmdline to validate options are passed correctly:
+```
+QPID=$(pgrep -f "qemu-system-aarch64 -name guest=cvd-1" | head -1)
+ps -o command= -p "$QPID" | grep -o '\-crashpad enable=on[^ ]*'
+# -crashpad enable=on,database=/Users/rogerhb/cvd-e2e/crashpad-db-bundled,url=https://developer.147447.od.oculus.com/emulator/crash/,handler=<cache>/qemu-cf/darwin-aarch64/libexec/crashpad_handler,annotation=maui_command_id:rogerhb-T275117255-e2e
+```
+
+Trigger a crash and confirm the OD breakpoint catches it:
+```
+kill -SEGV "$QPID"
+ls ~/cvd-e2e/crashpad-db-bundled/pending/     # dedce754-...dmp  (HELD)
+ls ~/cvd-e2e/crashpad-db-bundled/completed/    # empty - held at breakpoint
+```
+Validate crash hits OD breakpoint on developer.147447.od.oculus.com HIT, carrying
+annotation maui_command_id:rogerhb-T275117255-e2e.
+{F1991028076}
+
+Once breakpoint is released crash report flips to completed
+```
+ls ~/cvd-e2e/crashpad-db-bundled/completed/
+dedce754-9b01-47e5-9cba-4c3353d8b313.dmp
+```
+
+Reviewers: jeffreyeffendy, josephknox, #wearables_emulators, achong
+
+Reviewed By: jeffreyeffendy
+
+Subscribers: #sentinel
+
+Differential Revision: https://phabricator.intern.facebook.com/D108036353
+
+Tasks: T275117255
+
+Tags: commitClose, aarch64, accept2ship, sentinelized
+---
+ host/commands/assemble_cvd/flags.cc           |  8 ++++++++
+ host/commands/assemble_cvd/flags_defaults.h   |  1 +
+ host/libs/config/cuttlefish_config.h          |  2 ++
+ .../config/cuttlefish_config_instance.cpp     | 19 +++++++++++++++++++
+ host/libs/vm_manager/qemu_manager.cpp         |  5 +++++
+ 5 files changed, 35 insertions(+)
+
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index 6b047f31f..1e07dedca 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -351,6 +351,8 @@ DEFINE_vec(extra_bootconfig_args_base64, CF_DEFAULTS_EXTRA_BOOTCONFIG_ARGS,
+ 
+ DEFINE_string(qemu_binary_dir, CF_DEFAULTS_QEMU_BINARY_DIR,
+               "Path to the directory containing the qemu binary to use");
++DEFINE_string(extra_qemu_args, CF_DEFAULTS_EXTRA_QEMU_ARGS,
++              "Space-separated list of extra arguments to pass to qemu");
+ DEFINE_string(crosvm_binary, CF_DEFAULTS_CROSVM_BINARY,
+               "The Crosvm binary to use");
+ DEFINE_vec(gem5_binary_dir, CF_DEFAULTS_GEM5_BINARY_DIR,
+@@ -1591,6 +1593,12 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+     instance.set_seccomp_policy_dir(seccomp_policy_dir_vec[instance_index]);
+     instance.set_qemu_binary_dir(qemu_binary_dir_vec[instance_index]);
+ 
++    // Read FLAGS_extra_qemu_args directly, not via GET_FLAG_STR_VALUE(): that
++    // helper splits on ',' (cuttlefish's per-instance separator), which would
++    // truncate qemu args that legitimately contain commas. Applied to all
++    // instances.
++    instance.set_extra_qemu_args(FLAGS_extra_qemu_args);
++
+     // wifi, bluetooth, Thread, connectivity setup
+ 
+     instance.set_vhost_net(vhost_net_vec[instance_index]);
+diff --git a/host/commands/assemble_cvd/flags_defaults.h b/host/commands/assemble_cvd/flags_defaults.h
+index b3fd160fd..d2efad0e3 100644
+--- a/host/commands/assemble_cvd/flags_defaults.h
++++ b/host/commands/assemble_cvd/flags_defaults.h
+@@ -69,6 +69,7 @@
+ 
+ // Qemu default parameters
+ #define CF_DEFAULTS_QEMU_BINARY_DIR cuttlefish::DefaultQemuBinaryDir()
++#define CF_DEFAULTS_EXTRA_QEMU_ARGS ""
+ 
+ // Gem5 default parameters
+ #define CF_DEFAULTS_GEM5_BINARY_DIR HostBinaryPath("gem5")
+diff --git a/host/libs/config/cuttlefish_config.h b/host/libs/config/cuttlefish_config.h
+index 35e2e333c..d18ce0609 100644
+--- a/host/libs/config/cuttlefish_config.h
++++ b/host/libs/config/cuttlefish_config.h
+@@ -673,6 +673,7 @@ class CuttlefishConfig {
+     std::string crosvm_binary() const;
+     std::string seccomp_policy_dir() const;
+     std::string qemu_binary_dir() const;
++    std::vector<std::string> extra_qemu_args() const;
+ 
+     // Configuration flags for a minimal device
+     bool enable_minimal_mode() const;
+@@ -904,6 +905,7 @@ class CuttlefishConfig {
+     void set_crosvm_binary(const std::string& crosvm_binary);
+     void set_seccomp_policy_dir(const std::string& seccomp_policy_dir);
+     void set_qemu_binary_dir(const std::string& qemu_binary_dir);
++    void set_extra_qemu_args(const std::string& extra_qemu_args);
+ 
+     void set_vhost_net(bool vhost_net);
+     void set_vhost_user_vsock(bool vhost_user_vsock);
+diff --git a/host/libs/config/cuttlefish_config_instance.cpp b/host/libs/config/cuttlefish_config_instance.cpp
+index d594bd93c..8bf02537f 100644
+--- a/host/libs/config/cuttlefish_config_instance.cpp
++++ b/host/libs/config/cuttlefish_config_instance.cpp
+@@ -1279,6 +1279,25 @@ void CuttlefishConfig::MutableInstanceSpecific::set_qemu_binary_dir(
+   (*Dictionary())[kQemuBinaryDir] = qemu_binary_dir;
+ }
+ 
++static constexpr char kExtraQemuArgs[] = "extra_qemu_args";
++std::vector<std::string>
++CuttlefishConfig::InstanceSpecific::extra_qemu_args() const {
++  std::string extra_qemu_args_str =
++      (*Dictionary())[kExtraQemuArgs].asString();
++  std::vector<std::string> qemu_args;
++  if (!extra_qemu_args_str.empty()) {
++    for (const auto& arg :
++         android::base::Split(extra_qemu_args_str, " ")) {
++      qemu_args.push_back(arg);
++    }
++  }
++  return qemu_args;
++}
++void CuttlefishConfig::MutableInstanceSpecific::set_extra_qemu_args(
++    const std::string& extra_qemu_args) {
++  (*Dictionary())[kExtraQemuArgs] = extra_qemu_args;
++}
++
+ static constexpr char kVhostNet[] = "vhost_net";
+ void CuttlefishConfig::MutableInstanceSpecific::set_vhost_net(bool vhost_net) {
+   (*Dictionary())[kVhostNet] = vhost_net;
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 1ac972b02..b32813b95 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -1131,6 +1131,11 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+     add_hvc_sink();
+   }
+ 
++  // Forward any user-supplied qemu args (e.g. -crashpad enable=on,...) verbatim.
++  for (const auto& arg : instance.extra_qemu_args()) {
++    qemu_cmd.AddParameter(arg);
++  }
++
+   commands.emplace_back(std::move(qemu_cmd), true);
+   return commands;
+ }

@@ -1,0 +1,72 @@
+From 7555711148edc685e9f45a30de4ec66bff873c3c Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Fri, 15 Aug 2025 11:50:59 -0700
+Subject: [PATCH 16/63] add helper function to get qemu help string
+
+Summary:
+# Motivation:
+To avoid using unsupported parameters we can check the help string of the qemu binary. This helps when a flag is not part of a support version or qemu hasn't been built with the correct dependencies.
+
+Test Plan:
+# Build Host Tools
+```
+ . build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+unset TMPDIR
+HOME=/Users/achong/n-16/out/host/darwin-x86 out/host/darwin-x86/bin/launch_cvd  \
+--use-overlay=false --vm_manager=qemu_cli  --system_image_dir=/Users/achong/n-16/out/host/darwin-x86 \
+--qemu_binary_dir=/Users/achong/qemu/build --enable-audio=false \
+--enable_host_uwb=false -console=true --start_webrtc=true \
+-device_external_network=slirp \
+--enable_dev_qemu_monitor=true \
+--vhost_user_vsock
+
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D80360899
+
+Tags: aarch64
+---
+ host/libs/vm_manager/qemu_manager.cpp | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 6260d03b7..70b5a3e96 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -86,6 +86,24 @@ StopperResult Stop() {
+   return StopperResult::kStopSuccess;
+ }
+ 
++Result<std::string> GetQemuHelpString(const std::string& qemu_binary) {
++  Command qemu_help_cmd(qemu_binary);
++  qemu_help_cmd.AddParameter("-help");
++
++  std::string qemu_help_input, qemu_help_output, qemu_help_error;
++  cuttlefish::SubprocessOptions options;
++  options.Verbose(false);
++  int qemu_help_ret = cuttlefish::RunWithManagedStdio(
++      std::move(qemu_help_cmd), &qemu_help_input, &qemu_help_output,
++      &qemu_help_error, std::move(options));
++  CF_EXPECT(qemu_help_ret == 0,
++            qemu_binary << " -help returned unexpected response "
++                        << qemu_help_output << ". Stderr was "
++                        << qemu_help_error);
++
++  return qemu_help_output;
++}
++
+ Result<std::pair<int, int>> GetQemuVersion(const std::string& qemu_binary) {
+   Command qemu_version_cmd(qemu_binary);
+   qemu_version_cmd.AddParameter("-version");

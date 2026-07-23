@@ -1,0 +1,90 @@
+From 7512224980adbd7bc8d03b07686d51b1d0ece5e7 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 4 Mar 2026 10:28:35 -1000
+Subject: [PATCH 39/63] [cuttlefish] Fix macOS platform issues in run_cvd
+
+Summary:
+# Motivation:
+- Replace /proc/self/exe with _NSGetExecutablePath() on macOS for
+  RestartRunCvd(). The /proc filesystem does not exist on macOS, so
+  powerwash and restart operations would fail.
+
+{F1986640832}
+
+- Add documentation comment for the missing PR_SET_PDEATHSIG on macOS.
+  The parent socket (child_channel_) provides EOF detection when the
+  parent process dies, which serves the same purpose.
+
+Test Plan:
+```
+. build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+Reviewers: guolinliu, #wearables_emulators, drahul
+
+Reviewed By: guolinliu
+
+Subscribers: #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D95272949
+
+Tags: aarch64
+---
+ host/commands/run_cvd/server_loop_impl.cpp   | 18 +++++++++++++++++-
+ host/libs/process_monitor/process_monitor.cc |  6 ++++++
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/host/commands/run_cvd/server_loop_impl.cpp b/host/commands/run_cvd/server_loop_impl.cpp
+index 5d6d9a463..c0298f94b 100644
+--- a/host/commands/run_cvd/server_loop_impl.cpp
++++ b/host/commands/run_cvd/server_loop_impl.cpp
+@@ -18,6 +18,11 @@
+ 
+ #include <unistd.h>
+ 
++#ifdef __APPLE__
++#include <mach-o/dyld.h>
++#endif
++
++#include <climits>
+ #include <memory>
+ #include <string>
+ #include <utility>
+@@ -420,8 +425,19 @@ void ServerLoopImpl::RestartRunCvd(int notification_fd) {
+   argv[argv_vec.size()] = reboot_notification.data();
+   argv[argv_vec.size() + 1] = nullptr;
+ 
++#ifdef __APPLE__
++  char self_path[PATH_MAX];
++  uint32_t self_path_size = sizeof(self_path);
++  if (_NSGetExecutablePath(self_path, &self_path_size) == 0) {
++    char resolved_path[PATH_MAX];
++    if (realpath(self_path, resolved_path) != nullptr) {
++      execv(resolved_path, argv.get());
++    }
++  }
++#else
+   execv("/proc/self/exe", argv.get());
+-  // execve should not return, so something went wrong.
++#endif
++  // execv should not return, so something went wrong.
+   PLOG(ERROR) << "execv returned: ";
+ }
+ 
+diff --git a/host/libs/process_monitor/process_monitor.cc b/host/libs/process_monitor/process_monitor.cc
+index fb5814542..3f3fff778 100644
+--- a/host/libs/process_monitor/process_monitor.cc
++++ b/host/libs/process_monitor/process_monitor.cc
+@@ -420,6 +420,12 @@ Result<void> ProcessMonitor::MonitorRoutine() {
+   // See https://man7.org/linux/man-pages/man2/prctl.2.html
+   prctl(PR_SET_CHILD_SUBREAPER, 1);
+   prctl(PR_SET_PDEATHSIG, SIGHUP);  // Die when parent dies
++#else
++  // On macOS, PR_SET_PDEATHSIG is not available. Detect parent death by
++  // checking if our parent pid changed to 1 (reparented to launchd/init).
++  // This is checked periodically by the monitor loop via wait() timeouts.
++  // The parent socket (child_channel_) will also get EOF when parent dies,
++  // which ReadMonitorSocketLoop will detect.
+ #endif
+ 
+   LOG(DEBUG) << "Monitoring subprocesses";

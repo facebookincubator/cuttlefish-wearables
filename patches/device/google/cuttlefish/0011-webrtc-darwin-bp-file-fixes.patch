@@ -1,0 +1,247 @@
+From 1370e80bc24d943dd08690e59870bbebdae749ef Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 6 Aug 2025 15:25:18 -0700
+Subject: [PATCH 11/63] webrtc darwin bp file fixes
+
+Summary:
+# Motivation:
+webrtc is part of the host libraries for cuttlefish. they currently don't build on mac
+# Overview:
+- fix cflags for darwin build and libraries linked against
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+````
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79568366
+
+Tags: aarch64
+
+Privacy Context Container: L1248481
+---
+ host/frontend/webrtc/Android.bp            | 13 +++++++++++--
+ host/frontend/webrtc/libcommon/Android.bp  | 16 ++++++++++++++--
+ host/frontend/webrtc/libdevice/Android.bp  | 18 ++++++++++++++----
+ host/frontend/webrtc_operator/Android.bp   |  8 +++++++-
+ host/libs/input_connector/event_buffer.cpp |  2 ++
+ host/libs/screen_connector/Android.bp      |  1 +
+ host/libs/wayland/wayland_dmabuf.cpp       |  4 ++--
+ host/libs/websocket/Android.bp             |  8 +++++++-
+ 8 files changed, 58 insertions(+), 12 deletions(-)
+
+diff --git a/host/frontend/webrtc/Android.bp b/host/frontend/webrtc/Android.bp
+index b482b6281..da661aef6 100644
+--- a/host/frontend/webrtc/Android.bp
++++ b/host/frontend/webrtc/Android.bp
+@@ -94,7 +94,6 @@ cc_binary_host {
+     ],
+     cflags: [
+         // libwebrtc headers need this
+-        "-DWEBRTC_LINUX",
+         "-DWEBRTC_POSIX",
+         "-D_XOPEN_SOURCE",
+         "-Wno-unused-parameter",
+@@ -107,7 +106,6 @@ cc_binary_host {
+     static_libs: [
+         "libabsl_host",
+         "libaom",
+-        "libcap",
+         "libcn-cbor",
+         "libcuttlefish_audio_connector",
+         "libcuttlefish_confui",
+@@ -169,6 +167,17 @@ cc_binary_host {
+             header_libs: [
+                 "darwin-input-event-codes"
+             ],
++            cflags: [
++                "-DWEBRTC_MAC",
++            ],
++        },
++        linux: {
++            cflags: [
++                "-DWEBRTC_LINUX",
++            ],
++            static_libs: [
++                "libcap",
++            ]
+         },
+     }
+ }
+diff --git a/host/frontend/webrtc/libcommon/Android.bp b/host/frontend/webrtc/libcommon/Android.bp
+index 0e2974a79..f065f4e7a 100644
+--- a/host/frontend/webrtc/libcommon/Android.bp
++++ b/host/frontend/webrtc/libcommon/Android.bp
+@@ -29,8 +29,6 @@ cc_library {
+     ],
+     cflags: [
+         // libwebrtc headers need this
+-        "-DWEBRTC_LINUX",
+-        "-DWEBRTC_POSIX",
+         "-D_XOPEN_SOURCE",
+         "-Wno-unused-parameter",
+     ],
+@@ -51,4 +49,18 @@ cc_library {
+         "libssl",
+     ],
+     defaults: ["cuttlefish_buildhost_only"],
++    target: {
++        linux: {
++            cflags: [
++                "-DWEBRTC_LINUX",
++                "-DWEBRTC_POSIX",
++            ],
++        },
++        darwin: {
++            cflags: [
++                "-DWEBRTC_MAC",
++                "-DWEBRTC_POSIX",
++            ]
++        }
++    }
+ }
+diff --git a/host/frontend/webrtc/libdevice/Android.bp b/host/frontend/webrtc/libdevice/Android.bp
+index 310ff89e0..12f5547be 100644
+--- a/host/frontend/webrtc/libdevice/Android.bp
++++ b/host/frontend/webrtc/libdevice/Android.bp
+@@ -33,9 +33,6 @@ cc_library {
+         "video_track_source_impl.cpp",
+     ],
+     cflags: [
+-        // libwebrtc headers need this
+-        "-DWEBRTC_LINUX",
+-        "-DWEBRTC_POSIX",
+         "-D_XOPEN_SOURCE",
+         "-Wno-unused-parameter",
+     ],
+@@ -44,6 +41,20 @@ cc_library {
+             header_libs: [
+                 "darwin-input-event-codes"
+             ],
++            cflags: [
++                "-DWEBRTC_POSIX",
++                "-DWEBRTC_MAC",
++            ],
++        },
++        linux: {
++            cflags: [
++                // libwebrtc headers need this
++                "-DWEBRTC_LINUX",
++                "-DWEBRTC_POSIX",
++            ],
++            static_libs: [
++                "libcap",
++            ],
+         },
+     },
+     header_libs: [
+@@ -51,7 +62,6 @@ cc_library {
+     ],
+     static_libs: [
+         "libabsl_host",
+-        "libcap",
+         "libcuttlefish_host_config",
+         "libcuttlefish_screen_connector",
+         "libcuttlefish_utils",
+diff --git a/host/frontend/webrtc_operator/Android.bp b/host/frontend/webrtc_operator/Android.bp
+index 0c872b056..00c30e8f3 100644
+--- a/host/frontend/webrtc_operator/Android.bp
++++ b/host/frontend/webrtc_operator/Android.bp
+@@ -46,7 +46,6 @@ cc_binary_host {
+         "libssl",
+     ],
+     static_libs: [
+-        "libcap",
+         "libcuttlefish_host_config",
+         "libcuttlefish_host_websocket",
+         "libcuttlefish_utils",
+@@ -55,6 +54,13 @@ cc_binary_host {
+         "libwebsockets",
+     ],
+     defaults: ["cuttlefish_buildhost_only"],
++    target: {
++        linux: {
++            static_libs: [
++                "libcap",
++            ]
++        }
++    }
+ }
+ 
+ // TODO(jemoreira): Ideally these files should be in $HOST_OUT/webrtc but I
+diff --git a/host/libs/input_connector/event_buffer.cpp b/host/libs/input_connector/event_buffer.cpp
+index 182cc5e33..6e93d19e3 100644
+--- a/host/libs/input_connector/event_buffer.cpp
++++ b/host/libs/input_connector/event_buffer.cpp
+@@ -21,7 +21,9 @@
+ #include <memory>
+ #include <vector>
+ 
++#ifdef __linux__
+ #include <linux/input.h>
++#endif
+ 
+ namespace cuttlefish {
+ 
+diff --git a/host/libs/screen_connector/Android.bp b/host/libs/screen_connector/Android.bp
+index 85b35bbfd..300a009c4 100644
+--- a/host/libs/screen_connector/Android.bp
++++ b/host/libs/screen_connector/Android.bp
+@@ -34,6 +34,7 @@ cc_library {
+     ],
+     header_libs: [
+         "libcuttlefish_confui_host_headers",
++        "libdrm_headers"
+     ],
+     static_libs: [
+         "libcuttlefish_confui",
+diff --git a/host/libs/wayland/wayland_dmabuf.cpp b/host/libs/wayland/wayland_dmabuf.cpp
+index 279839d9f..aff49cb45 100644
+--- a/host/libs/wayland/wayland_dmabuf.cpp
++++ b/host/libs/wayland/wayland_dmabuf.cpp
+@@ -18,7 +18,7 @@
+ 
+ #include <android-base/logging.h>
+ 
+-#include <drm_fourcc.h>
++#include <drm/drm_fourcc.h>
+ 
+ #include <linux-dmabuf-unstable-v1-server-protocol.h>
+ #include <wayland-server-core.h>
+@@ -164,4 +164,4 @@ void BindDmabufInterface(wl_display* display) {
+                    kLinuxDmabufVersion, nullptr, bind_linux_dmabuf);
+ }
+ 
+-}  // namespace wayland
+\ No newline at end of file
++}  // namespace wayland
+diff --git a/host/libs/websocket/Android.bp b/host/libs/websocket/Android.bp
+index 28418afe5..f7c0f4f6f 100644
+--- a/host/libs/websocket/Android.bp
++++ b/host/libs/websocket/Android.bp
+@@ -31,8 +31,14 @@ cc_library {
+         "libssl",
+     ],
+     static_libs: [
+-        "libcap",
+         "libwebsockets",
+     ],
+     defaults: ["cuttlefish_buildhost_only"],
++    target: {
++        linux: {
++            static_libs: [
++                "libcap",
++            ]
++        }
++    }
+ }

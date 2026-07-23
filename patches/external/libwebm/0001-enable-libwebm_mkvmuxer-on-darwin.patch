@@ -1,0 +1,47 @@
+From c3a20737ec96bd4f8ff11fb2af8206700dc9f65e Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:56:03 -0700
+Subject: [PATCH] enable libwebm_mkvmuxer on darwin
+
+Summary:
+# Motivation:
+libwebm_mkvmuxer  is needed for cuttlefish host utils webrtc:
+https://www.internalfb.com/code/aosp-device-google-cuttlefish/[nucleus-14.0]/host/frontend/webrtc/libdevice/Android.bp?lines=70
+# Overview:
+- enable libwebm_mkvmuxer
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79568155
+
+Tags: aarch64
+---
+ Android.bp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Android.bp b/Android.bp
+index b68d2dd..cfc9ba1 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -53,7 +53,7 @@ cc_library {
+     min_sdk_version: "29",
+     target: {
+         darwin: {
+-            enabled: false,
++            enabled: true,
+         },
+     },
+ }

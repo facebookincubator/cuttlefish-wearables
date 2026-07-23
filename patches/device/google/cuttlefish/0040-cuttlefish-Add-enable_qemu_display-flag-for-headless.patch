@@ -1,0 +1,139 @@
+From ea0ac3f56be8ef0329344db3e9bdb52154f44093 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 12 Mar 2026 11:41:10 -1000
+Subject: [PATCH 40/63] [cuttlefish] Add --enable_qemu_display flag for
+ headless macOS operation
+
+Summary:
+# Motivation:
+
+On macOS, QEMU opens a Cocoa display window for each emulator instance. The hypothesis is it's crashing in RE because it's trying to reserve a window.
+
+# Overview:
+
+- add --enable_qemu_display flag (default: true) to launch_cvd/assemble_cvd. This is non-breaking since it's additive. It only causes and issue if used with an old set of host tools. Upstream is not compatible with macOS anyways, so no risk there.
+
+Test Plan:
+```
+cd /Volumes/AOSP && source build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m assemble_cvd run_cvd
+./start_cuttlefish.py --enable_qemu_display=false
+```
+no window just adb
+ {F1986710810}
+
+Reviewers: shaochi, #wearables_emulators, ivantsou
+
+Reviewed By: shaochi
+
+Subscribers: #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D96518708
+
+Tags: aarch64
+---
+ host/commands/assemble_cvd/flags.cc             |  8 ++++++++
+ host/libs/config/cuttlefish_config.h            |  2 ++
+ host/libs/config/cuttlefish_config_instance.cpp |  9 +++++++++
+ host/libs/vm_manager/qemu_manager.cpp           | 16 ++++++++++------
+ 4 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index d38cd3ccf..838e7efa5 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -276,6 +276,10 @@ DEFINE_string(
+ DEFINE_vec(start_webrtc, fmt::format("{}", CF_DEFAULTS_START_WEBRTC),
+            "Whether to start the webrtc process.");
+ 
++DEFINE_vec(enable_qemu_display, "true",
++           "Whether to enable the QEMU display window (Cocoa on macOS). "
++           "Set to false for headless operation.");
++
+ DEFINE_vec(webrtc_assets_dir, CF_DEFAULTS_WEBRTC_ASSETS_DIR,
+               "[Experimental] Path to WebRTC webpage assets.");
+ 
+@@ -1286,6 +1290,8 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+       modem_simulator_sim_type));
+   std::vector<bool> console_vec = CF_EXPECT(GET_FLAG_BOOL_VALUE(console));
+   std::vector<bool> enable_audio_vec = CF_EXPECT(GET_FLAG_BOOL_VALUE(enable_audio));
++  std::vector<bool> enable_qemu_display_vec = CF_EXPECT(GET_FLAG_BOOL_VALUE(
++      enable_qemu_display));
+   std::vector<bool> enable_usb_vec = CF_EXPECT(GET_FLAG_BOOL_VALUE(enable_usb));
+   std::vector<bool> start_gnss_proxy_vec = CF_EXPECT(GET_FLAG_BOOL_VALUE(
+       start_gnss_proxy));
+@@ -1822,6 +1828,8 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+     }
+ 
+     instance.set_enable_gpu_udmabuf(enable_gpu_udmabuf_vec[instance_index]);
++    instance.set_enable_qemu_display(
++        enable_qemu_display_vec[instance_index]);
+ 
+     instance.set_gpu_context_types(gpu_context_types_vec[instance_index]);
+     instance.set_guest_vulkan_driver(guest_vulkan_driver_vec[instance_index]);
+diff --git a/host/libs/config/cuttlefish_config.h b/host/libs/config/cuttlefish_config.h
+index c80f4b732..1cf3a9ecd 100644
+--- a/host/libs/config/cuttlefish_config.h
++++ b/host/libs/config/cuttlefish_config.h
+@@ -674,6 +674,7 @@ class CuttlefishConfig {
+     int modem_simulator_instance_number() const;
+     int modem_simulator_sim_type() const;
+ 
++    bool enable_qemu_display() const;
+     std::string gpu_mode() const;
+     std::string gpu_angle_feature_overrides_enabled() const;
+     std::string gpu_angle_feature_overrides_disabled() const;
+@@ -915,6 +916,7 @@ class CuttlefishConfig {
+     void set_modem_simulator_instance_number(int instance_numbers);
+     void set_modem_simulator_sim_type(int sim_type);
+ 
++    void set_enable_qemu_display(bool enable);
+     void set_gpu_mode(const std::string& name);
+     void set_gpu_angle_feature_overrides_enabled(const std::string& overrides);
+     void set_gpu_angle_feature_overrides_disabled(const std::string& overrides);
+diff --git a/host/libs/config/cuttlefish_config_instance.cpp b/host/libs/config/cuttlefish_config_instance.cpp
+index 7137673e5..49741af4b 100644
+--- a/host/libs/config/cuttlefish_config_instance.cpp
++++ b/host/libs/config/cuttlefish_config_instance.cpp
+@@ -836,6 +836,15 @@ int CuttlefishConfig::InstanceSpecific::modem_simulator_sim_type() const {
+   return (*Dictionary())[kModemSimulatorSimType].asInt();
+ }
+ 
++static constexpr char kEnableQemuDisplay[] = "enable_qemu_display";
++bool CuttlefishConfig::InstanceSpecific::enable_qemu_display() const {
++  return (*Dictionary())[kEnableQemuDisplay].asBool();
++}
++void CuttlefishConfig::MutableInstanceSpecific::set_enable_qemu_display(
++    bool enable) {
++  (*Dictionary())[kEnableQemuDisplay] = enable;
++}
++
+ static constexpr char kGpuMode[] = "gpu_mode";
+ std::string CuttlefishConfig::InstanceSpecific::gpu_mode() const {
+   return (*Dictionary())[kGpuMode].asString();
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 0c9fe11da..a49d323c9 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -484,12 +484,16 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+              gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+              gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe) {
+ #ifdef __APPLE__
+-  qemu_cmd.AddParameter("-display");
+-  if (qemu_help.find("use-bgra") != std::string::npos) {
+-    qemu_cmd.AddParameter("cocoa,use-bgra=on,show-cursor=on");
+-  } else {
+-    qemu_cmd.AddParameter("cocoa,show-cursor=on");
+-  }
++    qemu_cmd.AddParameter("-display");
++    if (instance.enable_qemu_display()) {
++      if (qemu_help.find("use-bgra") != std::string::npos) {
++        qemu_cmd.AddParameter("cocoa,use-bgra=on,show-cursor=on");
++      } else {
++        qemu_cmd.AddParameter("cocoa,show-cursor=on");
++      }
++    } else {
++      qemu_cmd.AddParameter("none");
++    }
+ #else
+   qemu_cmd.AddParameter("-vnc");
+   qemu_cmd.AddParameter("127.0.0.1:", instance.qemu_vnc_server_port());

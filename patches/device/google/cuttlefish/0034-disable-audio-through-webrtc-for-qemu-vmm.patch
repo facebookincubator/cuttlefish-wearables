@@ -1,0 +1,131 @@
+From bc8e02938841b116e178ce1dafbd3a83dc6fab33 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 17 Feb 2026 12:54:57 -1000
+Subject: [PATCH 34/63] disable audio through webrtc for qemu vmm
+
+Summary:
+# Motivation:
+Streamer webrtc component wants to setup audio with qemu, but currently we only want to use it for the extended controls.
+
+https://www.internalfb.com/code/aosp-device-google-cuttlefish/[releases-nucleus-16.0-tiki-adhoc-cf-darwin-host-tools-system-from-nucleus-16.0-qxsi%3Aa431b4408c26fb46fe710a3904897f54d3927661]/host/commands/run_cvd/launch/streamer.cpp?lines=152-157
+
+## error:
+```
+CF_EXPECT(audio_server_->IsOpen(), audio_server_->StrError())
+```
+
+# Overview:
+- remove audio from streamer for QEMU until we can get display working
+
+Test Plan:
+# Build Host Tools
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+# Pull gw
+```
+device sf device
+device virtual -t device
+```
+
+# Replace Host Tools:
+```
+ rm -r bin com.android.i18n lib64 nativetest64/ framework etc usr
+ ln -s  /Volumes/AOSP/out/host/darwin-x86/cvd-host_package/* .
+```
+
+# Launch
+```
+./start_cuttlefish.py
+```
+
+ {F1985714684}
+
+Reviewers: hzalek, #cuttlefish-cross-platform, #wearables_emulators, benthomas
+
+Reviewed By: hzalek
+
+Subscribers: #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D93532810
+
+Tags: aarch64
+---
+ host/commands/run_cvd/launch/streamer.cpp | 13 +++++++++++--
+ host/frontend/webrtc/main.cpp             | 11 +++++++++--
+ 2 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/host/commands/run_cvd/launch/streamer.cpp b/host/commands/run_cvd/launch/streamer.cpp
+index 58d5a0ea5..2b3887ba5 100644
+--- a/host/commands/run_cvd/launch/streamer.cpp
++++ b/host/commands/run_cvd/launch/streamer.cpp
+@@ -82,6 +82,15 @@ std::vector<Command> LaunchCustomActionServers(
+   return commands;
+ }
+ 
++// Returns true if the current VM configuration supports the audio server
++// socket for WebRTC streaming. QEMU handles audio internally via CoreAudio
++// (macOS) or disables it (Linux), and SOCK_SEQPACKET is not supported on
++// macOS for Unix sockets.
++bool SupportsAudioServer(const CuttlefishConfig& config,
++                         const CuttlefishConfig::InstanceSpecific& instance) {
++  return instance.enable_audio() && config.vm_manager() != VmmMode::kQemu;
++}
++
+ // Creates the frame and input sockets and add the relevant arguments to
+ // webrtc commands
+ class StreamerSockets : public virtual SetupFeature {
+@@ -123,7 +132,7 @@ class StreamerSockets : public virtual SetupFeature {
+     cmd.AddParameter("-keyboard_fd=",
+                      input_connections_provider_.KeyboardConnection());
+     cmd.AddParameter("-frame_server_fd=", frames_server_);
+-    if (instance_.enable_audio()) {
++    if (SupportsAudioServer(config_, instance_)) {
+       cmd.AddParameter("--audio_server_fd=", audio_server_);
+     }
+     cmd.AddParameter("--confui_in_fd=", confui_in_fd_);
+@@ -149,7 +158,7 @@ class StreamerSockets : public virtual SetupFeature {
+     frames_server_ = CreateUnixInputServer(instance_.frames_socket_path());
+     CF_EXPECT(frames_server_->IsOpen(), frames_server_->StrError());
+     // TODO(schuffelen): Make this a separate optional feature?
+-    if (instance_.enable_audio()) {
++    if (SupportsAudioServer(config_, instance_)) {
+       auto path = config_.ForDefaultInstance().audio_server_path();
+       audio_server_ =
+           SharedFD::SocketLocalServer(path, false, SOCK_SEQPACKET, 0666);
+diff --git a/host/frontend/webrtc/main.cpp b/host/frontend/webrtc/main.cpp
+index 680557a3c..9127cfcc3 100644
+--- a/host/frontend/webrtc/main.cpp
++++ b/host/frontend/webrtc/main.cpp
+@@ -100,6 +100,9 @@ class CfOperatorObserver : public webrtc_streaming::OperatorObserver {
+   }
+ };
+ std::unique_ptr<AudioServer> CreateAudioServer() {
++  if (FLAGS_audio_server_fd < 0) {
++    return nullptr;
++  }
+   SharedFD audio_server_fd = SharedFD::Dup(FLAGS_audio_server_fd);
+   close(FLAGS_audio_server_fd);
+   return std::make_unique<AudioServer>(audio_server_fd);
+@@ -367,12 +370,16 @@ int CuttlefishMain() {
+   streamer->SetHardwareSpec("GPU Mode", user_friendly_gpu_mode);
+ 
+   std::shared_ptr<AudioHandler> audio_handler;
+-  if (instance.enable_audio()) {
++  // Only create AudioHandler if audio is enabled and we have a valid audio
++  // server socket. QEMU handles audio internally via CoreAudio, so no socket
++  // is provided in that case.
++  if (instance.enable_audio() && FLAGS_audio_server_fd >= 0) {
+     int output_streams_count = instance.audio_output_streams_count();
+     std::vector<std::shared_ptr<webrtc_streaming::AudioSink>> audio_streams(
+         output_streams_count);
+     for (int i = 0; i < audio_streams.size(); i++) {
+-      audio_streams[i] = streamer->AddAudioStream("audio-" + std::to_string(i));
++      audio_streams[i] =
++          streamer->AddAudioStream("audio-" + std::to_string(i));
+     }
+     auto audio_server = CreateAudioServer();
+     auto audio_source = streamer->GetAudioSource();

@@ -1,0 +1,88 @@
+From 66a03af4e3b706d3541b495ccce5ce3269555e51 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 5 May 2026 08:29:02 -1000
+Subject: [PATCH 59/63] add framework hypervisor to Android.bp targets
+
+Summary:
+# Motivation:
+D102697364 needs to link with this dylib
+# Overview:
+- add framework Hypervisor
+
+Test Plan:
+```
+ . build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+Reviewers: josephknox, #wearables_emulators, drahul
+
+Reviewed By: josephknox
+
+Subscribers: #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D103894279
+
+Tags: aarch64
+---
+ host/commands/assemble_cvd/Android.bp | 3 +++
+ host/commands/run_cvd/Android.bp      | 3 +++
+ host/commands/start/Android.bp        | 3 +++
+ host/libs/vm_manager/Android.bp       | 3 ---
+ 4 files changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/host/commands/assemble_cvd/Android.bp b/host/commands/assemble_cvd/Android.bp
+index 0bdc366a7..6d24021c9 100644
+--- a/host/commands/assemble_cvd/Android.bp
++++ b/host/commands/assemble_cvd/Android.bp
+@@ -93,6 +93,9 @@ cc_binary_host {
+     target: {
+         darwin: {
+             enabled: true,
++            host_ldlibs: [
++                "-framework Hypervisor",
++            ],
+         },
+         linux: {
+             required: [
+diff --git a/host/commands/run_cvd/Android.bp b/host/commands/run_cvd/Android.bp
+index 317a88413..74a581af2 100644
+--- a/host/commands/run_cvd/Android.bp
++++ b/host/commands/run_cvd/Android.bp
+@@ -97,6 +97,9 @@ cc_binary_host {
+     target: {
+         darwin: {
+             enabled: true,
++            host_ldlibs: [
++                "-framework Hypervisor",
++            ],
+             required: [
+                 "echo_server",
+                 "gnss_grpc_proxy",
+diff --git a/host/commands/start/Android.bp b/host/commands/start/Android.bp
+index 24c8592ef..52caac895 100644
+--- a/host/commands/start/Android.bp
++++ b/host/commands/start/Android.bp
+@@ -48,6 +48,9 @@ cc_binary {
+     target: {
+         darwin: {
+             enabled: true,
++            host_ldlibs: [
++                "-framework Hypervisor",
++            ],
+         },
+     },
+     defaults: ["cuttlefish_host"],
+diff --git a/host/libs/vm_manager/Android.bp b/host/libs/vm_manager/Android.bp
+index 54cace73d..e2170b93a 100644
+--- a/host/libs/vm_manager/Android.bp
++++ b/host/libs/vm_manager/Android.bp
+@@ -52,9 +52,6 @@ cc_library {
+             host_ldlibs: [
+                 "-framework Hypervisor",
+             ],
+-            data: [
+-                "hypervisor.entitlements",
+-            ],
+         },
+     },
+ }

@@ -1,0 +1,119 @@
+From 49ecb38c9cb36d47130a001fb5deb1335ea83507 Mon Sep 17 00:00:00 2001
+From: Olya Arkhangelskaia <olja@meta.com>
+Date: Tue, 5 Aug 2025 19:06:38 +0100
+Subject: [PATCH 01/63] [DEMO CODE ONLY] changes to cuttlefish configuration
+
+Summary:
+Remove linux_musl from boar configuration.
+Changes to Android.bp to enable Mac Os build.
+This is a part of D77880815.
+
+Test Plan:
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+Rollback Plan:
+
+Reviewers: achong, tcare, benthomas
+
+Reviewed By: achong
+
+Subscribers: ryanyu
+
+Differential Revision: https://phabricator.intern.facebook.com/D79660900
+
+Tags: aarch64
+---
+ Android.bp                     | 2 +-
+ build/Android.bp               | 2 +-
+ common/libs/utils/Android.bp   | 5 +++++
+ host/libs/web/Android.bp       | 5 +++++
+ vsoc_arm64/BoardConfig.mk      | 2 +-
+ vsoc_arm64_only/BoardConfig.mk | 2 +-
+ 6 files changed, 14 insertions(+), 4 deletions(-)
+
+diff --git a/Android.bp b/Android.bp
+index 28043d5d2..0abefcd5d 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -77,7 +77,7 @@ cc_defaults {
+         },
+         // We don't need Darwin host-side builds
+         darwin: {
+-            enabled: false,
++            enabled: true,
+         },
+     },
+     cflags: [
+diff --git a/build/Android.bp b/build/Android.bp
+index c8847e58b..a78f30ffa 100644
+--- a/build/Android.bp
++++ b/build/Android.bp
+@@ -550,7 +550,7 @@ cvd_host_package_customization {
+             enabled: false,
+         },
+         darwin: {
+-            enabled: false,
++            enabled: true,
+         },
+     },
+ }
+diff --git a/common/libs/utils/Android.bp b/common/libs/utils/Android.bp
+index e05bf70d0..c0060dc2c 100644
+--- a/common/libs/utils/Android.bp
++++ b/common/libs/utils/Android.bp
+@@ -61,6 +61,11 @@ cc_library {
+     target: {
+         darwin: {
+             enabled: true,
++	    srcs: [
++                "inotify.cpp",
++                "socket2socket_proxy.cpp", // TODO(b/285989475): Find eventfd alternative
++                "vsock_connection.cpp",
++            ],
+         },
+         linux: {
+             srcs: [
+diff --git a/host/libs/web/Android.bp b/host/libs/web/Android.bp
+index 0118ef440..16b624c65 100644
+--- a/host/libs/web/Android.bp
++++ b/host/libs/web/Android.bp
+@@ -53,6 +53,11 @@ cc_library {
+                 "libz",
+             ],
+         },
++        darwin: {
++            host_ldlibs: [
++                "-framework SystemConfiguration"
++            ]
++        },
+     },
+     defaults: ["cuttlefish_host"],
+ }
+diff --git a/vsoc_arm64/BoardConfig.mk b/vsoc_arm64/BoardConfig.mk
+index 1c07a216d..f986722ba 100644
+--- a/vsoc_arm64/BoardConfig.mk
++++ b/vsoc_arm64/BoardConfig.mk
+@@ -30,7 +30,7 @@ TARGET_2ND_CPU_ABI2 := armeabi
+ TARGET_2ND_CPU_VARIANT := cortex-a53
+ TARGET_TRANSLATE_2ND_ARCH := false
+ 
+-HOST_CROSS_OS := linux_musl
++#HOST_CROSS_OS := linux_musl
+ HOST_CROSS_ARCH := arm64
+ HOST_CROSS_2ND_ARCH :=
+ 
+diff --git a/vsoc_arm64_only/BoardConfig.mk b/vsoc_arm64_only/BoardConfig.mk
+index 4f363ed6e..89236ec94 100644
+--- a/vsoc_arm64_only/BoardConfig.mk
++++ b/vsoc_arm64_only/BoardConfig.mk
+@@ -26,7 +26,7 @@ TARGET_CPU_VARIANT := cortex-a53
+ 
+ AUDIOSERVER_MULTILIB := first
+ 
+-HOST_CROSS_OS := linux_musl
++#HOST_CROSS_OS := linux_musl
+ HOST_CROSS_ARCH := arm64
+ HOST_CROSS_2ND_ARCH :=
+ 

@@ -1,0 +1,47 @@
+From 632c539ce62739fc22f43d9a3e317037767bf649 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:55:38 -0700
+Subject: [PATCH] enable libopus on mac
+
+Summary:
+# Motivation:
+libopus is needed for cuttlefish host utils webrtc:
+https://www.internalfb.com/code/aosp-device-google-cuttlefish/[oculus-15.0]/host/frontend/webrtc/libcommon/Android.bp?lines=42
+# Overview:
+- enable libopus
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79568130
+
+Tags: aarch64
+---
+ Android.bp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Android.bp b/Android.bp
+index 0fe42a28..5b3a81b7 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -366,7 +366,7 @@ cc_library {
+ 
+     target: {
+         darwin: {
+-            enabled: false,
++            enabled: true,
+         },
+     },
+     apex_available: [

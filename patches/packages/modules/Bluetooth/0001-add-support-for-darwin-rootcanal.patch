@@ -1,0 +1,128 @@
+From 5242de2f11a07879f3f0e1965e7a0c36a28b4e98 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:59:39 -0700
+Subject: [PATCH 1/2] add support for darwin rootcanal
+
+Summary:
+# Motivation:
+Rootcanal is used for bluetooth on cuttlefish
+# Overview:
+- comment out breakpad stuff in main
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D79568456
+
+Tags: aarch64
+---
+ tools/rootcanal/Android.bp                 | 12 +++++++++---
+ tools/rootcanal/desktop/root_canal_main.cc |  8 +++++++-
+ tools/rootcanal/rust/Android.bp            |  5 +++++
+ 3 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/tools/rootcanal/Android.bp b/tools/rootcanal/Android.bp
+index 501a3efeb2..de61f72a82 100644
+--- a/tools/rootcanal/Android.bp
++++ b/tools/rootcanal/Android.bp
+@@ -368,13 +368,11 @@ cc_binary_host {
+     ],
+     shared_libs: [
+         "libbase",
+-        "libunwindstack",
+     ],
+     whole_static_libs: [
+         "libbt-rootcanal",
+     ],
+     static_libs: [
+-        "breakpad_client",
+         "libcrypto",
+         "libgflags",
+         "libprotobuf-cpp-full",
+@@ -388,8 +386,16 @@ cc_binary_host {
+                 all_undefined: false,
+             },
+         },
++        linux: {
++            static_libs: [
++                "breakpad_client",
++            ],
++            shared_libs: [
++                "libunwindstack",
++            ],
++        },
+         darwin: {
+-            enabled: false,
++            enabled: true,
+         },
+     },
+ }
+diff --git a/tools/rootcanal/desktop/root_canal_main.cc b/tools/rootcanal/desktop/root_canal_main.cc
+index fde5560fbe..a7d2f02ad7 100644
+--- a/tools/rootcanal/desktop/root_canal_main.cc
++++ b/tools/rootcanal/desktop/root_canal_main.cc
+@@ -20,9 +20,11 @@
+ #include "log.h"
+ // clang-format on
+ 
++#ifdef __linux__
+ #include <client/linux/handler/exception_handler.h>
+-#include <gflags/gflags.h>
+ #include <unwindstack/AndroidUnwinder.h>
++#endif
++#include <gflags/gflags.h>
+ 
+ #include <fstream>
+ #include <future>
+@@ -55,6 +57,7 @@ DEFINE_uint32(link_ble_port, 6404, "le link server tcp port");
+ 
+ extern "C" const char* __asan_default_options() { return "detect_container_overflow=0"; }
+ 
++#if defined(__linux__)
+ bool crash_callback(const void* crash_context, size_t crash_context_size, void* /* context */) {
+   std::optional<pid_t> tid;
+   if (crash_context_size >= sizeof(google_breakpad::ExceptionHandler::CrashContext)) {
+@@ -78,12 +81,15 @@ bool crash_callback(const void* crash_context, size_t crash_context_size, void*
+   }
+   return true;
+ }
++#endif
+ 
+ int main(int argc, char** argv) {
++#ifdef __linux__
+   google_breakpad::MinidumpDescriptor descriptor(
+           google_breakpad::MinidumpDescriptor::kMicrodumpOnConsole);
+   google_breakpad::ExceptionHandler eh(descriptor, nullptr, nullptr, nullptr, true, -1);
+   eh.set_crash_handler(crash_callback);
++#endif
+ 
+   gflags::ParseCommandLineFlags(&argc, &argv, true);
+   rootcanal::log::SetLogColorEnable(FLAGS_enable_log_color);
+diff --git a/tools/rootcanal/rust/Android.bp b/tools/rootcanal/rust/Android.bp
+index 66a8e0877e..11949182f6 100644
+--- a/tools/rootcanal/rust/Android.bp
++++ b/tools/rootcanal/rust/Android.bp
+@@ -32,6 +32,11 @@ rust_ffi {
+         "libthiserror",
+     ],
+     export_include_dirs: ["include"],
++    target: {
++        darwin: {
++            enabled: true
++        },
++    },
+ }
+ 
+ genrule {

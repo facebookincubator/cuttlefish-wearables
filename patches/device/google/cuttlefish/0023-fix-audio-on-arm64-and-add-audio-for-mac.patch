@@ -1,0 +1,87 @@
+From e6c16741b6571f59429a7e9e0eac83da77fe89ec Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 19 Aug 2025 14:38:28 -0700
+Subject: [PATCH 23/63] fix audio on arm64 and add audio for mac
+
+Summary:
+# Motivation:
+Audio output isn't working on cuttlefish on mac. This requires an image-side change.
+
+# Overview:
+- add same blocklist entry from x86_64 to arm64 so that tinyalsa picks virtio-snd device
+
+https://www.internalfb.com/code/aosp-device-google-cuttlefish/[nucleus-16.0-qxsi%3Ac2968c6b1f90a818cedf081327b9d07669f46430]/shared/modules.blocklist?lines=4-13
+
+```
+ adb shell cat /proc/asound/cards
+ 0 [Loopback       ]: Loopback - Loopback
+                      Loopback 1
+ 1 [SoundCard      ]: virtio-snd - VirtIO SoundCard
+                      VirtIO SoundCard at pci/0000:00:0e.0/virtio13
+```
+
+https://www.internalfb.com/code/aosp-device-generic-goldfish/[nucleus-14.0%3Ad0116b881a602c6dd40cafd07b3abcbe0d27faec]/audio/talsa.h?lines=28-30
+
+Test Plan:
+# Test alarm:
+- sound is heard after 5 seconds (**warning - loud**)
+
+ https://pxl.cl/7WvqF
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D80568189
+
+Tags: aarch64
+---
+ host/libs/vm_manager/qemu_manager.cpp |  8 ++++++++
+ shared/modules_aarch64.blocklist      | 10 ++++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 9cadf3e0a..f2df98ec4 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -950,10 +950,18 @@ qemu_cmd.AddParameter("user,id=hostnet2,net=10.0.2.1/24,dns=1.1.1.1");
+     }
+   }
+ 
++
++#ifdef __APPLE__
++  qemu_cmd.AddParameter("-device");
++  qemu_cmd.AddParameter("virtio-sound-pci,audiodev=snd0");
++  qemu_cmd.AddParameter("-audiodev");
++  qemu_cmd.AddParameter("coreaudio,id=snd0");
++#else
+   qemu_cmd.AddParameter("-device");
+   qemu_cmd.AddParameter("AC97,audiodev=audio_none");
+   qemu_cmd.AddParameter("-audiodev");
+   qemu_cmd.AddParameter("driver=none,id=audio_none");
++#endif
+ 
+   qemu_cmd.AddParameter("-device");
+   qemu_cmd.AddParameter("qemu-xhci,id=xhci");
+diff --git a/shared/modules_aarch64.blocklist b/shared/modules_aarch64.blocklist
+index 86a57c3e6..7a0eacd9f 100644
+--- a/shared/modules_aarch64.blocklist
++++ b/shared/modules_aarch64.blocklist
+@@ -2,3 +2,13 @@ blocklist dummy-cpufreq.ko
+ # ptp_kvm.ko should only load when the kvm hypervisor is available on the target
+ blocklist ptp_kvm.ko
+ blocklist vkms.ko
++
++# Cuttlefish assumes /dev/snd/pcmC0D0p, the first ALSA playback device,
++# represents a virtio-snd playback device.
++#
++# When audio loopback device gets loaded earlier, that device becomes a
++# loopback audio device, and no output from audio HAL gets forwarded to the
++# host.
++#
++# Prevent it from loading completely as it's not needed in Cuttlefish.
++blocklist snd-aloop.ko

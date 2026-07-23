@@ -1,0 +1,40 @@
+From 286bfe73654792a6f8225c2ddf0a3dc85f3193a8 Mon Sep 17 00:00:00 2001
+From: Olya Arkhangelskaia <olja@meta.com>
+Date: Wed, 20 Aug 2025 15:53:53 +0100
+Subject: [PATCH] Fix to f2fs tools
+
+Summary:
+lsetxattr  (set extended attributes on symbolic links without following them) is a Linux-specific function that doesn't exist on macOS.
+On macOS  use setxattr with the XATTR_NOFOLLOW flag instead.
+
+Test Plan: m make_f2fs fsck.f2fs sload_f2fs
+
+Rollback Plan:
+
+Reviewers: achong, tcare, benthomas
+
+Reviewed By: achong, tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D80622833
+---
+ fsck/dump.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/fsck/dump.c b/fsck/dump.c
+index dc3c199..85e240f 100644
+--- a/fsck/dump.c
++++ b/fsck/dump.c
+@@ -462,9 +462,9 @@ static void dump_xattr(struct f2fs_sb_info *sbi, struct f2fs_node *node_blk, int
+ 					le16_to_cpu(ent->e_value_size), 0,
+ 					XATTR_CREATE);
+ 		} if (S_ISLNK(type) && c.preserve_symlinks) {
+-			ret = lsetxattr(c.dump_symlink, xattr_name, value,
++			ret = setxattr(c.dump_symlink, xattr_name, value,
+ 					le16_to_cpu(ent->e_value_size), 0,
+-					XATTR_CREATE);
++					XATTR_CREATE | XATTR_NOFOLLOW);
+ 		} else {
+ 			ret = fsetxattr(c.dump_fd, xattr_name, value,
+ 					le16_to_cpu(ent->e_value_size), 0,

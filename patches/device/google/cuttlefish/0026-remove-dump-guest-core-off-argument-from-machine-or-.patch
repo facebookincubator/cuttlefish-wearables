@@ -1,0 +1,71 @@
+From 72afc97983db9e66b33117696862dfa3217e8f5b Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 18 Aug 2025 13:44:45 -0700
+Subject: [PATCH 26/63] remove dump-guest-core=off argument from machine or
+ macOS
+
+Summary:
+# Motivation:
+Error on launch:
+```
+Timed out
+2025-08-20T18:30:40.309030Z qemu-system-aarch64: Dumping guest memory cannot be disabled on this host
+Detected unexpected exit of monitored subprocess /Users/achong/qemu/build/qemu-system-aarch64
+```
+
+# Overview:
+- remove `dump-guest-core=off,` on APPLE host
+
+Test Plan:
+```
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+HOME=/Users/achong/n-16/out/host/darwin-x86 out/host/darwin-x86/bin/launch_cvd  \
+--use-overlay=false --vm_manager=qemu_cli  --system_image_dir=/Users/achong/n-16/out/host/darwin-x86 \
+--qemu_binary_dir=/Users/achong/qemu/build \
+--enable_host_uwb=false -device_external_network=slirp \
+--vhost_user_vsock --enable_audio=true
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D80484523
+
+Tags: aarch64
+---
+ host/libs/vm_manager/qemu_manager.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 6135102ba..749ba91f3 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -395,7 +395,11 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+     machine += ",mte=on";
+   }
+   qemu_cmd.AddParameter("-machine");
++#ifdef __APPLE__
++  qemu_cmd.AddParameter(machine, ",usb=off,memory-backend=vm_ram");
++#else
+   qemu_cmd.AddParameter(machine, ",usb=off,dump-guest-core=off,memory-backend=vm_ram");
++#endif
+ 
+   if (IsHostCompatible(arch_)) {
+     qemu_cmd.AddParameter("-accel");
+@@ -931,9 +935,9 @@ qemu_cmd.AddParameter("user,id=hostnet2,net=10.0.2.1/24,dns=1.1.1.1");
+   if (instance.vsock_guest_cid() >= 2) {
+     if (instance.vhost_user_vsock()) {
+       // Vhost user is supported on all posix platforms
+-      auto vsock_socket_path = fmt::format("{}/vsock_{}_{}/vhost.socket", 
++      auto vsock_socket_path = fmt::format("{}/vsock_{}_{}/vhost.socket",
+                                           TempDir(),
+-                                          instance.vsock_guest_cid(), 
++                                          instance.vsock_guest_cid(),
+                                           getuid());
+       qemu_cmd.AddParameter("-chardev");
+       qemu_cmd.AddParameter("socket,id=vhost-user-vsock,path=", vsock_socket_path);

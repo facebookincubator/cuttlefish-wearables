@@ -1,0 +1,161 @@
+From 2de43c9224e8d6eb149baf9eda4951dc9220218b Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 27 Aug 2025 07:22:34 -1000
+Subject: [PATCH 27/63] add vmnet networking option to qemu manager for macos
+ users
+
+Summary:
+# Motivation:
+slirp does full emultation of the software stack, but can be sub-par in performance.
+# Overview:
+- add vmnet option to qemu_manager.cpp
+
+# Reference:
+- goldfish qemu fork arguments
+https://www.internalfb.com/code/aosp-platform-external-qemu/[emu-35-2-release-meta%3A90f69a72efd89a27b95c043317bc073a8f1122c4]/android-qemu2-glue/main.cpp?lines=2866-2879
+
+# Note:
+when switching back to slirp
+```
+sudo rm -rf /tmp/modem_simulator*
+```
+
+Test Plan:
+
+Note (`sudo` is required)
+```
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt && sudo HOME=/Users/achong/n-16/out/host/darwin-x86 out/host/darwin-x86/bin/launch_cvd  \
+--vm_manager=qemu_cli  --system_image_dir=/Users/achong/n-16/out/host/darwin-x86 \
+--qemu_binary_dir=/Users/achong/qemu/build \
+--enable_host_uwb=false -device_external_network=vmnet \
+--vhost_user_vsock --enable_audio=true
+```
+
+network ping is lower
+```
+adb shell ping 1.1.1.1
+PING 1.1.1.1 (1.1.1.1) 56(84) bytes of data.
+64 bytes from 1.1.1.1: icmp_seq=1 ttl=59 time=15.4 ms
+```
+slirp:
+ {F1981564130}
+vmnet:
+ {F1981564129}
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, #wearables_emulators
+
+Differential Revision: https://phabricator.intern.facebook.com/D81145512
+---
+ host/libs/config/cuttlefish_config.h          |  3 +++
+ .../config/cuttlefish_config_instance.cpp     | 17 +++++++++++++-
+ host/libs/vm_manager/qemu_manager.cpp         | 23 +++++++++++++------
+ 3 files changed, 35 insertions(+), 8 deletions(-)
+
+diff --git a/host/libs/config/cuttlefish_config.h b/host/libs/config/cuttlefish_config.h
+index 0962d5e11..c80f4b732 100644
+--- a/host/libs/config/cuttlefish_config.h
++++ b/host/libs/config/cuttlefish_config.h
+@@ -57,6 +57,9 @@ enum class ExternalNetworkMode {
+   kUnknown,
+   kTap,
+   kSlirp,
++#ifdef __APPLE__
++  kVmnet,
++#endif
+ };
+ 
+ std::ostream& operator<<(std::ostream&, ExternalNetworkMode);
+diff --git a/host/libs/config/cuttlefish_config_instance.cpp b/host/libs/config/cuttlefish_config_instance.cpp
+index af5ea28d5..7137673e5 100644
+--- a/host/libs/config/cuttlefish_config_instance.cpp
++++ b/host/libs/config/cuttlefish_config_instance.cpp
+@@ -48,6 +48,10 @@ std::ostream& operator<<(std::ostream& out, ExternalNetworkMode net) {
+       return out << "tap";
+     case ExternalNetworkMode::kSlirp:
+       return out << "slirp";
++#ifdef __APPLE__
++    case ExternalNetworkMode::kVmnet:
++      return out << "vmnet";
++#endif
+   }
+ }
+ Result<ExternalNetworkMode> ParseExternalNetworkMode(std::string_view str) {
+@@ -55,11 +59,22 @@ Result<ExternalNetworkMode> ParseExternalNetworkMode(std::string_view str) {
+     return ExternalNetworkMode::kTap;
+   } else if (android::base::EqualsIgnoreCase(str, "slirp")) {
+     return ExternalNetworkMode::kSlirp;
++#ifdef __APPLE__
++} else if (android::base::EqualsIgnoreCase(str, "vmnet")) {
++  return ExternalNetworkMode::kVmnet;
++#endif
+   } else {
++#ifdef __APPLE__
+     return CF_ERRF(
+-        "\"{}\" is not a valid ExternalNetworkMode. Valid values are \"tap\" "
++        "\"{}\" is not a valid ExternalNetworkMode. Valid values are \"tap\", "
++        "\"vmnet\", and \"slirp\"",
++        str);
++#else
++    return CF_ERRF(
++        "\"{}\" is not a valid ExternalNetworkMode. Valid values are \"tap\", "
+         "and \"slirp\"",
+         str);
++#endif
+   }
+ }
+ 
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 749ba91f3..e0416291e 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -878,13 +878,27 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+       if (!config.virtio_mac80211_hwsim()) {
+         qemu_cmd.AddParameter("-netdev");
+ #ifdef __APPLE__
+-qemu_cmd.AddParameter("user,id=hostnet2");
++        qemu_cmd.AddParameter("user,id=hostnet2");
+ #else
+-qemu_cmd.AddParameter("user,id=hostnet2,net=10.0.2.1/24,dns=1.1.1.1");
++        qemu_cmd.AddParameter("user,id=hostnet2,net=10.0.2.1/24,dns=1.1.1.1");
+ #endif
+       }
+       break;
+     }
++#ifdef __APPLE__
++    case cuttlefish::ExternalNetworkMode::kVmnet: {
++      has_network_devices = true;
++      qemu_cmd.AddParameter("-netdev");
++      qemu_cmd.AddParameter("vmnet-shared,id=hostnet0");
++      qemu_cmd.AddParameter("-netdev");
++      qemu_cmd.AddParameter("vmnet-shared,id=hostnet1");
++      if (!config.virtio_mac80211_hwsim()) {
++        qemu_cmd.AddParameter("-netdev");
++        qemu_cmd.AddParameter("vmnet-shared,id=hostnet2");
++      }
++      break;
++    }
++#endif
+     default:
+       return CF_ERRF("Unexpected net mode {}",
+                      instance.external_network_mode());
+@@ -903,14 +917,9 @@ qemu_cmd.AddParameter("user,id=hostnet2,net=10.0.2.1/24,dns=1.1.1.1");
+         instance.ethernet_mac());
+     if (!config.virtio_mac80211_hwsim()) {
+       qemu_cmd.AddParameter("-device");
+-#ifdef __APPLE__
+-      qemu_cmd.AddParameter(
+-          "virtio-net-pci-non-transitional,netdev=hostnet2,id=net2");
+-#else
+       qemu_cmd.AddParameter(
+           "virtio-net-pci-non-transitional,netdev=hostnet2,id=net2,mac=",
+           instance.wifi_mac());
+-#endif
+     }
+   }
+ 
