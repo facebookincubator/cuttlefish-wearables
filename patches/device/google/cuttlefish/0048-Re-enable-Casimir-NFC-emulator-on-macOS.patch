@@ -1,0 +1,72 @@
+From 88b0838736586b205e1ed904741e04e71a0ec562 Mon Sep 17 00:00:00 2001
+From: jeffreyeffendy <jeffreyeffendy@fb.com>
+Date: Sun, 29 Mar 2026 09:41:54 -0700
+Subject: [PATCH 48/63] Re-enable Casimir NFC emulator on macOS
+
+Summary:
+Casimir was previously commented out due to an inherited_fd issue on macOS/Darwin hosts. Now that the inherited_fd issue is fixed (D98664615), Casimir can be re-enabled.
+
+This fixes the continuous "Failed to open socket" error spam in launcher.log when the socket never existed before.
+
+Test Plan:
+```
+$ . build/envsetup.sh
+$ lunch aosp_cf_arm64_phone-userdebug
+$ m out/host/darwin-x86/cvd-host_package.tar.gz
+
+$ device device virtual -t <device> --cache-only
+$ cd ~/.device/cache/emulators/<device>_cf_emu_arm64-15910000003901-1644523956582521
+$ ln -s ~/cvd-tools/out/host/darwin-x86/cvd-host_package/* .
+$ ./start_cuttlefish.py
+...
+VIRTUAL_DEVICE_BOOT_STARTED
+VIRTUAL_DEVICE_NETWORK_ETHERNET_CONNECTED
+VIRTUAL_DEVICE_BOOT_COMPLETED
+Virtual device booted successfully
+```
+Seeing sign of casimir working in launcher log P2255088167
+```
+casimir D 03-29 17:35:23  3219 77442017 log_tee.cpp:111] Starting to read from process casimir
+tcp_connector D 03-29 17:35:23  3202 77441990 shared_fd.cpp:721] Connecting to socket: /tmp/cf_env_501/env-1/casimir_nci.sock
+process_restarter D 03-29 17:35:23  3221 77442020 subprocess.cpp:522] Started (pid: 3243): /Users/jeffreyeffendy/.device/cache/emulators/<device>/bin/casimir
+casimir D 03-29 17:35:23  3219 77442017 log_tee.cpp:142] [INFO  casimir] Listening for NCI connections on fd 48
+casimir D 03-29 17:35:23  3219 77442017 log_tee.cpp:142] [INFO  casimir] Listening for RF connections on fd 49
+casimir D 03-29 17:35:23  3219 77442017 log_tee.cpp:142] [INFO  casimir] Incoming NCI connection from (unnamed)
+casimir D 03-29 17:35:23  3219 77442017 log_tee.cpp:142] [INFO  casimir] Accepted NCI connection from (unnamed) in slot 0
+```
+
+Reviewers: achong, sorokin, #cuttlefish-cross-platform
+
+Reviewed By: achong, sorokin
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D98670962
+
+Tags: aarch64
+---
+ host/commands/run_cvd/main.cc | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/host/commands/run_cvd/main.cc b/host/commands/run_cvd/main.cc
+index 311179a46..50381bfac 100644
+--- a/host/commands/run_cvd/main.cc
++++ b/host/commands/run_cvd/main.cc
+@@ -149,7 +149,7 @@ fruit::Component<> runCvdComponent(
+       .install(FastbootConfigComponent)
+       .install(FastbootConfigFragmentComponent)
+       .install(bootStateMachineComponent)
+-      //.install(AutoCmd<CasimirControlServer>::Component)
++      .install(AutoCmd<CasimirControlServer>::Component)
+       .install(AutoCmd<ScreenRecordingServer>::Component)
+       .install(ConfigFlagPlaceholder)
+       .install(CustomActionsComponent)
+@@ -170,7 +170,7 @@ fruit::Component<> runCvdComponent(
+       .install(OpenwrtControlServerComponent)
+       .install(AutoCmd<Pica>::Component)
+       .install(RootCanalComponent)
+-      //.install(AutoCmd<Casimir>::Component)
++      .install(AutoCmd<Casimir>::Component)
+       .install(NetsimServerComponent)
+       .install(AutoSnapshotControlFiles::Component)
+       .install(AutoCmd<SecureEnv>::Component)

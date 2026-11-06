@@ -1,0 +1,63 @@
+From c20f42ba04c9cd484ab8e6eeca3f3463b27c3481 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 6 Apr 2026 15:04:07 -0700
+Subject: [PATCH 51/63] fix audio for <device> on macOS
+
+Summary:
+# Motivation:
+
+CONFIG_SND_VIRTIO=m and CONFIG_SND_VIRTIO=y are not actually in the <internal-release> ikconfigs. We still want to use virtio-snd for +a16
+
+Let's just check if the config contains the string
+
+# Overview:
+- update check and add comment
+
+Test Plan:
+```
+. build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+
+ln -sf /Volumes/AOSP/out/host/darwin-x86/cvd-host_package/* .
+./start_cuttlefish.py
+```
+
+```
+# gw no results:
+ HOME=$(pwd) ./bin/extract-ikconfig ~/.device/cache/emulators/<device>_cf_emu_arm64-50890000003761-4581073138791240/boot.img | grep "CONFIG_SND_VIRTIO"
+# <device> results:
+HOME=$(pwd) ./bin/extract-ikconfig boot.img | grep "CONFIG_SND_VIRTIO"
+# CONFIG_SND_VIRTIO is not set
+```
+
+Reviewers: josephknox, <internal-group>, #cuttlefish-cross-platform, ivantsou
+
+Reviewed By: josephknox
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D99731122
+
+Tags: aarch64
+---
+ host/commands/assemble_cvd/flags.cc | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index 5abe02450..febc8b926 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -716,9 +716,12 @@ Result<std::vector<GuestConfig>> ReadGuestConfig() {
+           (guest_config.android_version_number != "13.0.0") &&
+           (guest_config.android_version_number != "11") &&
+           (guest_config.android_version_number != "13");
++      // GKI kernels load virtio-snd as a vendor module, so
++      // CONFIG_SND_VIRTIO won't be =m or =y in ikconfig. Check for
++      // the option's presence in any form (including "is not set")
++      // which indicates kernel >= 5.14 where virtio-snd is available.
+       guest_config.virtio_soundcard_supported =
+-          config.find("\nCONFIG_SND_VIRTIO=m") != std::string::npos ||
+-          config.find("\nCONFIG_SND_VIRTIO=y") != std::string::npos;
++          config.find("CONFIG_SND_VIRTIO") != std::string::npos;
+ 
+       unlink(ikconfig_path.c_str());
+     }

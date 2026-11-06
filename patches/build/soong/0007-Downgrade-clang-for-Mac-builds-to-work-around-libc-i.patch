@@ -1,0 +1,54 @@
+From 7aa0fa7b4f7eef7d0299b648af59ca048364213e Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Thu, 30 Oct 2025 11:33:31 -0700
+Subject: [PATCH 07/11] Downgrade clang for Mac builds to work around libc++
+ ios allocation crashes
+
+Summary:
+We were seeing build failures during the cvd host tool build on Mac, where `aprotoc` was segfaulting in the dyld std::ios initialization hook. This was using the static libc++, and working around that by switching to the regular dynamic libc++ would result in the grpc plugin having allocation issues in std::ios library code.
+
+The allocations were done by the prebuilt distributed libc++, but being freed by libc++.1.dylib (the built in system library.) This happened for both RBE and local builds.
+
+There were no obvious code bugs, and no fixes from upstream in this area. The stacks were quite deep in libc++, and often indirect (called by other library functions that used std::ios as an implementation detail.) I suspected a libc++abi bug, but there were no obvious issues in how things were linked.
+
+Suspecting a compiler/toolchain issue, I switched down to the previous clang version and that fixed everything. We may want to roll the clang version to a newer one from upstream, but for now this is a straight forward fix that shouldn't affect too much for the Mac build.
+
+We can isolate this to Darwin only.
+
+Test Plan:
+m casimir_control_server (minimal repro)
+
+m out/host/darwin-x86/cvd-host_package.tar.gz
+
+Rollback Plan:
+
+Reviewers: achong, olja, benthomas
+
+Reviewed By: achong
+
+Subscribers: ilyatsunaev, jmgao, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D85881633
+---
+ cc/config/global.go | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/cc/config/global.go b/cc/config/global.go
+index 5c7416cf8..8d015b246 100644
+--- a/cc/config/global.go
++++ b/cc/config/global.go
+@@ -463,7 +463,13 @@ var (
+ 
+ 	// prebuilts/clang default settings.
+ 	ClangDefaultBase         = "prebuilts/clang/host"
+-	ClangDefaultVersion      = "clang-r547379"
++	ClangDefaultVersion = func() string {
++		// Workaound for libc++ ios issue on MacOS SDK 26
++		if runtime.GOOS == "darwin" {
++			return "clang-r536225"
++		}
++		return "clang-r547379"
++	}()
+ 	ClangDefaultShortVersion = "20"
+ 
+ 	// Directories with warnings from Android.bp files.

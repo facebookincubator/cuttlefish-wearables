@@ -1,0 +1,40 @@
+From f0e25e3ef330c317a6caf6f64962bf53c04449fe Mon Sep 17 00:00:00 2001
+From: spelliott <spelliott@devvm11359.lla0.facebook.com>
+Date: Thu, 26 Mar 2026 03:05:09 -0700
+Subject: [PATCH 2/2] [rootcanal] Disable ASAN for darwin builds
+
+Summary:
+I was trying out a combination of Bluetooth/netsim related options which mean we try to launch `root-canal`.  This has a dependency on an ASAN library which we don't include in the build, likely we do not even need ASAN for this build.
+
+The error logs in `launcher.log` look like P2249731370
+
+Test Plan: @jeffreyeffendy I think just being able to build and boot <device> CF <internal-release> with the default options should be enough? I don't think we touch rootcanal unless we start explicitly disabling netsim etc like I have been trying out.
+
+Reviewers: jeffreyeffendy, achong, divyesh07, <internal-group>-aosp, <internal-group>, pakhomov, dougyoung, krishnaprasadmv, nsavant
+
+Reviewed By: jeffreyeffendy
+
+Subscribers: jeffreyeffendy, jessiew, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D98288587
+
+Tags: connectivity-bt-transport-shiproom-pending
+---
+ tools/rootcanal/Android.bp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/tools/rootcanal/Android.bp b/tools/rootcanal/Android.bp
+index de61f72a82..5c74568bab 100644
+--- a/tools/rootcanal/Android.bp
++++ b/tools/rootcanal/Android.bp
+@@ -396,6 +396,10 @@ cc_binary_host {
+         },
+         darwin: {
+             enabled: true,
++            sanitize: {
++                address: false,
++                all_undefined: false,
++            },
+         },
+     },
+ }

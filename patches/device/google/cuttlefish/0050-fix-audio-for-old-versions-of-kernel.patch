@@ -1,0 +1,137 @@
+From 1472a722a7fe0028cc5bc4bde4929a3ea197e5e1 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 6 Apr 2026 10:18:05 -0700
+Subject: [PATCH 50/63] fix audio for old versions of kernel
+
+Summary:
+# Motivation:
+
+Audio isn't working on gw because kernel is 5.10 (doesn't have virtio-snd) I'd rather not rebuild it with the module. Let's use intel-hda instead.
+
+# Overview:
+
+- add setting to use intel-hda
+- use kernel config to check and set
+
+Test Plan:
+```
+# rebuild host tools
+. build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+
+ln -sf /Volumes/AOSP/out/host/darwin-x86/cvd-host_package/* .
+# boot and play the oobe
+./start_cuttlefish.py
+```
+
+Reviewers: hzalek, #cuttlefish-cross-platform, <internal-group>
+
+Reviewed By: hzalek
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D99687544
+
+Tags: aarch64
+---
+ host/commands/assemble_cvd/flags.cc             |  5 +++++
+ host/commands/assemble_cvd/flags.h              |  1 +
+ host/libs/config/cuttlefish_config.h            |  2 ++
+ host/libs/config/cuttlefish_config_instance.cpp | 10 ++++++++++
+ host/libs/vm_manager/qemu_manager.cpp           |  8 +++++++-
+ 5 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index d38cd3ccf..5abe02450 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -716,6 +716,9 @@ Result<std::vector<GuestConfig>> ReadGuestConfig() {
+           (guest_config.android_version_number != "13.0.0") &&
+           (guest_config.android_version_number != "11") &&
+           (guest_config.android_version_number != "13");
++      guest_config.virtio_soundcard_supported =
++          config.find("\nCONFIG_SND_VIRTIO=m") != std::string::npos ||
++          config.find("\nCONFIG_SND_VIRTIO=y") != std::string::npos;
+ 
+       unlink(ikconfig_path.c_str());
+     }
+@@ -1598,6 +1601,8 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+ 
+     instance.set_audio_output_streams_count(
+         guest_configs[instance_index].output_audio_streams_count);
++    instance.set_virtio_soundcard_supported(
++        guest_configs[instance_index].virtio_soundcard_supported);
+ 
+     if (vhost_user_vsock_vec[instance_index] == kVhostUserVsockModeAuto) {
+       std::set<Arch> default_on_arch = {Arch::Arm64};
+diff --git a/host/commands/assemble_cvd/flags.h b/host/commands/assemble_cvd/flags.h
+index 42a01a106..0a786d29a 100644
+--- a/host/commands/assemble_cvd/flags.h
++++ b/host/commands/assemble_cvd/flags.h
+@@ -44,6 +44,7 @@ struct GuestConfig {
+   std::optional<std::string> custom_keyboard_config;
+   std::optional<std::string> domkey_mapping_config;
+   int output_audio_streams_count = 1;
++  bool virtio_soundcard_supported = false;
+ };
+ 
+ Result<std::vector<GuestConfig>> GetGuestConfigAndSetDefaults();
+diff --git a/host/libs/config/cuttlefish_config.h b/host/libs/config/cuttlefish_config.h
+index c80f4b732..2609d7556 100644
+--- a/host/libs/config/cuttlefish_config.h
++++ b/host/libs/config/cuttlefish_config.h
+@@ -759,6 +759,7 @@ class CuttlefishConfig {
+     bool start_vhal_proxy_server() const;
+ 
+     int audio_output_streams_count() const;
++    bool virtio_soundcard_supported() const;
+ 
+     bool enable_tap_devices() const;
+   };
+@@ -991,6 +992,7 @@ class CuttlefishConfig {
+     void set_start_vhal_proxy_server(bool enable_vhal_proxy_server);
+ 
+     void set_audio_output_streams_count(int count);
++    void set_virtio_soundcard_supported(bool supported);
+ 
+     void set_enable_tap_devices(bool);
+ 
+diff --git a/host/libs/config/cuttlefish_config_instance.cpp b/host/libs/config/cuttlefish_config_instance.cpp
+index 7137673e5..e12098ac3 100644
+--- a/host/libs/config/cuttlefish_config_instance.cpp
++++ b/host/libs/config/cuttlefish_config_instance.cpp
+@@ -1004,6 +1004,16 @@ bool CuttlefishConfig::InstanceSpecific::enable_audio() const {
+   return (*Dictionary())[kEnableAudio].asBool();
+ }
+ 
++static constexpr char kVirtioSoundcardSupported[] =
++    "virtio_soundcard_supported";
++void CuttlefishConfig::MutableInstanceSpecific::set_virtio_soundcard_supported(
++    bool supported) {
++  (*Dictionary())[kVirtioSoundcardSupported] = supported;
++}
++bool CuttlefishConfig::InstanceSpecific::virtio_soundcard_supported() const {
++  return (*Dictionary())[kVirtioSoundcardSupported].asBool();
++}
++
+ static constexpr char kEnableMouse[] = "enable_mouse";
+ void CuttlefishConfig::MutableInstanceSpecific::set_enable_mouse(bool enable) {
+   (*Dictionary())[kEnableMouse] = enable;
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 0c9fe11da..d7688d2d1 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -1013,7 +1013,13 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+ 
+ #ifdef __APPLE__
+   qemu_cmd.AddParameter("-device");
+-  qemu_cmd.AddParameter("virtio-sound-pci,audiodev=snd0");
++  if (instance.virtio_soundcard_supported()) {
++    qemu_cmd.AddParameter("virtio-sound-pci,audiodev=snd0");
++  } else {
++    qemu_cmd.AddParameter("intel-hda");
++    qemu_cmd.AddParameter("-device");
++    qemu_cmd.AddParameter("hda-duplex,audiodev=snd0");
++  }
+   qemu_cmd.AddParameter("-audiodev");
+   qemu_cmd.AddParameter("coreaudio,id=snd0");
+ #else

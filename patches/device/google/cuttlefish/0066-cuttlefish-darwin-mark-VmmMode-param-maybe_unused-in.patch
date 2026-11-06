@@ -1,0 +1,28 @@
+From 7e9ccfd0cc7a3e0dfa1a8892606dfc2a15436634 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 27 Jul 2026 16:27:20 -0700
+Subject: [PATCH 66/67] cuttlefish: darwin: mark VmmMode param maybe_unused in
+ SelectGpuMode
+
+vmm is only referenced inside #ifndef __APPLE__, so it is unused on darwin.
+Mark it [[maybe_unused]] to satisfy -Werror,-Wunused-parameter.
+---
+ host/commands/assemble_cvd/graphics_flags.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/host/commands/assemble_cvd/graphics_flags.cc b/host/commands/assemble_cvd/graphics_flags.cc
+index 86bd09e..50ebff2 100644
+--- a/host/commands/assemble_cvd/graphics_flags.cc
++++ b/host/commands/assemble_cvd/graphics_flags.cc
+@@ -248,7 +248,7 @@ GetNeededVhostUserGpuHostRendererFeatures(
+ }
+ 
+ Result<std::string> SelectGpuMode(
+-    const std::string& gpu_mode_arg, VmmMode vmm,
++    const std::string& gpu_mode_arg, [[maybe_unused]] VmmMode vmm,
+     const GuestConfig& guest_config,
+     const gfxstream::proto::GraphicsAvailability& graphics_availability) {
+   if (gpu_mode_arg != kGpuModeAuto && gpu_mode_arg != kGpuModeDrmVirgl &&
+-- 
+2.50.1
+

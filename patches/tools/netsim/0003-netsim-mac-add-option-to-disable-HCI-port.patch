@@ -1,0 +1,111 @@
+From 4a2fc075c6a0767baf80783ef2197acd02a726f1 Mon Sep 17 00:00:00 2001
+From: spelliott <spelliott@devvm11359.lla0.facebook.com>
+Date: Thu, 5 Mar 2026 14:52:18 -0800
+Subject: [PATCH 3/3] [netsim][mac] add option to disable HCI port
+
+Summary:
+Currently netsim always creates an HCI port - using the config `rootcanal_hci_port`, which will always align with the rootcanal (virtual BT controller) port when using the option `netsim_bt=false`.
+
+If we have the option to disable this port, we open up another use case: as well as offering [ rootcanal -> netsim ], we can do [ rootcanal -> bumble ], where bumble is a tool that can enable forwarding of HCI to a physical BT dongle which is useful for local dev purposes.
+
+Test Plan:
+@jeffreyeffendy built the host tools for this branch (thanks!)
+
+Then
+
+```
+cd ~/fbsource/fbcode/device
+./dev-entry wrist virtual -t <device>_emu_cf --skip-login --local ~/<device>
+```
+
+CF boots fine.
+
+```
+VIRTUAL_DEVICE_BOOT_COMPLETED
+Virtual device booted successfully
+```
+ I had to use dev-entry with a manual change to make device skip the `build.prop` metadata check because my custom build didn't have that
+
+I also tried with some new device code (still WIP) that disables the HCI root port, which also worked fine:
+
+```
+./dev-entry wrist virtual -t <device>_emu_cf --skip-login --use-bumble-usb --local ~/<device>
+```
+
+Reviewers: achong, <internal-group>, jeffreyeffendy, drahul
+
+Reviewed By: achong
+
+Subscribers: jeffreyeffendy, jessiew, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D95451503
+---
+ rust/daemon/src/args.rs      | 4 ++++
+ rust/daemon/src/rust_main.rs | 1 +
+ rust/daemon/src/service.rs   | 8 ++++++--
+ 3 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/rust/daemon/src/args.rs b/rust/daemon/src/args.rs
+index c6582b5d..1b8bc69c 100644
+--- a/rust/daemon/src/args.rs
++++ b/rust/daemon/src/args.rs
+@@ -40,6 +40,10 @@ pub struct NetsimdArgs {
+     #[arg(long, alias = "hci_port")]
+     pub hci_port: Option<u32>,
+ 
++    /// Disable HCI port transport
++    #[arg(long, alias = "disable_hci_port")]
++    pub disable_hci_port: bool,
++
+     /// Enables connector mode to forward packets to another instance.
+     #[arg(short, long, alias = "connector_instance", visible_alias = "connector_instance_num")]
+     pub connector_instance: Option<u16>,
+diff --git a/rust/daemon/src/rust_main.rs b/rust/daemon/src/rust_main.rs
+index fdbcc190..b5584558 100644
+--- a/rust/daemon/src/rust_main.rs
++++ b/rust/daemon/src/rust_main.rs
+@@ -284,6 +284,7 @@ fn run_netsimd_primary(mut args: NetsimdArgs) {
+         args.no_cli_ui,
+         args.no_web_ui,
+         hci_port,
++        args.disable_hci_port,
+         instance_num,
+         args.dev,
+         args.vsock.unwrap_or_default(),
+diff --git a/rust/daemon/src/service.rs b/rust/daemon/src/service.rs
+index 9d418ffb..ac0d5d82 100644
+--- a/rust/daemon/src/service.rs
++++ b/rust/daemon/src/service.rs
+@@ -34,6 +34,7 @@ pub struct ServiceParams {
+     no_cli_ui: bool,
+     no_web_ui: bool,
+     hci_port: u16,
++    disable_hci_port: bool,
+     instance_num: u16,
+     dev: bool,
+     vsock: u16,
+@@ -46,11 +47,12 @@ impl ServiceParams {
+         no_cli_ui: bool,
+         no_web_ui: bool,
+         hci_port: u16,
++        disable_hci_port: bool,
+         instance_num: u16,
+         dev: bool,
+         vsock: u16,
+     ) -> Self {
+-        ServiceParams { fd_startup_str, no_cli_ui, no_web_ui, hci_port, instance_num, dev, vsock }
++        ServiceParams { fd_startup_str, no_cli_ui, no_web_ui, hci_port, disable_hci_port, instance_num, dev, vsock }
+     }
+ }
+ 
+@@ -136,7 +138,9 @@ impl Service {
+         let web_port = self.run_web_server();
+ 
+         // Run the socket server.
+-        run_socket_transport(self.service_params.hci_port);
++        if !self.service_params.disable_hci_port {
++            run_socket_transport(self.service_params.hci_port);
++        }
+ 
+         Ok((grpc_port, web_port))
+     }

@@ -1,0 +1,55 @@
+From 69599e2d325423ba5ab3814f33233a6d42410ada Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 14 Aug 2025 14:36:40 -0700
+Subject: [PATCH 17/63] add bgra to cocoa display to fix colors on mac
+
+Summary:
+# Motivation:
+The colors are backwards.
+
+# Overview:
+- use flag added in D80292806 to use BGRA colors
+
+Test Plan:
+| Before | After |
+| -- |
+|  {F1981232645} |  {F1981232667} |
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D80294865
+---
+ host/libs/vm_manager/qemu_manager.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 70b5a3e96..777ed546f 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -270,6 +270,7 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+   }
+ 
+   auto qemu_version = CF_EXPECT(GetQemuVersion(qemu_binary));
++  auto qemu_help = CF_EXPECT(GetQemuHelpString(qemu_binary));
+   Command qemu_cmd(qemu_binary, KillSubprocessFallback(Stop));
+ 
+   qemu_cmd.AddPrerequisite([&dependency_commands]() -> Result<void> {
+@@ -475,7 +476,11 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+              gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe) {
+ #ifdef __APPLE__
+   qemu_cmd.AddParameter("-display");
+-  qemu_cmd.AddParameter("cocoa");
++  if (qemu_help.find("use-bgra") != std::string::npos) {
++    qemu_cmd.AddParameter("cocoa,use-bgra=on");
++  } else {
++    qemu_cmd.AddParameter("cocoa");
++  }
+ #else
+   qemu_cmd.AddParameter("-vnc");
+   qemu_cmd.AddParameter("127.0.0.1:", instance.qemu_vnc_server_port());

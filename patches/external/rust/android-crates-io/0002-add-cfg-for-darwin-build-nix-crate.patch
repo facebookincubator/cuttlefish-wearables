@@ -1,0 +1,50 @@
+From 908223fce4bde491a98c2151d64ec22a7c34d6d7 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:45:47 -0700
+Subject: [PATCH 2/7] add cfg for darwin build - nix crate
+
+Summary:
+# Motivation:
+libnix is needed in cuttlefish host utils. It can be built with the right cfgs
+# Overview:
+- set darwin cfg correctly
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform
+
+Reviewed By: tcare
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D79567506
+
+Tags: aarch64
+---
+ crates/nix/Android.bp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/crates/nix/Android.bp b/crates/nix/Android.bp
+index 2a9c274a..cb3c16b0 100644
+--- a/crates/nix/Android.bp
++++ b/crates/nix/Android.bp
+@@ -68,6 +68,12 @@ rust_library {
+                 "linux_android",
+             ],
+         },
++        darwin: {
++            cfgs: [
++                "apple_targets",
++                "bsd"
++            ]
++        },
+     },
+ 
+ }

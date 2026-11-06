@@ -1,0 +1,236 @@
+From 06d6dd4878b911394eaa52c72d5c9870ccc1d534 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 4 Mar 2026 12:18:05 -1000
+Subject: [PATCH 56/63] [cuttlefish] Update status and host_bugreport for
+ registry-aware config
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+# Motivation:
+Developers running multiple emulator types simultaneously on macOS in independent instance mode have no global config symlink, so cvd_status and cvd_host_bugreport cannot find instances without registry fallback.
+
+```
+  cvd_status --instance_num=1          cvd_status --all_instances
+       |                                    |
+       v                                    v
+  registry lookup(1)                   registry.list()
+       |                                    |
+       v                                    v
+  load config for instance 1           load config for each instance
+  query launcher monitor               query each launcher monitor
+  print status                         print all statuses
+
+  cvd_host_bugreport (no global config)
+       |
+       v
+  registry.list() ──> enumerate instances
+       |
+       v
+  collect logs from each instance config
+```
+
+# Overview:
+Update cvd_status to support --instance_num (query single instance from registry) and --all_instances (enumerate all from registry when no monolithic config). Update cvd_host_bugreport to enumerate instances from the registry when no monolithic config is available, collecting logs from each independent instance's config.
+
+Test Plan:
+```
+cd /Volumes/AOSP && source build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+
+HOME=~/.device/cache/emulators/<device>_cf_emu_arm64-37930000003761-2086149158896680 ./bin/cvd_status --all_instances
+```
+
+Reviewers: josephknox, <internal-group>, jamesbloomer, hzalek
+
+Reviewed By: josephknox
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D96518703
+
+Tags: aarch64
+---
+ host/commands/host_bugreport/main.cc | 42 ++++++++++++++--
+ host/commands/status/main.cc         | 71 +++++++++++++++++++++++++++-
+ 2 files changed, 106 insertions(+), 7 deletions(-)
+
+diff --git a/host/commands/host_bugreport/main.cc b/host/commands/host_bugreport/main.cc
+index b4dcb4dcc..b9a1011f9 100644
+--- a/host/commands/host_bugreport/main.cc
++++ b/host/commands/host_bugreport/main.cc
+@@ -31,6 +31,7 @@
+ #include "common/libs/utils/subprocess.h"
+ #include "common/libs/utils/tee_logging.h"
+ #include "host/libs/config/cuttlefish_config.h"
++#include "host/libs/config/instance_registry.h"
+ #include "ziparchive/zip_writer.h"
+ 
+ DEFINE_string(output, "host_bugreport.zip", "Where to write the output");
+@@ -128,19 +129,49 @@ Result<void> CvdHostBugreportMain(int argc, char** argv) {
+   }
+ 
+   auto config = CuttlefishConfig::Get();
++
++  // If no monolithic config, try to enumerate instances from the registry.
++  std::vector<std::unique_ptr<const CuttlefishConfig>> registry_configs;
++  if (!config) {
++    auto instances = ListInstances();
++    if (instances.ok() && !instances->empty()) {
++      for (const auto& entry : *instances) {
++        auto inst_config =
++            CuttlefishConfig::GetForInstance(entry.instance_num);
++        if (inst_config) {
++          registry_configs.push_back(std::move(inst_config));
++        }
++      }
++      if (!registry_configs.empty()) {
++        config = registry_configs[0].get();
++      }
++    }
++  }
+   CHECK(config) << "Unable to find the config";
+ 
+   auto out_path = FLAGS_output.c_str();
+   std::unique_ptr<FILE, decltype(&fclose)> out(fopen(out_path, "wbe"), &fclose);
+   ZipWriter writer(out.get());
+ 
+-  auto save = [&writer, config](const std::string& path) {
++  auto save_assembly = [&writer, config](const std::string& path) {
+     SaveFile(writer, "cuttlefish_assembly/" + path, config->AssemblyPath(path));
+   };
+-  save("assemble_cvd.log");
+-  save("cuttlefish_config.json");
++  save_assembly("assemble_cvd.log");
++  save_assembly("cuttlefish_config.json");
+ 
+-  for (const auto& instance : config->Instances()) {
++  // Collect all configs to iterate: either the single monolithic config
++  // or multiple configs from the registry.
++  std::vector<const CuttlefishConfig*> all_configs;
++  if (!registry_configs.empty()) {
++    for (const auto& rc : registry_configs) {
++      all_configs.push_back(rc.get());
++    }
++  } else {
++    all_configs.push_back(config);
++  }
++
++  for (const auto* cfg : all_configs) {
++    for (const auto& instance : cfg->Instances()) {
+     auto save = [&writer, instance](const std::string& path) {
+       const auto& zip_name = instance.instance_name() + "/" + path;
+       const auto& file_name = instance.PerInstancePath(path.c_str());
+@@ -212,7 +243,8 @@ Result<void> CvdHostBugreportMain(int argc, char** argv) {
+       }
+       static_cast<void>(RecursivelyRemoveDirectory(device_br_dir));
+     }
+-  }
++  }  // for each instance
++  }  // for each config
+ 
+   AddNetsimdLogs(writer);
+ 
+diff --git a/host/commands/status/main.cc b/host/commands/status/main.cc
+index 4e284f01d..e38ba1a22 100644
+--- a/host/commands/status/main.cc
++++ b/host/commands/status/main.cc
+@@ -32,6 +32,7 @@
+ #include "host/libs/command_util/runner/defs.h"
+ #include "host/libs/command_util/util.h"
+ #include "host/libs/config/cuttlefish_config.h"
++#include "host/libs/config/instance_registry.h"
+ 
+ namespace cuttlefish {
+ namespace {
+@@ -39,6 +40,7 @@ namespace {
+ struct StatusFlags {
+   std::int32_t wait_for_launcher = 5;
+   std::string instance_name;
++  std::int32_t instance_num = 0;
+   bool print = false;
+   bool all_instances = false;
+   bool help_xml = false;
+@@ -58,6 +60,11 @@ Result<StatusFlags> GetFlagValues(int argc, char** argv) {
+   flags.emplace_back(GflagsCompatFlag("print", flag_values.print)
+                          .Help("If provided, prints status and instance config "
+                                "information to stdout instead of CHECK"));
++  flags.emplace_back(
++      GflagsCompatFlag("instance_num", flag_values.instance_num)
++          .Help("Query only this specific instance number. When set, loads "
++                "the instance config from the registry instead of the "
++                "global config. Use 0 (default) to use normal lookup."));
+   flags.emplace_back(
+       GflagsCompatFlag("all_instances", flag_values.all_instances)
+           .Help("List all instances status and instance config information."));
+@@ -111,8 +118,68 @@ Json::Value PopulateDevicesInfoFromInstance(
+ }
+ 
+ Result<void> CvdStatusMain(const StatusFlags& flag_values) {
+-  const CuttlefishConfig* config =
+-      CF_EXPECT(CuttlefishConfig::Get(), "Failed to obtain config object");
++  // If a specific instance number was requested, load its config
++  // from the instance registry (independent instance mode).
++  if (flag_values.instance_num > 0) {
++    auto inst_config =
++        CuttlefishConfig::GetForInstance(flag_values.instance_num);
++    CF_EXPECT(inst_config != nullptr,
++              "Could not load config for instance "
++                  << flag_values.instance_num << " from registry");
++    Json::Value devices_info;
++    int index = 0;
++    for (const auto& instance : inst_config->Instances()) {
++      SharedFD monitor_socket = CF_EXPECT(GetLauncherMonitorFromInstance(
++          instance, flag_values.wait_for_launcher));
++      CF_EXPECT(RunLauncherAction(monitor_socket, LauncherAction::kStatus,
++                                  flag_values.wait_for_launcher));
++      devices_info[index] =
++          PopulateDevicesInfoFromInstance(*inst_config, instance);
++      LOG(INFO) << "run_cvd is active for instance "
++                << instance.instance_name();
++      index++;
++    }
++    if (flag_values.print) {
++      std::cout << devices_info.toStyledString();
++    }
++    return {};
++  }
++
++  const CuttlefishConfig* config = CuttlefishConfig::Get();
++
++  // If no monolithic config and --all_instances, try the registry.
++  if (!config && flag_values.all_instances) {
++    auto instances = ListInstances();
++    if (instances.ok() && !instances->empty()) {
++      Json::Value devices_info;
++      int index = 0;
++      for (const auto& entry : *instances) {
++        auto inst_config = CuttlefishConfig::GetForInstance(entry.instance_num);
++        if (!inst_config) {
++          LOG(ERROR) << "Could not load config for instance "
++                     << entry.instance_num;
++          continue;
++        }
++        for (const auto& instance : inst_config->Instances()) {
++          SharedFD monitor_socket = CF_EXPECT(GetLauncherMonitorFromInstance(
++              instance, flag_values.wait_for_launcher));
++          CF_EXPECT(RunLauncherAction(monitor_socket, LauncherAction::kStatus,
++                                      flag_values.wait_for_launcher));
++          devices_info[index] =
++              PopulateDevicesInfoFromInstance(*inst_config, instance);
++          LOG(INFO) << "run_cvd is active for instance "
++                    << instance.instance_name();
++          index++;
++        }
++      }
++      if (flag_values.print) {
++        std::cout << devices_info.toStyledString();
++      }
++      return {};
++    }
++  }
++
++  CF_EXPECT(config != nullptr, "Failed to obtain config object");
+ 
+   Json::Value devices_info;
+   auto instance_names =

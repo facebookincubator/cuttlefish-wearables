@@ -1,0 +1,84 @@
+From 78ce62d9e7ed61ce327ed099b88e84b12141c1a8 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 27 Jan 2026 15:09:27 -0800
+Subject: [PATCH 33/63] modify vhost_user_input to work on macos
+
+Summary:
+# Motivation:
+cf_vhost_user_input crashes on macos
+
+Let's get it working so keyboard inputs work with qemu + cuttlefish images on mac.
+
+# Overview:
+- skip validation on macos and use the raw file descriptor
+
+Test Plan:
+# Build host tools on mac host
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+# Launch:
+```
+# in device cache folder
+ln -s /Volumes/AOSP/out/host/darwin-x86/cvd-host_package/* .
+./start_cuttlefish.py
+```
+
+ {F1984991982} https://pxl.cl/8Nf4W
+
+Rollback Plan:
+
+Reviewers: spelliott, <internal-group>, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: spelliott
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D91631170
+
+Tags: aarch64
+---
+ host/commands/vhost_user_input/main.rs | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/host/commands/vhost_user_input/main.rs b/host/commands/vhost_user_input/main.rs
+index 9228af963..35cd32637 100644
+--- a/host/commands/vhost_user_input/main.rs
++++ b/host/commands/vhost_user_input/main.rs
+@@ -5,7 +5,7 @@ mod vhu_input;
+ mod vio_input;
+ 
+ use std::fs;
+-use std::os::fd::{FromRawFd, IntoRawFd};
++use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+ use std::str::FromStr;
+ use std::sync::{Arc, Mutex};
+ 
+@@ -46,7 +46,9 @@ fn init_logging(verbosity: &str) -> Result<()> {
+ }
+ 
+ fn main() -> Result<()> {
+-    // SAFETY: First thing after main
++    // SAFETY: First thing after main. Only run on Linux as rustutils::inherited_fd
++    // requires /proc/self/fd which doesn't exist on macOS.
++    #[cfg(target_os = "linux")]
+     unsafe {
+         rustutils::inherited_fd::init_once()
+             .context("Failed to take ownership of process' file descriptors")?
+@@ -65,8 +67,13 @@ fn main() -> Result<()> {
+         .context("Unable to parse config file")?;
+ 
+     // SAFETY: No choice but to trust the caller passed a valid fd representing a unix socket.
++    #[cfg(target_os = "linux")]
+     let server_fd = rustutils::inherited_fd::take_fd_ownership(args.socket_fd)
+         .context("Failed to take ownership of socket fd")?;
++    // SAFETY: No choice but to trust the caller passed a valid fd representing a unix socket.
++    // On non-Linux platforms, we directly create an OwnedFd from the raw fd passed by the caller.
++    #[cfg(not(target_os = "linux"))]
++    let server_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(args.socket_fd) };
+     loop {
+         let backend =
+             Arc::new(Mutex::new(VhostUserInput::new(device_config.clone(), std::io::stdin())));

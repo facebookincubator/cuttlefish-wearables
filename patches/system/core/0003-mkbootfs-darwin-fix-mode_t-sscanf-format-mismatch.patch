@@ -1,0 +1,44 @@
+From 25f6d0cba5431a33f54482e0febe1f09d2035d5a Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 27 Jul 2026 16:27:27 -0700
+Subject: [PATCH] mkbootfs: darwin: fix mode_t sscanf format mismatch
+
+On macOS mode_t is unsigned short, so "%o" into &st_mode triggers
+-Werror,-Wformat. Scan the mode into a temporary unsigned int and assign,
+which is correct on both Linux and darwin.
+---
+ mkbootfs/mkbootfs.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/mkbootfs/mkbootfs.cpp b/mkbootfs/mkbootfs.cpp
+index 1ebae05..6875e2a 100644
+--- a/mkbootfs/mkbootfs.cpp
++++ b/mkbootfs/mkbootfs.cpp
+@@ -311,8 +311,10 @@ static void devnodes_desc_error(const char* filename, unsigned long line_num,
+ static int append_devnodes_desc_dir(char* path, char* args)
+ {
+     struct stat s;
++    unsigned int mode;
+ 
+-    if (sscanf(args, "%o %d %d", &s.st_mode, &s.st_uid, &s.st_gid) != 3) return -1;
++    if (sscanf(args, "%o %d %d", &mode, &s.st_uid, &s.st_gid) != 3) return -1;
++    s.st_mode = mode;
+ 
+     s.st_mode |= S_IFDIR;
+ 
+@@ -326,9 +328,11 @@ static int append_devnodes_desc_nod(char* path, char* args)
+     int minor, major;
+     struct stat s;
+     char dev;
++    unsigned int mode;
+ 
+-    if (sscanf(args, "%o %d %d %c %d %d", &s.st_mode, &s.st_uid, &s.st_gid,
++    if (sscanf(args, "%o %d %d %c %d %d", &mode, &s.st_uid, &s.st_gid,
+                &dev, &major, &minor) != 6) return -1;
++    s.st_mode = mode;
+ #ifdef __APPLE__
+     fprintf(stderr, "mkbootfs does not support dev nodes on Apple platforms\n");
+ #else
+-- 
+2.50.1
+

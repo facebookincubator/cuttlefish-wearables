@@ -1,0 +1,135 @@
+From 2f16b0ee68ec72f38096632a89fe2bb2e07d4135 Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Tue, 16 Dec 2025 17:52:46 -0800
+Subject: [PATCH 6/7] Fix adb throughput on mac by allowing multiple epoll
+ flags
+
+Summary:
+ADB was having throughput issues despite aggressively draining the vsock tx buffer. The root cause is the epoll shim - it currently only accepts one flag type, leading to EPOLLIN | EPOLLOUT only registering one type with kqueue.
+
+This fix correctly builds the flags when multiple values are specified, thus delivering both EPOLLIN/OUT and correcting throughput.
+
+We can remove the aggressive tx buffer change following this one.
+
+Test Plan:
+`adb shell`
+- check typing is responsive
+- `cmd gpu vkjson` doesn't lag
+- `logcat` does not freeze during buffer readout
+
+Rollback Plan:
+
+Reviewers: olja, achong
+
+Reviewed By: olja
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D89338990
+---
+ crates/epoll/src/macos.rs | 71 +++++++++++++++++++++++----------------
+ 1 file changed, 42 insertions(+), 29 deletions(-)
+
+diff --git a/crates/epoll/src/macos.rs b/crates/epoll/src/macos.rs
+index 8617e6df..79e31659 100644
+--- a/crates/epoll/src/macos.rs
++++ b/crates/epoll/src/macos.rs
+@@ -160,50 +160,63 @@ pub fn ctl(
+     fd: RawFd,
+     event: Event,
+ ) -> io::Result<()> {
+-    let mut kev = kevent {
+-        ident: fd as usize,
+-        filter: 0,
+-        flags: 0,
+-        fflags: 0,
+-        data: 0,
+-        udata: std::ptr::null_mut(),
+-    };
+-
+-    // Map epoll events to kqueue filters and flags
+-    if event.events & EPOLLIN != 0 {
+-        kev.filter = EVFILT_READ;
+-    } else if event.events & EPOLLOUT != 0 {
+-        kev.filter = EVFILT_WRITE;
+-    } else {
+-        kev.filter = EVFILT_READ; // Default to read
+-    }
+-
+-    match op {
++    // Determine base flags based on operation
++    let base_flags: u16 = match op {
+         ControlOptions::EPOLL_CTL_ADD => {
+-            kev.flags = EV_ADD as u16;
++            let mut flags = EV_ADD as u16;
+             if event.events & EPOLLONESHOT != 0 {
+-                kev.flags |= EV_ONESHOT as u16;
++                flags |= EV_ONESHOT as u16;
+             }
+             if event.events & EPOLLET != 0 {
+-                kev.flags |= EV_CLEAR as u16;
++                flags |= EV_CLEAR as u16;
+             }
++            flags
+         }
+         ControlOptions::EPOLL_CTL_MOD => {
+-            kev.flags = EV_ADD as u16; // Modify is similar to add in kqueue
++            // Modify is similar to add in kqueue
++            EV_ADD as u16
+         }
+         ControlOptions::EPOLL_CTL_DEL => {
+-            kev.flags = EV_DELETE as u16;
++            EV_DELETE as u16
+         }
+-    }
++    };
+ 
+-    kev.udata = event.data as *mut libc::c_void;
++    // Build a list of kevents - we may need multiple for EPOLLIN + EPOLLOUT
++    let mut changelist: Vec<kevent> = Vec::with_capacity(2);
++    
++    let has_read = event.events & EPOLLIN != 0;
++    let has_write = event.events & EPOLLOUT != 0;
++    
++    // If neither is specified, default to read
++    let effective_read = has_read || (!has_read && !has_write);
++    
++    if effective_read {
++        changelist.push(kevent {
++            ident: fd as usize,
++            filter: EVFILT_READ,
++            flags: base_flags,
++            fflags: 0,
++            data: 0,
++            udata: event.data as *mut libc::c_void,
++        });
++    }
++    
++    if has_write {
++        changelist.push(kevent {
++            ident: fd as usize,
++            filter: EVFILT_WRITE,
++            flags: base_flags,
++            fflags: 0,
++            data: 0,
++            udata: event.data as *mut libc::c_void,
++        });
++    }
+ 
+-    let changelist = [kev];
+     let result = unsafe {
+         kevent(
+             epfd,
+             changelist.as_ptr(),
+-            1,
++            changelist.len() as i32,
+             std::ptr::null_mut(),
+             0,
+             std::ptr::null(),
+@@ -299,4 +312,4 @@ fn cvt(result: libc::c_int) -> io::Result<libc::c_int> {
+     } else {
+         Ok(result)
+     }
+-}
+\ No newline at end of file
++}

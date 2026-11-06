@@ -1,0 +1,653 @@
+From 04b2103c9206f846189a9fd2042ab1db4dfc1699 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:57:59 -0700
+Subject: [PATCH] support wayland on darwin
+
+Summary: definitely makes it compile, but not sure if correct
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D79568304
+
+Tags: aarch64
+---
+ config.h             |   2 +
+ src/event-loop.c     | 271 +++++++++++++++++++++++++++++++++++++++++--
+ src/wayland-os.c     |  36 +++++-
+ src/wayland-server.c |  20 ++++
+ 4 files changed, 319 insertions(+), 10 deletions(-)
+
+diff --git a/config.h b/config.h
+index 96d00e1..a7def3f 100644
+--- a/config.h
++++ b/config.h
+@@ -15,5 +15,7 @@
+  */
+ 
+ // These are provided by bionic
++#ifdef __linux__
+ #define HAVE_ACCEPT4
++#endif
+ #define HAVE_STRNDUP
+diff --git a/src/event-loop.c b/src/event-loop.c
+index 37cf95d..5615666 100644
+--- a/src/event-loop.c
++++ b/src/event-loop.c
+@@ -35,9 +35,16 @@
+ #include <fcntl.h>
+ #include <sys/socket.h>
+ #include <sys/un.h>
++#ifdef __linux__
+ #include <sys/epoll.h>
+ #include <sys/signalfd.h>
+ #include <sys/timerfd.h>
++#endif
++#ifdef __APPLE__
++#include <sys/types.h>
++#include <sys/event.h>
++#include <sys/time.h>
++#endif
+ #include <unistd.h>
+ #include "wayland-util.h"
+ #include "wayland-private.h"
+@@ -79,8 +86,14 @@ struct wl_event_loop {
+ };
+ 
+ struct wl_event_source_interface {
+-	int (*dispatch)(struct wl_event_source *source,
+-			struct epoll_event *ep);
++#ifdef __APPLE__
++int (*dispatch)(struct wl_event_source *source,
++		struct kevent *ke);
++#else
++int (*dispatch)(struct wl_event_source *source,
++		struct epoll_event *ep);
++
++#endif
+ };
+ 
+ 
+@@ -92,6 +105,27 @@ struct wl_event_source_fd {
+ 
+ /** \endcond */
+ 
++#ifdef __APPLE__
++static int
++wl_event_source_fd_dispatch(struct wl_event_source *source,
++			    struct kevent *ke)
++{
++	struct wl_event_source_fd *fd_source = (struct wl_event_source_fd *) source;
++	uint32_t mask;
++
++	mask = 0;
++	if (ke->filter == EVFILT_READ)
++		mask |= WL_EVENT_READABLE;
++	if (ke->filter == EVFILT_WRITE)
++		mask |= WL_EVENT_WRITABLE;
++	if (ke->filter == EV_EOF)
++		mask |= WL_EVENT_HANGUP;
++	if (ke->filter == EV_ERROR)
++		mask |= WL_EVENT_ERROR;
++
++	return fd_source->func(fd_source->fd, mask, source->data);
++}
++#else
+ static int
+ wl_event_source_fd_dispatch(struct wl_event_source *source,
+ 			    struct epoll_event *ep)
+@@ -111,11 +145,50 @@ wl_event_source_fd_dispatch(struct wl_event_source *source,
+ 
+ 	return fd_source->func(fd_source->fd, mask, source->data);
+ }
++#endif
+ 
+ struct wl_event_source_interface fd_source_interface = {
+ 	wl_event_source_fd_dispatch,
+ };
+ 
++#ifdef __APPLE__
++static struct wl_event_source *
++add_source(struct wl_event_loop *loop,
++	   struct wl_event_source *source, uint32_t mask, void *data)
++{
++	struct kevent ke;
++
++	if (source->fd < 0) {
++		free(source);
++		return NULL;
++	}
++
++	source->loop = loop;
++	source->data = data;
++	wl_list_init(&source->link);
++
++	memset(&ke, 0, sizeof ke);
++	if (mask & WL_EVENT_READABLE) {
++		EV_SET(&ke, source->fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, source);
++		if (kevent(loop->epoll_fd, &ke, 1, NULL, 0, NULL) == -1) {
++			close(source->fd);
++			free(source);
++			return NULL;
++		}
++	}
++
++	if (mask & WL_EVENT_WRITABLE) {
++		EV_SET(&ke, source->fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, source);
++		if (kevent(loop->epoll_fd, &ke, 1, NULL, 0, NULL) == -1) {
++			close(source->fd);
++			free(source);
++			return NULL;
++		}
++	}
++
++	return source;
++}
++#else
+ static struct wl_event_source *
+ add_source(struct wl_event_loop *loop,
+ 	   struct wl_event_source *source, uint32_t mask, void *data)
+@@ -146,6 +219,7 @@ add_source(struct wl_event_loop *loop,
+ 
+ 	return source;
+ }
++#endif
+ 
+ /** Create a file descriptor event source
+  *
+@@ -214,6 +288,29 @@ wl_event_loop_add_fd(struct wl_event_loop *loop,
+ WL_EXPORT int
+ wl_event_source_fd_update(struct wl_event_source *source, uint32_t mask)
+ {
++#ifdef __APPLE__
++	struct wl_event_loop *loop = source->loop;
++	struct kevent ke;
++
++	memset(&ke, 0, sizeof ke);
++	int result = 0;
++
++	if (mask & WL_EVENT_READABLE) {
++		EV_SET(&ke, source->fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, source);
++		if (kevent(loop->epoll_fd, &ke, 1, NULL, 0, NULL) == -1) {
++			result = -1;
++		}
++	}
++
++	if (mask & WL_EVENT_WRITABLE) {
++		EV_SET(&ke, source->fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, source);
++		if (kevent(loop->epoll_fd, &ke, 1, NULL, 0, NULL) == -1) {
++			result = -1;
++		}
++	}
++
++	return result;
++#else
+ 	struct wl_event_loop *loop = source->loop;
+ 	struct epoll_event ep;
+ 
+@@ -225,6 +322,7 @@ wl_event_source_fd_update(struct wl_event_source *source, uint32_t mask)
+ 	ep.data.ptr = source;
+ 
+ 	return epoll_ctl(loop->epoll_fd, EPOLL_CTL_MOD, source->fd, &ep);
++#endif
+ }
+ 
+ /** \cond INTERNAL */
+@@ -237,11 +335,19 @@ struct wl_event_source_timer {
+ 	int heap_idx;
+ };
+ 
++#ifdef __APPLE__
++static int
++noop_dispatch(struct wl_event_source *source,
++	      struct kevent *ke) {
++	return 0;
++}
++#else
+ static int
+ noop_dispatch(struct wl_event_source *source,
+ 	      struct epoll_event *ep) {
+ 	return 0;
+ }
++#endif
+ 
+ struct wl_event_source_interface timer_heap_source_interface = {
+ 	noop_dispatch,
+@@ -258,17 +364,39 @@ time_lt(struct timespec ta, struct timespec tb)
+ 
+ static int
+ set_timer(int timerfd, struct timespec deadline) {
++#ifdef __APPLE__
++	struct kevent ke;
++	struct timespec now;
++	struct timespec interval;
++
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	interval.tv_sec = deadline.tv_sec - now.tv_sec;
++	interval.tv_nsec = deadline.tv_nsec - now.tv_nsec;
++	if (interval.tv_nsec < 0) {
++		interval.tv_sec -= 1;
++		interval.tv_nsec += 1000000000L;
++	}
++
++	EV_SET(&ke, timerfd, EVFILT_TIMER, EV_ADD | EV_ENABLE, 0, interval.tv_sec * 1000 + interval.tv_nsec / 1000000, NULL);
++	return kevent(timerfd, &ke, 1, NULL, 0, NULL);
++#else
+ 	struct itimerspec its;
+ 
+ 	its.it_interval.tv_sec = 0;
+ 	its.it_interval.tv_nsec = 0;
+ 	its.it_value = deadline;
+ 	return timerfd_settime(timerfd, TFD_TIMER_ABSTIME, &its, NULL);
++#endif
+ }
+ 
+ static int
+ clear_timer(int timerfd)
+ {
++#ifdef __APPLE__
++	struct kevent ke;
++	EV_SET(&ke, timerfd, EVFILT_TIMER, EV_DELETE, 0, 0, NULL);
++	return kevent(timerfd, &ke, 1, NULL, 0, NULL);
++#else
+ 	struct itimerspec its;
+ 
+ 	its.it_interval.tv_sec = 0;
+@@ -276,6 +404,7 @@ clear_timer(int timerfd)
+ 	its.it_value.tv_sec = 0;
+ 	its.it_value.tv_nsec = 0;
+ 	return timerfd_settime(timerfd, 0, &its, NULL);
++#endif
+ }
+ 
+ static void
+@@ -305,6 +434,28 @@ wl_timer_heap_release(struct wl_timer_heap *timers)
+ static int
+ wl_timer_heap_ensure_timerfd(struct wl_timer_heap *timers)
+ {
++#ifdef __APPLE__
++	struct kevent ke;
++	int timer_fd;
++
++	if (timers->base.fd != -1)
++		return 0;
++
++	// Create a kqueue for the timer
++	timer_fd = kqueue();
++	if (timer_fd < 0)
++		return -1;
++
++	// Set up the timer event
++	EV_SET(&ke, 1, EVFILT_TIMER, EV_ADD | EV_ENABLE, 0, 0, timers);
++	if (kevent(timer_fd, &ke, 1, NULL, 0, NULL) == -1) {
++		close(timer_fd);
++		return -1;
++	}
++
++	timers->base.fd = timer_fd;
++	return 0;
++#else
+ 	struct epoll_event ep;
+ 	int timer_fd;
+ 
+@@ -328,6 +479,7 @@ wl_timer_heap_ensure_timerfd(struct wl_timer_heap *timers)
+ 
+ 	timers->base.fd = timer_fd;
+ 	return 0;
++#endif
+ }
+ 
+ static int
+@@ -529,6 +681,17 @@ wl_timer_heap_dispatch(struct wl_timer_heap *timers)
+ 	return 0;
+ }
+ 
++#ifdef __APPLE__
++static int
++wl_event_source_timer_dispatch(struct wl_event_source *source,
++			       struct kevent *ke)
++{
++	struct wl_event_source_timer *timer;
++
++	timer = wl_container_of(source, timer, base);
++	return timer->func(timer->base.data);
++}
++#else
+ static int
+ wl_event_source_timer_dispatch(struct wl_event_source *source,
+ 			       struct epoll_event *ep)
+@@ -538,6 +701,7 @@ wl_event_source_timer_dispatch(struct wl_event_source *source,
+ 	timer = wl_container_of(source, timer, base);
+ 	return timer->func(timer->base.data);
+ }
++#endif
+ 
+ struct wl_event_source_interface timer_source_interface = {
+ 	wl_event_source_timer_dispatch,
+@@ -668,6 +832,33 @@ struct wl_event_source_signal {
+ 
+ /** \endcond */
+ 
++#ifdef __APPLE__
++static int signal_pipe[2];
++
++static void signal_handler(int signo) {
++    write(signal_pipe[1], &signo, sizeof(signo));
++}
++#endif
++
++#ifdef __APPLE__
++static int
++wl_event_source_signal_dispatch(struct wl_event_source *source,
++				struct kevent *ke)
++{
++
++	struct wl_event_source_signal *signal_source =
++		(struct wl_event_source_signal *) source;
++	int signo;
++	int len;
++
++	len = read(source->fd, &signo, sizeof signo);
++	if (!(len == -1 && errno == EAGAIN) && len != sizeof signo)
++		/* Is there anything we can do here?  Will this ever happen? */
++		wl_log("signalfd read error: %s\n", strerror(errno));
++
++	return signal_source->func(signo, signal_source->base.data);
++}
++#else
+ static int
+ wl_event_source_signal_dispatch(struct wl_event_source *source,
+ 				struct epoll_event *ep)
+@@ -685,6 +876,7 @@ wl_event_source_signal_dispatch(struct wl_event_source *source,
+ 	return signal_source->func(signal_source->signal_number,
+ 				   signal_source->base.data);
+ }
++#endif
+ 
+ struct wl_event_source_interface signal_source_interface = {
+ 	wl_event_source_signal_dispatch,
+@@ -718,19 +910,36 @@ wl_event_loop_add_signal(struct wl_event_loop *loop,
+ 	struct wl_event_source_signal *source;
+ 	sigset_t mask;
+ 
++#ifdef __APPLE__
++	if (pipe(signal_pipe) == -1) {
++        perror("pipe");
++        return NULL;
++    }
++	struct sigaction sa;
++    memset(&sa, 0, sizeof(sa));
++    sa.sa_handler = signal_handler;
++    sigaction(signal_number, &sa, NULL);
++#endif
++
+ 	source = zalloc(sizeof *source);
+ 	if (source == NULL)
+ 		return NULL;
+ 
+-	source->base.interface = &signal_source_interface;
+-	source->signal_number = signal_number;
+-
++#ifndef __APPLE__
+ 	sigemptyset(&mask);
+ 	sigaddset(&mask, signal_number);
++#endif
++	source->base.interface = &signal_source_interface;
++	source->signal_number = signal_number;
++#ifdef __APPLE__
++	source->base.fd = signal_pipe[0];  // Use the read end of the pipe
++#else
+ 	source->base.fd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
+-	sigprocmask(SIG_BLOCK, &mask, NULL);
+-
++#endif
+ 	source->func = func;
++#ifndef __APPLE__
++	sigprocmask(SIG_BLOCK, &mask, NULL);
++#endif
+ 
+ 	return add_source(loop, &source->base, WL_EVENT_READABLE, data);
+ }
+@@ -830,6 +1039,19 @@ wl_event_source_remove(struct wl_event_source *source)
+ {
+ 	struct wl_event_loop *loop = source->loop;
+ 
++#ifdef __APPLE__
++	/* We need to explicitly remove the fd, since closing the fd
++	 * isn't enough in case we've dup'ed the fd. */
++	if (source->fd >= 0) {
++		struct kevent ke;
++		EV_SET(&ke, source->fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
++		kevent(loop->epoll_fd, &ke, 1, NULL, 0, NULL);
++		EV_SET(&ke, source->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
++		kevent(loop->epoll_fd, &ke, 1, NULL, 0, NULL);
++		close(source->fd);
++		source->fd = -1;
++	}
++#else
+ 	/* We need to explicitly remove the fd, since closing the fd
+ 	 * isn't enough in case we've dup'ed the fd. */
+ 	if (source->fd >= 0) {
+@@ -837,6 +1059,7 @@ wl_event_source_remove(struct wl_event_source *source)
+ 		close(source->fd);
+ 		source->fd = -1;
+ 	}
++#endif
+ 
+ 	if (source->interface == &timer_source_interface &&
+ 	    source->fd != TIMER_REMOVED) {
+@@ -932,11 +1155,16 @@ wl_event_loop_destroy(struct wl_event_loop *loop)
+ static bool
+ post_dispatch_check(struct wl_event_loop *loop)
+ {
++#ifdef __APPLE__
++	struct kevent ep;
++	memset(&ep, 0, sizeof ep);
++#else
+ 	struct epoll_event ep;
++	ep.events = 0;
++#endif
+ 	struct wl_event_source *source, *next;
+ 	bool needs_recheck = false;
+ 
+-	ep.events = 0;
+ 	wl_list_for_each_safe(source, next, &loop->check_list, link) {
+ 		int dispatch_result;
+ 
+@@ -994,22 +1222,41 @@ wl_event_loop_dispatch_idle(struct wl_event_loop *loop)
+ WL_EXPORT int
+ wl_event_loop_dispatch(struct wl_event_loop *loop, int timeout)
+ {
++#ifdef __APPLE__
++	struct kevent ep[32];
++#else
+ 	struct epoll_event ep[32];
++#endif
+ 	struct wl_event_source *source;
+ 	int i, count;
+ 	bool has_timers = false;
+ 
+ 	wl_event_loop_dispatch_idle(loop);
+ 
++#ifdef __APPLE__
++	struct timespec ts;
++	ts.tv_sec = timeout / 1000;
++	ts.tv_nsec = (timeout % 1000) * 1000000;
++	count = kevent(loop->epoll_fd, NULL, 0, ep, ARRAY_LENGTH(ep), timeout == -1 ? NULL : &ts);
++#else
+ 	count = epoll_wait(loop->epoll_fd, ep, ARRAY_LENGTH(ep), timeout);
++#endif
+ 	if (count < 0)
+ 		return -1;
+ 
++#ifdef __APPLE__
++	for (i = 0; i < count; i++) {
++		source = ep[i].udata; // Use udata for kevent
++		if (source == &loop->timers.base)
++			has_timers = true;
++	}
++#else
+ 	for (i = 0; i < count; i++) {
+ 		source = ep[i].data.ptr;
+ 		if (source == &loop->timers.base)
+ 			has_timers = true;
+ 	}
++#endif
+ 
+ 	if (has_timers) {
+ 		/* Dispatch timer sources before non-timer sources, so that
+@@ -1021,11 +1268,19 @@ wl_event_loop_dispatch(struct wl_event_loop *loop, int timeout)
+ 			return -1;
+ 	}
+ 
++#ifdef __APPLE__
++	for (i = 0; i < count; i++) {
++		source = ep[i].udata; // Use udata for kevent
++		if (source->fd != -1)
++			source->interface->dispatch(source, &ep[i]);
++	}
++#else
+ 	for (i = 0; i < count; i++) {
+ 		source = ep[i].data.ptr;
+ 		if (source->fd != -1)
+ 			source->interface->dispatch(source, &ep[i]);
+ 	}
++#endif
+ 
+ 	wl_event_loop_process_destroy_list(loop);
+ 
+diff --git a/src/wayland-os.c b/src/wayland-os.c
+index a9066ca..0531e17 100644
+--- a/src/wayland-os.c
++++ b/src/wayland-os.c
+@@ -33,7 +33,14 @@
+ #include <fcntl.h>
+ #include <errno.h>
+ #include <string.h>
++#ifdef __linux__
+ #include <sys/epoll.h>
++#endif
++#ifdef __APPLE__
++#include <sys/event.h>
++#include <sys/time.h>
++#include <sys/ucred.h>
++#endif
+ #include <sys/mman.h>
+ #include <sys/un.h>
+ #ifdef HAVE_SYS_UCRED_H
+@@ -68,8 +75,17 @@ int
+ wl_os_socket_cloexec(int domain, int type, int protocol)
+ {
+ 	int fd;
+-
++#ifdef __linux__
+ 	fd = socket(domain, type | SOCK_CLOEXEC, protocol);
++#else
++	fd = socket(domain, type, protocol);
++	if (fd >= 0) {
++		if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
++			close (fd);
++			return -1;
++		}
++	}
++#endif
+ 	if (fd >= 0)
+ 		return fd;
+ 	if (errno != EINVAL)
+@@ -79,7 +95,7 @@ wl_os_socket_cloexec(int domain, int type, int protocol)
+ 	return set_cloexec_or_close(fd);
+ }
+ 
+-#if defined(__FreeBSD__)
++#if defined(__FreeBSD__) || defined(__APPLE__)
+ int
+ wl_os_socket_peercred(int sockfd, uid_t *uid, gid_t *gid, pid_t *pid)
+ {
+@@ -179,7 +195,11 @@ wl_os_recvmsg_cloexec(int sockfd, struct msghdr *msg, int flags)
+ #else
+ 	ssize_t len;
+ 
++#ifdef __APPLE__
++	len = recvmsg(sockfd, msg, flags);
++#else
+ 	len = recvmsg(sockfd, msg, flags | MSG_CMSG_CLOEXEC);
++#endif
+ 	if (len >= 0)
+ 		return len;
+ 	if (errno != EINVAL)
+@@ -200,9 +220,21 @@ wl_os_epoll_create_cloexec(void)
+ 	if (errno != EINVAL)
+ 		return -1;
+ #endif
++#ifdef __APPLE__
++	fd = kqueue();
++    if (fd == -1)
++        return -1;
+ 
++    if (fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
++        close(fd);
++        return -1;
++    }
++
++    return fd;
++#else
+ 	fd = epoll_create(1);
+ 	return set_cloexec_or_close(fd);
++#endif
+ }
+ 
+ int
+diff --git a/src/wayland-server.c b/src/wayland-server.c
+index 468322d..5b48348 100644
+--- a/src/wayland-server.c
++++ b/src/wayland-server.c
+@@ -40,7 +40,9 @@
+ #include <assert.h>
+ #include <sys/time.h>
+ #include <fcntl.h>
++#ifdef __linux__
+ #include <sys/eventfd.h>
++#endif
+ #include <sys/file.h>
+ #include <sys/stat.h>
+ 
+@@ -1138,8 +1140,26 @@ wl_display_create(void)
+ 		free(display);
+ 		return NULL;
+ 	}
++#ifdef __APPLE__
++	int pipe_fds[2];
++	if (pipe(pipe_fds) == -1) {
++		goto err_eventfd;
++	}
+ 
++	display->terminate_efd = pipe_fds[0]; // Read end of the pipe
++	int terminate_write_fd = pipe_fds[1]; // Write end of the pipe
++	// TODO use terminate_write_fd
++
++	// Set the file descriptors to close on exec
++	fcntl(display->terminate_efd, F_SETFD, FD_CLOEXEC);
++	fcntl(terminate_write_fd, F_SETFD, FD_CLOEXEC);
++
++	// Set the file descriptors to non-blocking
++	fcntl(display->terminate_efd, F_SETFL, O_NONBLOCK);
++	fcntl(terminate_write_fd, F_SETFL, O_NONBLOCK);
++#else
+ 	display->terminate_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++#endif
+ 	if (display->terminate_efd < 0)
+ 		goto err_eventfd;
+ 

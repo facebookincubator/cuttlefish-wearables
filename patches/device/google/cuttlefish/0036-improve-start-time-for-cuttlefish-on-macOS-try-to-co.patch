@@ -1,0 +1,199 @@
+From 40c7043fc784a5ccfa18c1426477f8d75b48ba01 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 18 Feb 2026 09:15:56 -1000
+Subject: [PATCH 36/63] improve start time for cuttlefish on macOS - try to
+ connect to socket on mac instead of using lsof
+
+Summary:
+# Motivation:
+The boot on macOS is very slow for cuttlefish emulators. This is because the timeout is reaching maximum length for lsof.
+
+# Overview:
+- try connecting to socket instead of using lsof on mac
+
+Test Plan:
+# Build Host Tools
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+# Pull gw
+```
+device sf device
+device virtual -t device
+```
+
+# Replace Host Tools:
+```
+ rm -r bin com.android.i18n lib64 nativetest64/ framework etc usr
+ ln -s  /Volumes/AOSP/out/host/darwin-x86/cvd-host_package/* .
+```
+
+# Launch with modified start_cuttlefish.py
+```
+./start_cuttlefish.py
+```
+
+# Old: ~ 49 seconds
+https://pxl.cl/8VzV7
+
+# New: ~8 seconds
+ https://pxl.cl/8VzV9
+
+Reviewers: josephknox, tcare, #cuttlefish-cross-platform, <internal-group>, benthomas
+
+Reviewed By: josephknox
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D93635021
+
+Tasks: T255376488
+
+Tags: aarch64
+---
+ common/libs/utils/files.cpp | 71 +++++++++++++++++++------------------
+ 1 file changed, 36 insertions(+), 35 deletions(-)
+
+diff --git a/common/libs/utils/files.cpp b/common/libs/utils/files.cpp
+index 98783e933..c4995ce8d 100644
+--- a/common/libs/utils/files.cpp
++++ b/common/libs/utils/files.cpp
+@@ -37,6 +37,7 @@
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <sys/uio.h>
++#include <sys/un.h>
+ #include <unistd.h>
+ 
+ #include <algorithm>
+@@ -755,11 +756,7 @@ Result<void> WaitForUnixSocketListeningWithoutConnect(const std::string& path,
+       return CF_ERR("Timed out");
+     }
+ 
+-#if defined(__APPLE__)
+-    Command lsof("/usr/sbin/lsof");
+-#else
+     Command lsof("/usr/bin/lsof");
+-#endif
+     lsof.AddParameter(/*"format"*/ "-F", /*"connection state"*/ "TST");
+     lsof.AddParameter(path);
+     std::string lsof_out;
+@@ -802,7 +799,7 @@ class KqueueWatcher {
+       kevent(kq_, &event, 1, nullptr, 0, nullptr);
+     }
+   }
+-  
++
+   virtual ~KqueueWatcher() {
+     if (fd_ >= 0) {
+       close(fd_);
+@@ -850,12 +847,12 @@ static Result<void> WaitForFileInternal(const std::string& path, int timeoutSec,
+     if (currentTimeRemain.count() <= 0) {
+       return CF_ERR("Timed out");
+     }
+-    
++
+     // Convert to seconds and nanoseconds for timespec
+     const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(currentTimeRemain);
+     const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(
+         currentTimeRemain - seconds);
+-    
++
+     struct timespec timeout;
+     timeout.tv_sec = seconds.count();
+     timeout.tv_nsec = nanoseconds.count();
+@@ -870,7 +867,7 @@ static Result<void> WaitForFileInternal(const std::string& path, int timeoutSec,
+       if (FileExists(path, true)) {
+         return {};
+       }
+-      
++
+       // Continue the loop to check again or timeout if we've exceeded the total time
+       continue;
+     } else if (ret < 0) {
+@@ -928,7 +925,7 @@ Result<void> WaitForUnixSocket(const std::string& path, int timeoutSec) {
+ }
+ 
+ Result<void> WaitForUnixSocketListeningWithoutConnect(const std::string& path,
+-                                                      int timeoutSec) {
++                                                        int timeoutSec) {
+   const auto targetTime =
+       std::chrono::system_clock::now() + std::chrono::seconds(timeoutSec);
+ 
+@@ -936,43 +933,47 @@ Result<void> WaitForUnixSocketListeningWithoutConnect(const std::string& path,
+             "Waiting for socket path creation failed");
+   CF_EXPECT(FileIsSocket(path), "Specified path is not a socket");
+ 
+-  std::regex socket_state_regex("TST=(.*)");
+-
++  // Try to connect to the socket.
++  // If connect succeeds, the socket is listening.
++  //
++  // Analysis of vhost_device_vsock Rust source shows this is safe:
++  // - SocketListener::accept() handles ConnectionAborted by returning Ok(None)
++  // - The server loop continues and accepts new connections
++  // - Even if a full connection is established and immediately closed, the
++  //   server handles Disconnected errors gracefully and restarts its listener
+   while (true) {
+     const auto currentTime = std::chrono::system_clock::now();
+ 
+     if (currentTime >= targetTime) {
+-      return CF_ERR("Timed out");
++      return CF_ERR("Timed out waiting for socket to be listening");
+     }
+ 
+-#if defined(__APPLE__)
+-    Command lsof("/usr/sbin/lsof");
+-#else
+-    Command lsof("/usr/bin/lsof");
+-#endif
+-    lsof.AddParameter(/*"format"*/ "-F", /*"connection state"*/ "TST");
+-    lsof.AddParameter(path);
+-    std::string lsof_out;
+-    std::string lsof_err;
+-    int rval =
+-        RunWithManagedStdio(std::move(lsof), nullptr, &lsof_out, &lsof_err);
+-    if (rval != 0) {
+-      return CF_ERR("Failed to run `lsof`, stderr: " << lsof_err);
++    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (sock_fd < 0) {
++      return CF_ERRNO("Failed to create socket for connection test");
+     }
+ 
+-    LOG(DEBUG) << "lsof stdout:|" << lsof_out << "|";
+-    LOG(DEBUG) << "lsof stderr:|" << lsof_err << "|";
++    struct sockaddr_un addr;
++    memset(&addr, 0, sizeof(addr));
++    addr.sun_family = AF_UNIX;
++    strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+ 
+-    std::smatch socket_state_match;
+-    if (std::regex_search(lsof_out, socket_state_match, socket_state_regex)) {
+-      if (socket_state_match.size() == 2) {
+-        const std::string& socket_state = socket_state_match[1];
+-        if (socket_state == "LISTEN") {
+-          return {};
+-        }
+-      }
++    int result = connect(sock_fd, (struct sockaddr*)&addr, sizeof(addr));
++    int connect_errno = errno;
++    close(sock_fd);
++
++    if (result == 0) {
++      // Connection succeeded, socket is listening
++      return {};
++    }
++
++    if (connect_errno != ECONNREFUSED && connect_errno != ENOENT) {
++      // Unexpected error
++      return CF_ERR("Unexpected error connecting to socket: "
++                    << strerror(connect_errno));
+     }
+ 
++    // ECONNREFUSED or ENOENT means socket exists but nothing is listening yet
+     sched_yield();
+   }
+ 

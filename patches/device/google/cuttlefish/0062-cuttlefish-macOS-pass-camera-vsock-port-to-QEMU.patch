@@ -1,0 +1,117 @@
+From 0e8de5552ad6fda533f7ecdf8306a765449f722e Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Fri, 5 Jun 2026 13:38:22 -0700
+Subject: [PATCH 62/63] [cuttlefish] macOS: pass camera vsock port to QEMU
+
+Summary:
+# Motivation:
+We want to initialize camera on qemu on macos.
+
+# Overview:
+
+On macOS, enable host webcam passthrough by making the camera vsock port
+discoverable by QEMU. Default CF_DEFAULTS_CAMERA_SERVER_PORT to 7600 on
+Darwin (matching the guest cuttlefish_v4l2_streamer port), and add a
+"-fw_cfg name=opt/cf/camera_port,string=<port>" entry to the QEMU command
+line so the host-side darwin-camera bridge can discover the port from argv.
+No-op on other hosts (port stays dynamic/disabled).
+
+Test Plan:
+```
+. build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+# replace host tools
+rm -r bin com.android.i18n lib64 nativetest64/ framework etc usr
+ln -sf /Volumes/AOSP/out/host/darwin-x86/cvd-host_package/* .
+# boot
+./start_cuttlefish.py
+```
+
+ {F1990810048}
+
+Reviewers: shaochi, <internal-group>, josephknox
+
+Reviewed By: shaochi
+
+Differential Revision: https://phabricator.intern.facebook.com/D107575923
+
+Tasks: T267437814
+---
+ host/commands/assemble_cvd/flags_defaults.h |  4 ++
+ host/libs/vm_manager/qemu_manager.cpp       | 41 +++++++++++++++++++++
+ 2 files changed, 45 insertions(+)
+
+diff --git a/host/commands/assemble_cvd/flags_defaults.h b/host/commands/assemble_cvd/flags_defaults.h
+index 22ef2d963..b3fd160fd 100644
+--- a/host/commands/assemble_cvd/flags_defaults.h
++++ b/host/commands/assemble_cvd/flags_defaults.h
+@@ -160,7 +160,11 @@
+ #define CF_DEFAULTS_TOUCHPAD CF_DEFAULTS_DYNAMIC_STRING
+ 
+ // Camera default parameters
++#ifdef __APPLE__
++#define CF_DEFAULTS_CAMERA_SERVER_PORT 7600
++#else
+ #define CF_DEFAULTS_CAMERA_SERVER_PORT CF_DEFAULTS_DYNAMIC_INT
++#endif
+ 
+ // Connectivity default parameters
+ #define CF_DEFAULTS_RIL_DNS "8.8.8.8"
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index f38cb1e77..1ac972b02 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -128,6 +128,27 @@ Result<std::string> GetQemuHelpString(const std::string& qemu_binary) {
+   return qemu_help_output;
+ }
+ 
++[[maybe_unused]] std::string GetQemuObjectHelpString(
++    const std::string& qemu_binary) {
++  Command qemu_object_help_cmd(qemu_binary);
++  qemu_object_help_cmd.AddParameter("-object");
++  qemu_object_help_cmd.AddParameter("help");
++
++  std::string qemu_object_help_input, qemu_object_help_output,
++      qemu_object_help_error;
++  cuttlefish::SubprocessOptions options;
++  options.Verbose(false);
++  int ret = cuttlefish::RunWithManagedStdio(
++      std::move(qemu_object_help_cmd), &qemu_object_help_input,
++      &qemu_object_help_output, &qemu_object_help_error, std::move(options));
++  if (ret != 0) {
++    LOG(WARNING) << qemu_binary << " -object help failed (ret " << ret
++                 << "); treating optional objects as unsupported";
++    return "";
++  }
++  return qemu_object_help_output + qemu_object_help_error;
++}
++
+ Result<std::pair<int, int>> GetQemuVersion(const std::string& qemu_binary) {
+   Command qemu_version_cmd(qemu_binary);
+   qemu_version_cmd.AddParameter("-version");
+@@ -1037,6 +1058,26 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+     }
+   }
+ 
++#ifdef __APPLE__
++  if (instance.camera_server_port()) {
++    auto qemu_object_help = GetQemuObjectHelpString(qemu_binary);
++    if (qemu_object_help.find("darwin-camera") != std::string::npos) {
++      auto camera_socket =
++          SharedFD::GetVhostUserVsockClientAddr(instance.vsock_guest_cid());
++      qemu_cmd.AddParameter("-object");
++      qemu_cmd.AddParameter(
++          fmt::format("darwin-camera,id=cam0,socket-path={},port={}",
++                      camera_socket, instance.camera_server_port()));
++    } else {
++      LOG(ERROR) << "Host webcam requested (camera_server_port="
++                 << instance.camera_server_port() << ") but QEMU binary "
++                 << qemu_binary
++                 << " does not provide the darwin-camera object (not in "
++                    "`-object help`); host webcam passthrough disabled. Rebuild "
++                    "QEMU with darwin-camera support to enable it.";
++    }
++  }
++#endif
+ 
+ #ifdef __APPLE__
+   qemu_cmd.AddParameter("-device");

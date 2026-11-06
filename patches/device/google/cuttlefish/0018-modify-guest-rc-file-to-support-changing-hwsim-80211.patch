@@ -1,0 +1,49 @@
+From 573ffe8dcc255ac1194c87f98445a91be5ca8757 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Fri, 15 Aug 2025 11:52:43 -0700
+Subject: [PATCH 18/63] modify guest rc file to support changing hwsim 80211 at
+ boot config
+
+Summary:
+# Motivation:
+HWSIM_MAC80211 is set at build time which prevents us from setting up wifi without rebuilding the image.
+
+# Overview:
+- change init file in image to allow overriding wifi_impl at boot time
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_only_phone-aosp_current-userdebug
+m dist
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D80361488
+
+Tags: aarch64
+---
+ shared/config/init.vendor.rc | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/shared/config/init.vendor.rc b/shared/config/init.vendor.rc
+index 676740244..2f969e8c7 100644
+--- a/shared/config/init.vendor.rc
++++ b/shared/config/init.vendor.rc
+@@ -54,6 +54,9 @@ on fs
+     # So GceBootReporter can print to kmsg
+     chmod 622 /dev/kmsg
+ 
++on early-init && property:ro.boot.vendor.wifi_impl
++    setprop ro.vendor.wifi_impl ${ro.boot.vendor.wifi_impl}
++
+ on post-fs-data && property:ro.vendor.disable_rename_eth0=
+     # works around framework netiface enumeration issue
+     # TODO(b/202731768): Add this `start rename_eth0` command to the init.rc for rename_netiface

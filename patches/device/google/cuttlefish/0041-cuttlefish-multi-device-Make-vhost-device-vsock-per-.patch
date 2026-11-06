@@ -1,0 +1,168 @@
+From b4d2aafd2d89419390e23ff996b6381eec09e4e1 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 4 Mar 2026 10:36:13 -1000
+Subject: [PATCH 41/63] [cuttlefish][multi-device] Make vhost-device-vsock
+ per-instance
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+# Motivation:
+Developers running multiple emulator types simultaneously on macOS (e.g. phone + watch) need each instance to manage its own vsock daemon. Previously, only the first instance started vhost_device_vsock with VM parameters for ALL instances, so stopping the first instance killed vsock connectivity for all others.
+
+```
+  BEFORE (shared daemon):             AFTER (per-instance daemons):
+
+  run_cvd (instance 1)                run_cvd (instance 1)
+       |                                   |
+       v                                   v
+  vhost_device_vsock ──> VM1,VM2      vhost_device_vsock ──> VM1
+       |                              /tmp/vsock_3_501/
+       X (stop instance 1)
+       |                              run_cvd (instance 2)
+  VM2 loses vsock!                         |
+                                           v
+                                      vhost_device_vsock ──> VM2
+                                      /tmp/vsock_4_501/
+```
+
+# Overview:
+Each run_cvd now starts its own vhost_device_vsock daemon with only its own VM configuration. Each instance uses unique socket paths (/tmp/vsock_{CID}_{UID}/), eliminating conflicts and enabling independent instance start/stop. Remove CuttlefishConfig dependency from VhostDeviceVsock (only needs InstanceSpecific).
+
+Test Plan:
+rebuild host tools
+```
+cd /Volumes/AOSP && source build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+```
+rm -r bin com.android.i18n lib64 nativetest64/ framework etc usr
+ln -s  /Volumes/AOSP/out/host/darwin-x86/cvd-host_package/*
+start_cuttlefish.py
+```
+
+{F1987038615}
+launch and check number of vhost_device_vsock processes
+```
+ps aux | grep vhost_device_vsock
+```
+
+Reviewers: shaochi, <internal-group>, hzalek
+
+Reviewed By: shaochi
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D96518713
+
+Tags: aarch64
+---
+ host/commands/run_cvd/launch/launch.h         |  2 +-
+ .../run_cvd/launch/vhost_device_vsock.cpp     | 39 ++++++++-----------
+ .../run_cvd/launch/vhost_device_vsock.h       |  4 +-
+ 3 files changed, 19 insertions(+), 26 deletions(-)
+
+diff --git a/host/commands/run_cvd/launch/launch.h b/host/commands/run_cvd/launch/launch.h
+index decc226cf..e956361b5 100644
+--- a/host/commands/run_cvd/launch/launch.h
++++ b/host/commands/run_cvd/launch/launch.h
+@@ -41,7 +41,7 @@ Result<std::optional<MonitorCommand>> UwbConnector(
+ 
+ std::optional<MonitorCommand> AutomotiveProxyService(const CuttlefishConfig&);
+ 
+-fruit::Component<fruit::Required<const CuttlefishConfig, LogTeeCreator,
++fruit::Component<fruit::Required<LogTeeCreator,
+                                  const CuttlefishConfig::InstanceSpecific>>
+ VhostDeviceVsockComponent();
+ 
+diff --git a/host/commands/run_cvd/launch/vhost_device_vsock.cpp b/host/commands/run_cvd/launch/vhost_device_vsock.cpp
+index 1410dd567..b670b97c0 100644
+--- a/host/commands/run_cvd/launch/vhost_device_vsock.cpp
++++ b/host/commands/run_cvd/launch/vhost_device_vsock.cpp
+@@ -36,16 +36,10 @@
+ namespace cuttlefish {
+ 
+ VhostDeviceVsock::VhostDeviceVsock(
+-    LogTeeCreator& log_tee, const CuttlefishConfig::InstanceSpecific& instance,
+-    const CuttlefishConfig& cfconfig)
+-    : log_tee_(log_tee), instance_(instance), cfconfig_(cfconfig) {}
++    LogTeeCreator& log_tee, const CuttlefishConfig::InstanceSpecific& instance)
++    : log_tee_(log_tee), instance_(instance) {}
+ 
+ Result<std::vector<MonitorCommand>> VhostDeviceVsock::Commands() {
+-  auto instances = cfconfig_.Instances();
+-  if (instance_.serial_number() != instances[0].serial_number()) {
+-    return {};
+-  }
+-
+   Command command(ProcessRestarterBinary());
+   command.AddParameter("-when_killed");
+   command.AddParameter("-when_dumped");
+@@ -55,21 +49,22 @@ Result<std::vector<MonitorCommand>> VhostDeviceVsock::Commands() {
+   command.AddEnvironmentVariable("RUST_BACKTRACE", "1");
+   command.AddEnvironmentVariable("RUST_LOG", "debug");
+ 
+-  for (auto i : instances) {
+-    std::string isolation_groups = "";
+-    if (i.vsock_guest_group().length()) {
+-      isolation_groups = ",groups=" + i.vsock_guest_group();
+-    }
+-
+-    auto param = fmt::format(
+-        "guest-cid={1},socket={0}/vsock_{1}_{2}/vhost.socket,uds-path={0}/"
+-        "vsock_{1}_{2}/vm.vsock{3}",
+-        TempDir(), i.vsock_guest_cid(), getuid(), isolation_groups);
+-    command.AddParameter("--vm");
+-    command.AddParameter(param);
+-    LOG(INFO) << "VhostDeviceVsock::vhost param is:" << param;
++  // Each instance starts its own vhost_device_vsock daemon with only its own
++  // VM configuration. This allows instances to be started and stopped
++  // independently without affecting each other's vsock connectivity.
++  std::string isolation_groups = "";
++  if (instance_.vsock_guest_group().length()) {
++    isolation_groups = ",groups=" + instance_.vsock_guest_group();
+   }
+ 
++  auto param = fmt::format(
++      "guest-cid={1},socket={0}/vsock_{1}_{2}/vhost.socket,uds-path={0}/"
++      "vsock_{1}_{2}/vm.vsock{3}",
++      TempDir(), instance_.vsock_guest_cid(), getuid(), isolation_groups);
++  command.AddParameter("--vm");
++  command.AddParameter(param);
++  LOG(INFO) << "VhostDeviceVsock::vhost param is:" << param;
++
+   std::vector<MonitorCommand> commands;
+   commands.emplace_back(
+       CF_EXPECT(log_tee_.CreateFullLogTee(command, "vhost_device_vsock")));
+@@ -91,7 +86,7 @@ Result<void> VhostDeviceVsock::WaitForAvailability() const {
+   return {};
+ }
+ 
+-fruit::Component<fruit::Required<const CuttlefishConfig, LogTeeCreator,
++fruit::Component<fruit::Required<LogTeeCreator,
+                                  const CuttlefishConfig::InstanceSpecific>>
+ VhostDeviceVsockComponent() {
+   return fruit::createComponent()
+diff --git a/host/commands/run_cvd/launch/vhost_device_vsock.h b/host/commands/run_cvd/launch/vhost_device_vsock.h
+index 28ee0866c..a1e5dc38c 100644
+--- a/host/commands/run_cvd/launch/vhost_device_vsock.h
++++ b/host/commands/run_cvd/launch/vhost_device_vsock.h
+@@ -34,8 +34,7 @@ namespace cuttlefish {
+ class VhostDeviceVsock : public vm_manager::VmmDependencyCommand {
+  public:
+   INJECT(VhostDeviceVsock(LogTeeCreator& log_tee,
+-                          const CuttlefishConfig::InstanceSpecific& instance,
+-                          const CuttlefishConfig& cfconfig));
++                          const CuttlefishConfig::InstanceSpecific& instance));
+ 
+   // CommandSource
+   Result<std::vector<MonitorCommand>> Commands() override;
+@@ -52,7 +51,6 @@ class VhostDeviceVsock : public vm_manager::VmmDependencyCommand {
+ 
+   LogTeeCreator& log_tee_;
+   const CuttlefishConfig::InstanceSpecific& instance_;
+-  const CuttlefishConfig& cfconfig_;
+ };
+ 
+ }  // namespace cuttlefish

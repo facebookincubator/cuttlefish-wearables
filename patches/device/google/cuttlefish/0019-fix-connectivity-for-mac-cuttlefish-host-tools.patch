@@ -1,0 +1,86 @@
+From 837b20e086fdb1714eb6ef48b2dc0d6cd2f59545 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 14 Aug 2025 14:53:59 -0700
+Subject: [PATCH 19/63] fix connectivity for mac - cuttlefish host tools
+
+Summary:
+# Motivation:
+We want to be able to connect to the internet on emulator,
+
+# Overview:
+- remove hwsim from config if macOS
+
+wmediumd is not supported on macos
+
+Test Plan:
+# Build Host Tools
+```
+ . build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+unset TMPDIR
+HOME=/Users/achong/n-16/out/host/darwin-x86 out/host/darwin-x86/bin/launch_cvd  \
+--use-overlay=false --vm_manager=qemu_cli  --system_image_dir=/Users/achong/n-16/out/host/darwin-x86 \
+--qemu_binary_dir=/Users/achong/qemu/build --enable-audio=false \
+--enable_host_uwb=false -console=true --start_webrtc=true \
+-device_external_network=slirp \
+--enable_dev_qemu_monitor=true \
+--vhost_user_vsock
+
+```
+{F1981232634}
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, divyesh07, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D80297784
+
+Tags: aarch64
+---
+ host/commands/assemble_cvd/flags.cc   | 6 +++++-
+ host/libs/vm_manager/qemu_manager.cpp | 4 ++++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index 74b5dc530..cf2bf198d 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -1189,11 +1189,15 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+   tmp_config_obj.set_enable_metrics(FLAGS_report_anonymous_usage_stats);
+   // TODO(moelsherif): Handle this flag (set_metrics_binary) in the future
+ 
++#ifdef __APPLE__
++  tmp_config_obj.set_virtio_mac80211_hwsim(false);
++#else
+ #ifdef ENFORCE_MAC80211_HWSIM
+   tmp_config_obj.set_virtio_mac80211_hwsim(true);
+ #else
+   tmp_config_obj.set_virtio_mac80211_hwsim(false);
+-#endif
++#endif // ENFORCE_MAC80211_HWSIM
++#endif // __APPLE__
+ 
+   if ((FLAGS_ap_rootfs_image.empty()) != (FLAGS_ap_kernel_image.empty())) {
+     LOG(FATAL) << "Either both ap_rootfs_image and ap_kernel_image should be "
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 777ed546f..5adb6e990 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -204,6 +204,10 @@ QemuManager::ConfigureGraphics(
+   } else {
+     return CF_ERR("Unhandled GPU mode: " << instance.gpu_mode());
+   }
++#ifdef __APPLE__
++  // wmediumd is not supported on macOS
++  bootconfig_args["androidboot.vendor.wifi_impl"] = "virt_wifi";
++#endif
+ 
+   if (!instance.gpu_angle_feature_overrides_enabled().empty()) {
+     bootconfig_args["androidboot.hardware.angle_feature_overrides_enabled"] =

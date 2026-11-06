@@ -1,0 +1,37 @@
+From 931cc5e38dff26b971d866ef29f01064ba5fc851 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 27 Jul 2026 16:27:20 -0700
+Subject: [PATCH 67/67] cuttlefish: darwin: skip group ownership when group is
+ absent
+
+macOS hosts do not provision cuttlefish groups such as cvdnetwork (a Linux
+tap-networking construct, unneeded under slirp). On __APPLE__, ChangeGroup
+now warns and continues instead of aborting the launch.
+---
+ common/libs/utils/files.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/common/libs/utils/files.cpp b/common/libs/utils/files.cpp
+index c4995ce..c1d48e7 100644
+--- a/common/libs/utils/files.cpp
++++ b/common/libs/utils/files.cpp
+@@ -218,7 +218,16 @@ Result<void> ChangeGroup(const std::string& path,
+   auto groupId = GroupIdFromName(group_name);
+ 
+   if (groupId == -1) {
++#ifdef __APPLE__
++    // macOS hosts don't provision cuttlefish groups (e.g. cvdnetwork). Those
++    // exist on Linux for tap-device permissions; under slirp networking they
++    // aren't needed, so skip group ownership rather than failing the launch.
++    LOG(WARNING) << "Skipping group change for " << path << ": group '"
++                 << group_name << "' not found on this host";
++    return {};
++#else
+     return CF_ERR("Failed to get group id: ") << group_name;
++#endif
+   }
+ 
+   if (chown(path.c_str(), -1, groupId) != 0) {
+-- 
+2.50.1
+

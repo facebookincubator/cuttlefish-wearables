@@ -1,0 +1,173 @@
+From 0c3caf7b2adab7a0dbbb3756cc578c87bf44c9ad Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Mon, 14 Jul 2025 11:37:56 -0700
+Subject: [PATCH] [DEMO CODE ONLY] GRPC build fixes for darwin
+
+Summary:
+GRPC build fixes.
+
+Silence dylib specific duplicate entry warnings. Would need to be root caused before productionizing.
+
+Test Plan: mmm external/grpc-grpc
+
+Rollback Plan:
+
+Reviewers: olja, achong, benthomas
+
+Reviewed By: olja
+
+Subscribers: ryanyu
+
+Differential Revision: https://phabricator.intern.facebook.com/D77879727
+---
+ Android.bp                                          | 13 ++++++++++++-
+ .../transport/binder/client/channel_create_impl.cc  |  4 ++--
+ .../transport/binder/client/endpoint_binder_pool.cc |  4 ++--
+ .../ext/transport/binder/server/binder_server.cc    |  4 ++--
+ .../transport/binder/transport/binder_transport.cc  |  4 ++--
+ .../transport/binder/wire_format/binder_constants.h |  3 +++
+ .../binder/wire_format/wire_reader_impl.cc          |  4 ++--
+ .../ext/transport/binder/wire_format/wire_writer.cc |  4 ++--
+ 8 files changed, 27 insertions(+), 13 deletions(-)
+
+diff --git a/Android.bp b/Android.bp
+index 686ad6bc80..0da2af5721 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -691,7 +691,18 @@ cc_defaults {
+     ],
+     target: {
+         darwin: {
+-            cflags: ["-UANDROID"],
++            cflags: [
++                "-UANDROID",
++                "-DGRPC_NO_BINDER",
++                "-DGRPC_ARES=0"
++            ],
++            host_ldlibs: [
++                "-framework CoreFoundation",
++                "-lpthread",
++            ],
++            exclude_shared_libs: [
++                "libbinder_ndk",
++            ],
+         },
+     },
+ }
+diff --git a/src/core/ext/transport/binder/client/channel_create_impl.cc b/src/core/ext/transport/binder/client/channel_create_impl.cc
+index d9d5208f9a..79c427e28f 100644
+--- a/src/core/ext/transport/binder/client/channel_create_impl.cc
++++ b/src/core/ext/transport/binder/client/channel_create_impl.cc
+@@ -14,10 +14,10 @@
+ 
+ #include <grpc/support/port_platform.h>
+ 
+-#include "src/core/ext/transport/binder/client/channel_create_impl.h"
+-
+ #ifndef GRPC_NO_BINDER
+ 
++#include "src/core/ext/transport/binder/client/channel_create_impl.h"
++
+ #include <memory>
+ #include <utility>
+ 
+diff --git a/src/core/ext/transport/binder/client/endpoint_binder_pool.cc b/src/core/ext/transport/binder/client/endpoint_binder_pool.cc
+index 6ed8562133..4226f8bab3 100644
+--- a/src/core/ext/transport/binder/client/endpoint_binder_pool.cc
++++ b/src/core/ext/transport/binder/client/endpoint_binder_pool.cc
+@@ -14,10 +14,10 @@
+ 
+ #include <grpc/support/port_platform.h>
+ 
+-#include "src/core/ext/transport/binder/client/endpoint_binder_pool.h"
+-
+ #ifndef GRPC_NO_BINDER
+ 
++#include "src/core/ext/transport/binder/client/endpoint_binder_pool.h"
++
+ #include "src/core/ext/transport/binder/client/jni_utils.h"
+ 
+ #ifdef GPR_SUPPORT_BINDER_TRANSPORT
+diff --git a/src/core/ext/transport/binder/server/binder_server.cc b/src/core/ext/transport/binder/server/binder_server.cc
+index 994d8f82cb..1faa7765d2 100644
+--- a/src/core/ext/transport/binder/server/binder_server.cc
++++ b/src/core/ext/transport/binder/server/binder_server.cc
+@@ -14,10 +14,10 @@
+ 
+ #include <grpc/support/port_platform.h>
+ 
+-#include "src/core/ext/transport/binder/server/binder_server.h"
+-
+ #ifndef GRPC_NO_BINDER
+ 
++#include "src/core/ext/transport/binder/server/binder_server.h"
++
+ #include <memory>
+ #include <string>
+ #include <utility>
+diff --git a/src/core/ext/transport/binder/transport/binder_transport.cc b/src/core/ext/transport/binder/transport/binder_transport.cc
+index aad7b43f21..fe1716cf04 100644
+--- a/src/core/ext/transport/binder/transport/binder_transport.cc
++++ b/src/core/ext/transport/binder/transport/binder_transport.cc
+@@ -14,10 +14,10 @@
+ 
+ #include <grpc/support/port_platform.h>
+ 
+-#include "src/core/ext/transport/binder/transport/binder_transport.h"
+-
+ #ifndef GRPC_NO_BINDER
+ 
++#include "src/core/ext/transport/binder/transport/binder_transport.h"
++
+ #include <cstdint>
+ #include <memory>
+ #include <string>
+diff --git a/src/core/ext/transport/binder/wire_format/binder_constants.h b/src/core/ext/transport/binder/wire_format/binder_constants.h
+index 8d4d780dd1..de554dd9b0 100644
+--- a/src/core/ext/transport/binder/wire_format/binder_constants.h
++++ b/src/core/ext/transport/binder/wire_format/binder_constants.h
+@@ -15,7 +15,10 @@
+ #ifndef GRPC_SRC_CORE_EXT_TRANSPORT_BINDER_WIRE_FORMAT_BINDER_CONSTANTS_H
+ #define GRPC_SRC_CORE_EXT_TRANSPORT_BINDER_WIRE_FORMAT_BINDER_CONSTANTS_H
+ 
++#ifndef GRPC_NO_BINDER
+ #include <android/binder_ibinder.h>
++#endif
++
+ #include <grpc/support/port_platform.h>
+ 
+ #include <cstdint>
+diff --git a/src/core/ext/transport/binder/wire_format/wire_reader_impl.cc b/src/core/ext/transport/binder/wire_format/wire_reader_impl.cc
+index 3a9860a8ef..6558bd305a 100644
+--- a/src/core/ext/transport/binder/wire_format/wire_reader_impl.cc
++++ b/src/core/ext/transport/binder/wire_format/wire_reader_impl.cc
+@@ -14,10 +14,10 @@
+ 
+ #include <grpc/support/port_platform.h>
+ 
+-#include "src/core/ext/transport/binder/wire_format/wire_reader_impl.h"
+-
+ #ifndef GRPC_NO_BINDER
+ 
++#include "src/core/ext/transport/binder/wire_format/wire_reader_impl.h"
++
+ #include <functional>
+ #include <limits>
+ #include <string>
+diff --git a/src/core/ext/transport/binder/wire_format/wire_writer.cc b/src/core/ext/transport/binder/wire_format/wire_writer.cc
+index f1bfd19eb9..0c9dd3669f 100644
+--- a/src/core/ext/transport/binder/wire_format/wire_writer.cc
++++ b/src/core/ext/transport/binder/wire_format/wire_writer.cc
+@@ -14,10 +14,10 @@
+ 
+ #include <grpc/support/port_platform.h>
+ 
+-#include "src/core/ext/transport/binder/wire_format/wire_writer.h"
+-
+ #ifndef GRPC_NO_BINDER
+ 
++#include "src/core/ext/transport/binder/wire_format/wire_writer.h"
++
+ #include <utility>
+ 
+ #include "absl/cleanup/cleanup.h"

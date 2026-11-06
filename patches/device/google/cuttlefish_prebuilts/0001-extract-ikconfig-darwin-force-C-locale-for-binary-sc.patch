@@ -1,0 +1,32 @@
+From a2c7361bc19f13aa7af34beb5c6709eb13013888 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 27 Jul 2026 16:27:28 -0700
+Subject: [PATCH] extract-ikconfig: darwin: force C locale for binary scan
+ (D78132232)
+
+BSD tr/grep reject non-UTF8 bytes ("Illegal byte sequence") when scanning a
+binary kernel image under a UTF-8 locale, so config extraction fails on macOS.
+Export LC_ALL=C so the pipeline processes raw bytes.
+---
+ scripts/extract-ikconfig | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/scripts/extract-ikconfig b/scripts/extract-ikconfig
+index a788dbe..3729add 100755
+--- a/scripts/extract-ikconfig
++++ b/scripts/extract-ikconfig
+@@ -11,6 +11,11 @@
+ # Licensed under the terms of the GNU General Public License.
+ # ----------------------------------------------------------------------
+ 
++# macOS: BSD tr/grep reject non-UTF8 bytes ("Illegal byte sequence") when
++# scanning a binary kernel image under a UTF-8 locale. Force the C locale so
++# the whole pipeline processes raw bytes (D78132232: encoding detection on mac).
++export LC_ALL=C
++
+ cf1='IKCFG_ST\037\213\010'
+ cf2='0123456789'
+ 
+-- 
+2.50.1
+

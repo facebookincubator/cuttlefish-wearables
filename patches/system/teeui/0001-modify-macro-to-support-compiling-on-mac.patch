@@ -1,0 +1,88 @@
+From 8b74d7cb7e44662e3fa9c26bf53b37ece75c42d1 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 23 Jul 2025 09:31:58 -0700
+Subject: [PATCH] modify macro to support compiling on mac
+
+Summary:
+# Motivation:
+This assembly is not supported with mac toolchain
+```
+[ 13% 2/15] //device/google/cuttlefish/host/libs/confui:libcuttlefish_confui_host clang fonts.S [darwin arm64]
+FAILED: out/soong/.intermediates/device/google/cuttlefish/host/libs/confui/libcuttlefish_confui_host/darwin_arm64_static/obj/device/google/cuttlefish/host/libs/confui/fonts.o
+ prebuilts/clang/host/darwin-x86/clang-r547379/bin/clang -c  -fPIC -funwind-tables -fno-omit-frame-pointer -isysroot /Applications/Xcode_16.4.0_16F6_fb.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk -mmacosx-version-min=10.14 -DMACOSX_DEPLOYMENT_TARGET=10.14 -m64 -integrated-as -fstack-protector-strong -O2 -Wall -Wextra -Winit-self -Wpointer-arith -Wunguarded-availability -Werror=date-time -Werror=int-conversion -Werror=pragma-pack -Werror=pragma-pack-suspicious-include -Werror=sizeof-array-div -Werror=string-plus-int -Werror=unreachable-code-loop-increment -Wno-error=deprecated-declarations -Wno-c23-extensions -Wno-c99-designator -Wno-gnu-folding-constant -Wno-inconsistent-missing-override -Wno-error=reorder-init-list -Wno-reorder-init-list -Wno-sign-compare -Wno-unused -DANDROID -DNDEBUG -UDEBUG -D__compiler_offsetof=__builtin_offsetof -D__ANDROID_UNAVAILABLE_SYMBOLS_ARE_WEAK__ -faddrsig -fdebug-default-version=5 -Wno-unused-command-line-argument -fcolor-diagnostics -ffp-contract=off -fno-exceptions -fno-strict-aliasing -fmessage-length=0 -gsimple-template-names -no-canonical-prefixes -ftrivial-auto-var-init=zero -g  -B/Applications/Xcode_16.4.0_16F6_fb.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin -target aarch64-apple-darwin  -D__ASSEMBLY__ -fdebug-default-version=4 -Idevice/google/cuttlefish/host/libs/confui -Idevice/google/cuttlefish -Iexternal/libdrm/include -Iexternal/libdrm/android -Iexternal/freetype/include -Isystem/teeui/libteeui/include -Isystem/teeui/libteeui/prebuilt/localization/include -Iprebuilts/clang/host/linux-x86/clang-r547379/include/c++/v1 -Isystem/libbase/include -Iexternal/fmtlib/include -Iexternal/cn-cbor/include -Iexternal/boringssl/src/include -Iexternal/google-fruit/include -Iexternal/google-fruit/configuration/android -Iexternal/jsoncpp/include -Isystem/logging/liblog/include -isystem external/libdrm  -Isystem/core/include -Isystem/logging/liblog/include -Isystem/media/audio/include -Ihardware/libhardware/include -Ihardware/libhardware_legacy/include -Ihardware/ril/include -Iframeworks/native/include -Iframeworks/native/opengl/include -Iframeworks/av/include  -MD -MF out/soong/.intermediates/device/google/cuttlefish/host/libs/confui/libcuttlefish_confui_host/darwin_arm64_static/obj/device/google/cuttlefish/host/libs/confui/fonts.o.d -o out/soong/.intermediates/device/google/cuttlefish/host/libs/confui/libcuttlefish_confui_host/darwin_arm64_static/obj/device/google/cuttlefish/host/libs/confui/fonts.o device/google/cuttlefish/host/libs/confui/fonts.S
+<instantiation>:1:17: error: unexpected token in '.section' directive
+.section .rodata
+                ^
+device/google/cuttlefish/host/libs/confui/fonts.S:19:1: note: while in macro instantiation
+TEEUI_ASM_INCFONT RobotoMedium, "Roboto-Medium.ttf";
+```
+# Overview:
+- `#ifdef __APPLE__` things to make it build with mac toolchain
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D79591919
+
+Tags: aarch64
+---
+ libteeui/include/teeui/incfont.h | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/libteeui/include/teeui/incfont.h b/libteeui/include/teeui/incfont.h
+index 59a9183..b60efa8 100644
+--- a/libteeui/include/teeui/incfont.h
++++ b/libteeui/include/teeui/incfont.h
+@@ -20,19 +20,40 @@
+ 
+ #ifdef __ASSEMBLY__
+ .macro TEEUI_ASM_INCFONT fontname, filename
++#ifdef __APPLE__
++.section __TEXT,__const
++.align 4
++.globl _\fontname
++_\fontname:
++#else
+ .section .rodata
+ .align 4
+ .globl \fontname
+ \fontname:
++#endif
+ .incbin "\filename"
++#ifdef __APPLE__
++.section __TEXT,__const
++.align 1
++_\fontname\()_end:
++#else
+ .section .rodata
+ .align 1
+ \fontname\()_end:
++#endif
++#ifdef __APPLE__
++.section __TEXT,__const
++.align 4
++.globl _\fontname\()_length
++_\fontname\()_length:
++.long _\fontname\()_end - _\fontname - 1
++#else
+ .section .rodata
+ .align 4;
+ .globl \fontname\()_length
+ \fontname\()_length:
+ .long \fontname\()_end - \fontname - 1
++#endif
+ .endmacro
+ 
+ #define TEEUI_INCFONT(fontname, filename) TEEUI_ASM_INCFONT fontname, filename

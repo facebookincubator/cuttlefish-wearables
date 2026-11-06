@@ -1,0 +1,117 @@
+From 8ed0570ed92db5f0bfd42726764c489074d5b32f Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 10 Jul 2025 09:53:51 -1000
+Subject: [PATCH] make mtools compile for linux
+
+Summary:
+# Motivation:
+Config.h is not setup to support darwin builds for mtools
+
+# Overview:
+- modify config.h so that mtools builds on mac
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D78113504
+
+Tags: aarch64
+---
+ config.h | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/config.h b/config.h
+index b9223b9..d222cbe 100644
+--- a/config.h
++++ b/config.h
+@@ -86,10 +86,12 @@
+ #define HAVE_LIMITS_H 1
+ 
+ /* Define to 1 if you have the <linux/fs.h> header file. */
++#ifndef __APPLE__
+ #define HAVE_LINUX_FS_H 1
+ 
+ /* Define to 1 if you have the <linux/unistd.h> header file. */
+ #define HAVE_LINUX_UNISTD_H 1
++#endif
+ 
+ /* Define to 1 if you have the `llseek' function. */
+ /* #undef HAVE_LLSEEK */
+@@ -98,7 +100,9 @@
+ /* #undef HAVE_LLSEEK_PROTOTYPE */
+ 
+ /* Define to 1 if you have the <locale.h> header file. */
++#ifndef __APPLE__
+ #define HAVE_LOCALE_H 1
++#endif
+ 
+ /* Define to 1 if you have the `lockf' function. */
+ #define HAVE_LOCKF 1
+@@ -116,7 +120,9 @@
+ /* #undef HAVE_LSEEK64_PROTOTYPE */
+ 
+ /* Define to 1 if you have the <malloc.h> header file. */
++#ifndef __APPLE__
+ #define HAVE_MALLOC_H 1
++#endif
+ 
+ /* Define to 1 if you have the `media_oldaliases' function. */
+ /* #undef HAVE_MEDIA_OLDALIASES */
+@@ -134,7 +140,9 @@
+ #define HAVE_MEMSET 1
+ 
+ /* Define to 1 if you have the <mntent.h> header file. */
++#ifndef __APPLE__
+ #define HAVE_MNTENT_H 1
++#endif
+ 
+ /* Define to 1 if you have the <netdb.h> header file. */
+ #define HAVE_NETDB_H 1
+@@ -167,7 +175,9 @@
+ #define HAVE_SETEUID 1
+ 
+ /* Define to 1 if you have the `setlocale' function. */
++#ifndef __APPLE__
+ #define HAVE_SETLOCALE 1
++#endif
+ 
+ /* Define to 1 if you have the `setpgrp' function. */
+ #define HAVE_SETPGRP 1
+@@ -230,7 +240,9 @@
+ #define HAVE_STRNCASECMP 1
+ 
+ /* Define to 1 if you have the `strncasecmp_l' function. */
++#ifndef __APPLE__
+ #define HAVE_STRNCASECMP_L 1
++#endif
+ 
+ /* Define to 1 if you have the `strndup' function. */
+ #define HAVE_STRNDUP 1
+@@ -315,11 +327,15 @@
+ 
+ /* Define to 1 if you have the <termio.h> header file. */
+ #if !defined(ANDROID_HOST_MUSL)
++#ifndef __APPLE__
+ #define HAVE_TERMIO_H 1
+ #endif
++#endif
+ 
+ /* Define to 1 if you have the `toupper_l' function. */
++#ifndef __APPLE__
+ #define HAVE_TOUPPER_L 1
++#endif
+ 
+ /* Define to 1 if you have the `tzset' function. */
+ #define HAVE_TZSET 1

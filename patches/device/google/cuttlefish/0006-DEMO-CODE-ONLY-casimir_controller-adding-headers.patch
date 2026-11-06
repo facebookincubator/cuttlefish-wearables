@@ -1,0 +1,52 @@
+From 20a51471aa6b19e576b7f1fdc209b801416fb86f Mon Sep 17 00:00:00 2001
+From: Olya Arkhangelskaia <olja@meta.com>
+Date: Wed, 6 Aug 2025 11:38:57 +0100
+Subject: [PATCH 06/63] DEMO CODE ONLY casimir_controller - adding headers
+
+Summary:
+Adding headers to casimir
+This is a part of D77880815.
+
+Test Plan:
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+Rollback Plan:
+
+Reviewers: achong, tcare, benthomas
+
+Reviewed By: achong
+
+Subscribers: ryanyu
+
+Differential Revision: https://phabricator.intern.facebook.com/D79718786
+
+Tags: aarch64
+
+Privacy Context Container: L1248481
+---
+ .../casimir_control_server/casimir_controller.cpp      | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/host/commands/casimir_control_server/casimir_controller.cpp b/host/commands/casimir_control_server/casimir_controller.cpp
+index 6c55754c1..ff42a5d2d 100644
+--- a/host/commands/casimir_control_server/casimir_controller.cpp
++++ b/host/commands/casimir_control_server/casimir_controller.cpp
+@@ -18,6 +18,16 @@
+ #include <chrono>
+ #include <cstdint>
+ 
++#ifdef __APPLE__
++#include <libkern/OSByteOrder.h>
++#include <poll.h>
++#define htole16(x) OSSwapHostToLittleInt16(x)
++#define EPOLLIN POLLIN
++#else
++#include <endian.h>
++#include <sys/epoll.h>
++#endif
++
+ #include "host/commands/casimir_control_server/crc.h"
+ 
+ #include "casimir_control.grpc.pb.h"

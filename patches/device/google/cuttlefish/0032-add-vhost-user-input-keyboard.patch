@@ -1,0 +1,67 @@
+From 77c90d0124231e8394e7e09b4494180155fac70c Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 27 Jan 2026 14:46:39 -0800
+Subject: [PATCH 32/63] add vhost-user-input keyboard
+
+Summary:
+# Motivation:
+We want the webrtc webcontrols to work with the qemu vm manager.
+
+# Overview:
+- add qemu args to support talking to clients over webrtc
+
+Test Plan:
+# Build host tools on mac host
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+# Launch:
+```
+# in device cache folder
+ln -s /Volumes/AOSP/out/host/darwin-x86/cvd-host_package/* .
+./start_cuttlefish.py
+```
+
+Rollback Plan:
+
+Reviewers: spelliott, <internal-group>, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: spelliott
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D91631171
+
+Tags: aarch64
+---
+ host/libs/vm_manager/qemu_manager.cpp | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index ef0be5388..9b3d1fb4e 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -814,6 +814,20 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+   qemu_cmd.AddParameter("-device");
+   qemu_cmd.AddParameter("virtio-keyboard-pci,disable-legacy=on");
+ 
++  qemu_cmd.AddParameter("-chardev");
++  qemu_cmd.AddParameter("socket,path=", instance.keyboard_socket_path(), ",id=vhost-user-input-keyboard");
++  qemu_cmd.AddParameter("-device");
++  qemu_cmd.AddParameter("vhost-user-input-pci,chardev=vhost-user-input-keyboard");
++  auto socket_path = instance.keyboard_socket_path();
++  qemu_cmd.AddPrerequisite([socket_path]() -> Result<void> {
++#if defined(__linux__) || defined(__APPLE__)
++        return WaitForUnixSocketListeningWithoutConnect(socket_path,
++                                                        /*timeoutSec=*/10);
++#else
++        return CF_ERR("Unhandled check if vhost user block ready.");
++#endif
++      });
++
+   // device padding for unsupported "switches" input
+ #ifndef __APPLE__
+   qemu_cmd.AddParameter("-chardev");

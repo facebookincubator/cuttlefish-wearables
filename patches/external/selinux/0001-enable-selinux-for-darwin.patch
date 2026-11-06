@@ -1,0 +1,498 @@
+From b6b575b1ab8b9fe711e37a184a204074cafce817 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:51:00 -0700
+Subject: [PATCH] enable selinux for darwin
+
+Summary:
+# Motivation:
+This is required by multiple cuttlefish host binaries
+
+# Overview:
+- support building on mac
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: olja, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: olja
+
+Subscribers: ryanyu, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D79567855
+
+Tags: aarch64
+---
+ libselinux/Android.bp                  | 13 +++++++
+ libselinux/src/android/android_seapp.c |  2 +
+ libselinux/src/avc_internal.c          | 22 ++++++++++-
+ libselinux/src/fgetfilecon.c           | 16 +++++++-
+ libselinux/src/fsetfilecon.c           | 15 ++++++++
+ libselinux/src/getfilecon.c            | 16 ++++++--
+ libselinux/src/init.c                  | 53 +++++++++++++++++++++++++-
+ libselinux/src/lgetfilecon.c           | 13 ++++++-
+ libselinux/src/lsetfilecon.c           |  7 +++-
+ libselinux/src/procattr.c              |  4 ++
+ libselinux/src/selinux_internal.h      |  6 +++
+ libselinux/src/setfilecon.c            |  7 +++-
+ 12 files changed, 163 insertions(+), 11 deletions(-)
+
+diff --git a/libselinux/Android.bp b/libselinux/Android.bp
+index cc63b565..7b1cfa37 100644
+--- a/libselinux/Android.bp
++++ b/libselinux/Android.bp
+@@ -190,6 +190,12 @@ cc_library {
+         android: {
+             version_script: "exported.map.txt",
+         },
++        darwin: {
++            enabled: true,
++            cflags: [
++                "-DHAVE_STRLCPY",
++            ],
++        },
+     },
+ 
+     stubs: {
+@@ -230,6 +236,13 @@ cc_binary_host {
+         "libselinux",
+         "libsepol",
+     ],
++    target: {
++        darwin: {
++            cflags: [
++                "-DHAVE_STRLCPY",
++            ]
++        },
++    },
+ 
+     stl: "",
+ }
+diff --git a/libselinux/src/android/android_seapp.c b/libselinux/src/android/android_seapp.c
+index 44a90128..66a7528f 100644
+--- a/libselinux/src/android/android_seapp.c
++++ b/libselinux/src/android/android_seapp.c
+@@ -1,6 +1,8 @@
+ #include <ctype.h>
+ #include <limits.h>
++#ifndef __APPLE__
+ #include <linux/magic.h>
++#endif
+ #include <pwd.h>
+ #include <stdbool.h>
+ #include <stdio.h>
+diff --git a/libselinux/src/avc_internal.c b/libselinux/src/avc_internal.c
+index ffc663e5..6f5f3741 100644
+--- a/libselinux/src/avc_internal.c
++++ b/libselinux/src/avc_internal.c
+@@ -18,8 +18,10 @@
+ #include <poll.h>
+ #include <sys/types.h>
+ #include <sys/socket.h>
++#ifndef __APPLE__
+ #include <linux/types.h>
+ #include <linux/netlink.h>
++#endif
+ #include "callbacks.h"
+ #include "selinux_netlink.h"
+ #include "avc_internal.h"
+@@ -100,6 +102,11 @@ static int fd = -1;
+ 
+ int avc_netlink_open(int blocking)
+ {
++#ifdef __APPLE__
++	// Stub for macOS
++	fprintf(stderr, "Netlink sockets are not supported on macOS.\n");
++	return -1; // Or another appropriate error code
++#else
+ 	int len, rc = 0;
+ 	struct sockaddr_nl addr;
+ 
+@@ -108,7 +115,7 @@ int avc_netlink_open(int blocking)
+ 		rc = fd;
+ 		goto out;
+ 	}
+-	
++
+ 	if (!blocking && fcntl(fd, F_SETFL, O_NONBLOCK)) {
+ 		close(fd);
+ 		fd = -1;
+@@ -130,6 +137,7 @@ int avc_netlink_open(int blocking)
+ 	}
+       out:
+ 	return rc;
++#endif
+ }
+ 
+ void avc_netlink_close(void)
+@@ -141,6 +149,11 @@ void avc_netlink_close(void)
+ 
+ static int avc_netlink_receive(void *buf, unsigned buflen, int blocking)
+ {
++#ifdef __APPLE__
++	// Stub for macOS
++	fprintf(stderr, "Netlink sockets are not supported on macOS.\n");
++	return -1; // Or another appropriate error code
++#else
+ 	int rc;
+ 	struct pollfd pfd = { fd, POLLIN | POLLPRI, 0 };
+ 	struct sockaddr_nl nladdr;
+@@ -196,10 +209,16 @@ static int avc_netlink_receive(void *buf, unsigned buflen, int blocking)
+ 	}
+ 
+ 	return 0;
++#endif
+ }
+ 
+ static int avc_netlink_process(void *buf)
+ {
++#ifdef __APPLE__
++	// Stub for macOS
++	fprintf(stderr, "Netlink sockets are not supported on macOS.\n");
++	return -1; // Or another appropriate error code
++#else
+ 	int rc;
+ 	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+ 
+@@ -239,6 +258,7 @@ static int avc_netlink_process(void *buf)
+ 			avc_prefix, nlh->nlmsg_type);
+ 	}
+ 	return 0;
++#endif
+ }
+ 
+ int avc_netlink_check_nb(void)
+diff --git a/libselinux/src/fgetfilecon.c b/libselinux/src/fgetfilecon.c
+index d7051171..4c1c769a 100644
+--- a/libselinux/src/fgetfilecon.c
++++ b/libselinux/src/fgetfilecon.c
+@@ -12,21 +12,35 @@ static ssize_t fgetxattr_wrapper(int fd, const char *name, void *value, size_t s
+ 	char buf[40];
+ 	int fd_flag, saved_errno = errno;
+ 	ssize_t ret;
+-
++#ifdef __APPLE__
++	ret = fgetxattr(fd, name, value, size, 0, 0);
++#else
+ 	ret = fgetxattr(fd, name, value, size);
++#endif
+ 	if (ret != -1 || errno != EBADF)
+ 		return ret;
+ 
+ 	/* Emulate O_PATH support */
+ 	fd_flag = fcntl(fd, F_GETFL);
++#ifdef __APPLE__
++	if (fd_flag == -1) {
++		errno = EBADF;
++		return -1;
++	}
++#else
+ 	if (fd_flag == -1 || (fd_flag & O_PATH) == 0) {
+ 		errno = EBADF;
+ 		return -1;
+ 	}
++#endif
+ 
+ 	snprintf(buf, sizeof(buf), "/proc/self/fd/%d", fd);
+ 	errno = saved_errno;
++#ifdef __APPLE__
++	ret = getxattr(buf, name, value, size, 0, 0);
++#else
+ 	ret = getxattr(buf, name, value, size);
++#endif
+ 	if (ret < 0 && errno == ENOENT)
+ 		errno = EBADF;
+ 	return ret;
+diff --git a/libselinux/src/fsetfilecon.c b/libselinux/src/fsetfilecon.c
+index 19ea15b7..8fa8ee6b 100644
+--- a/libselinux/src/fsetfilecon.c
++++ b/libselinux/src/fsetfilecon.c
+@@ -12,20 +12,35 @@ static int fsetxattr_wrapper(int fd, const char* name, const void* value, size_t
+ 	char buf[40];
+ 	int rc, fd_flag, saved_errno = errno;
+ 
++#ifdef __APPLE__
++	rc = fsetxattr(fd, name, value, size, flags, 0);
++#else
+ 	rc = fsetxattr(fd, name, value, size, flags);
++#endif
+ 	if (rc == 0 || errno != EBADF)
+ 		return rc;
+ 
+ 	/* Emulate O_PATH support */
+ 	fd_flag = fcntl(fd, F_GETFL);
++#ifdef __APPLE__
++	if (fd_flag == -1) {
++		errno = EBADF;
++		return -1;
++	}
++#else
+ 	if (fd_flag == -1 || (fd_flag & O_PATH) == 0) {
+ 		errno = EBADF;
+ 		return -1;
+ 	}
++#endif
+ 
+ 	snprintf(buf, sizeof(buf), "/proc/self/fd/%d", fd);
+ 	errno = saved_errno;
++#ifdef __APPLE__
++	rc = setxattr(buf, name, value, size, flags, 0);
++#else
+ 	rc = setxattr(buf, name, value, size, flags);
++#endif
+ 	if (rc < 0 && errno == ENOENT)
+ 		errno = EBADF;
+ 	return rc;
+diff --git a/libselinux/src/getfilecon.c b/libselinux/src/getfilecon.c
+index 4bee3137..10a5d999 100644
+--- a/libselinux/src/getfilecon.c
++++ b/libselinux/src/getfilecon.c
+@@ -18,12 +18,19 @@ int getfilecon_raw(const char *path, char ** context)
+ 	if (!buf)
+ 		return -1;
+ 	memset(buf, 0, size);
+-
++#ifdef __APPLE__
++	ret = getxattr(path, XATTR_NAME_SELINUX, buf, size - 1, 0, 0);
++#else
+ 	ret = getxattr(path, XATTR_NAME_SELINUX, buf, size - 1);
++#endif
+ 	if (ret < 0 && errno == ERANGE) {
+ 		char *newbuf;
+ 
+-		size = getxattr(path, XATTR_NAME_SELINUX, NULL, 0);
++#ifdef __APPLE__
++	size = getxattr(path, XATTR_NAME_SELINUX, NULL, 0, 0, 0);
++#else
++	size = getxattr(path, XATTR_NAME_SELINUX, NULL, 0);
++#endif
+ 		if (size < 0)
+ 			goto out;
+ 
+@@ -34,7 +41,11 @@ int getfilecon_raw(const char *path, char ** context)
+ 
+ 		buf = newbuf;
+ 		memset(buf, 0, size);
++#ifdef __APPLE__
++		ret = getxattr(path, XATTR_NAME_SELINUX, buf, size - 1, 0, 0);
++#else
+ 		ret = getxattr(path, XATTR_NAME_SELINUX, buf, size - 1);
++#endif
+ 	}
+       out:
+ 	if (ret == 0) {
+@@ -68,4 +79,3 @@ int getfilecon(const char *path, char ** context)
+ 
+ 	return ret;
+ }
+-
+diff --git a/libselinux/src/init.c b/libselinux/src/init.c
+index 439da417..d1d0b1ee 100644
+--- a/libselinux/src/init.c
++++ b/libselinux/src/init.c
+@@ -5,10 +5,14 @@
+ #include <errno.h>
+ #include <ctype.h>
+ #include <stdio.h>
++#ifndef __APPLE__
+ #include <stdio_ext.h>
++#include <sys/vfs.h>
++#else
++#include <sys/mount.h>
++#endif
+ #include <dlfcn.h>
+ #include <sys/statvfs.h>
+-#include <sys/vfs.h>
+ #include <stdint.h>
+ #include <limits.h>
+ 
+@@ -54,6 +58,7 @@ static int verify_selinuxmnt(const char *mnt)
+ 
+ int selinuxfs_exists(void)
+ {
++#ifndef __APPLE__
+ 	int exists = 0;
+ 	FILE *fp = NULL;
+ 	char *buf = NULL;
+@@ -77,10 +82,28 @@ int selinuxfs_exists(void)
+ 	free(buf);
+ 	fclose(fp);
+ 	return exists;
++#else
++	int exists = 0;
++    struct statfs *mounts;
++    int num_mounts, i;
++
++    num_mounts = getmntinfo(&mounts, MNT_NOWAIT);
++    if (num_mounts == 0)
++        return 1; /* Fail as if it exists */
++
++    for (i = 0; i < num_mounts; i++) {
++        if (strcmp(mounts[i].f_fstypename, "selinuxfs") == 0) {
++            exists = 1;
++            break;
++        }
++    }
++    return exists;
++#endif
+ }
+ 
+ static void init_selinuxmnt(void)
+ {
++#ifndef __APPLE__
+ 	char *buf = NULL, *p;
+ 	FILE *fp = NULL;
+ 	size_t len;
+@@ -128,6 +151,34 @@ static void init_selinuxmnt(void)
+ 	if (fp)
+ 		fclose(fp);
+ 	return;
++#else
++	struct statfs *mounts;
++    int num_mounts, i;
++
++    if (selinux_mnt)
++        return;
++
++    if (verify_selinuxmnt(SELINUXMNT) == 0) return;
++
++    if (verify_selinuxmnt(OLDSELINUXMNT) == 0) return;
++
++    /* Drop back to detecting it the long way. */
++    if (!selinuxfs_exists())
++        return;
++
++    /* At this point, the usual spot doesn't have an selinuxfs so
++     * we look around for it */
++    num_mounts = getmntinfo(&mounts, MNT_NOWAIT);
++    if (num_mounts == 0)
++        return;
++
++    for (i = 0; i < num_mounts; i++) {
++        if (strcmp(mounts[i].f_fstypename, "selinuxfs") == 0) {
++            verify_selinuxmnt(mounts[i].f_mntonname);
++            break;
++        }
++    }
++#endif
+ }
+ 
+ void fini_selinuxmnt(void)
+diff --git a/libselinux/src/lgetfilecon.c b/libselinux/src/lgetfilecon.c
+index d1fb821b..d13e5dd5 100644
+--- a/libselinux/src/lgetfilecon.c
++++ b/libselinux/src/lgetfilecon.c
+@@ -18,12 +18,19 @@ int lgetfilecon_raw(const char *path, char ** context)
+ 	if (!buf)
+ 		return -1;
+ 	memset(buf, 0, size);
+-
++#ifdef __APPLE__
++	ret = getxattr(path, XATTR_NAME_SELINUX, buf, size - 1, 0, XATTR_NOFOLLOW);
++#else
+ 	ret = lgetxattr(path, XATTR_NAME_SELINUX, buf, size - 1);
++#endif
+ 	if (ret < 0 && errno == ERANGE) {
+ 		char *newbuf;
+ 
++#ifdef __APPLE__
++		size = getxattr(path, XATTR_NAME_SELINUX, NULL, 0, 0, XATTR_NOFOLLOW);
++#else
+ 		size = lgetxattr(path, XATTR_NAME_SELINUX, NULL, 0);
++#endif
+ 		if (size < 0)
+ 			goto out;
+ 
+@@ -34,7 +41,11 @@ int lgetfilecon_raw(const char *path, char ** context)
+ 
+ 		buf = newbuf;
+ 		memset(buf, 0, size);
++#ifdef __APPLE__
++		ret = getxattr(path, XATTR_NAME_SELINUX, buf, size - 1, 0, XATTR_NOFOLLOW);
++#else
+ 		ret = lgetxattr(path, XATTR_NAME_SELINUX, buf, size - 1);
++#endif
+ 	}
+       out:
+ 	if (ret == 0) {
+diff --git a/libselinux/src/lsetfilecon.c b/libselinux/src/lsetfilecon.c
+index 213fb684..ee4a46d4 100644
+--- a/libselinux/src/lsetfilecon.c
++++ b/libselinux/src/lsetfilecon.c
+@@ -9,8 +9,11 @@
+ 
+ int lsetfilecon_raw(const char *path, const char * context)
+ {
+-	int rc = lsetxattr(path, XATTR_NAME_SELINUX, context, strlen(context) + 1,
+-			 0);
++#ifdef __APPLE__
++	int rc = setxattr(path, XATTR_NAME_SELINUX, context, strlen(context) + 1,0,XATTR_NOFOLLOW);
++#else
++	int rc = lsetxattr(path, XATTR_NAME_SELINUX, context, strlen(context) + 1,0);
++#endif
+ 	if (rc < 0 && errno == ENOTSUP) {
+ 		char * ccontext = NULL;
+ 		int err = errno;
+diff --git a/libselinux/src/procattr.c b/libselinux/src/procattr.c
+index b7a93a2b..9ace3f55 100644
+--- a/libselinux/src/procattr.c
++++ b/libselinux/src/procattr.c
+@@ -41,6 +41,10 @@ static pid_t selinux_gettid(void)
+ {
+ #if HAVE_GETTID
+ 	return gettid();
++#elif defined(__APPLE__)
++	uint64_t tid;
++	pthread_threadid_np(NULL, &tid);
++	return (pid_t)tid;
+ #else
+ 	return syscall(__NR_gettid);
+ #endif
+diff --git a/libselinux/src/selinux_internal.h b/libselinux/src/selinux_internal.h
+index e4d4b484..ecb45281 100644
+--- a/libselinux/src/selinux_internal.h
++++ b/libselinux/src/selinux_internal.h
+@@ -17,6 +17,11 @@ extern int selinux_page_size ;
+ #pragma weak pthread_setspecific
+ #pragma weak pthread_getspecific
+ 
++#ifdef __APPLE__
++/* Call handler iff the first call.  */
++#define __selinux_once(ONCE_CONTROL, INIT_FUNCTION)	\
++	pthread_once (&(ONCE_CONTROL), (INIT_FUNCTION));
++#else
+ /* Call handler iff the first call.  */
+ #define __selinux_once(ONCE_CONTROL, INIT_FUNCTION)	\
+ 	do {						\
+@@ -27,6 +32,7 @@ extern int selinux_page_size ;
+ 			(ONCE_CONTROL) = 2;		\
+ 		}					\
+ 	} while (0)
++#endif
+ 
+ /* Pthread key macros */
+ #define __selinux_key_create(KEY, DESTRUCTOR)			\
+diff --git a/libselinux/src/setfilecon.c b/libselinux/src/setfilecon.c
+index bd45f12c..9be96099 100644
+--- a/libselinux/src/setfilecon.c
++++ b/libselinux/src/setfilecon.c
+@@ -9,8 +9,11 @@
+ 
+ int setfilecon_raw(const char *path, const char * context)
+ {
+-	int rc = setxattr(path, XATTR_NAME_SELINUX, context, strlen(context) + 1,
+-			0);
++#ifdef __APPLE__
++	int rc = setxattr(path, XATTR_NAME_SELINUX, context, strlen(context) + 1, 0, 0);
++#else
++	int rc = setxattr(path, XATTR_NAME_SELINUX, context, strlen(context) + 1, 0);
++#endif
+ 	if (rc < 0 && errno == ENOTSUP) {
+ 		char * ccontext = NULL;
+ 		int err = errno;

@@ -1,0 +1,665 @@
+From f71506e5edf3ec9ea930e0fbc974eb2dcd631057 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Fri, 1 May 2026 10:01:56 -1000
+Subject: [PATCH 60/63] [cuttlefish] Fix host process cleanup when QEMU exits
+ unexpectedly
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+When a user closes the QEMU display window (Cmd+Q or red X on macOS),
+QEMU exits but all associated host processes remain running indefinitely.
+This leaves the Cuttlefish instance in a broken state: the VM is gone
+but dozens of orphaned processes persist, and run_cvd stays alive. In
+multi-instance scenarios, this also leaks resources and can cause port
+conflicts on subsequent launches.
+
+## Root cause
+
+Two bugs prevent cleanup when the VMM (QEMU) exits:
+
+### Bug 1: Monitor child deadlocks
+
+ProcessMonitor forks a monitor child that runs two concurrent tasks:
+
+  - MonitorLoop: blocks in wait(), detects child process exits
+  - ReadMonitorSocketLoop: blocks in ReceiveMessage(), waits for
+    parent commands (kStop, kSuspend, kResume)
+
+When QEMU exits, MonitorLoop detects it (is_critical=true), sets
+running=false, and returns. The code then calls parent_comms.get()
+to wait for ReadMonitorSocketLoop — but that thread is permanently
+blocked in a socket read that will never return. Deadlock.
+StopSubprocesses() is never called. All host processes stay alive.
+
+### Bug 2: Parent run_cvd never exits
+
+Even if Bug 1 were fixed, the parent run_cvd process stays alive
+because it is blocked in SharedFD::Accept() on the launcher monitor
+socket. Nothing notifies it that the monitor child exited.
+
+## Before (broken)
+
+```
+  QEMU exits (Cmd+Q / red X)
+       |
+       v
+  MonitorLoop: wait() returns, detects critical exit
+       |
+       v
+  MonitorLoop: sets running=false, returns
+       |
+       v
+  parent_comms.get()  <-- DEADLOCK
+       |                   ReadMonitorSocketLoop is blocked
+       |                   in ReceiveMessage() forever.
+       x                   Nothing wakes it up.
+
+  StopSubprocesses() -- NEVER REACHED
+
+  Meanwhile in the parent run_cvd process:
+
+  ServerLoop: Accept()  <-- BLOCKED FOREVER
+       |                    No mechanism to detect
+       x                    monitor child death.
+
+  Result: all host processes orphaned, run_cvd alive but useless.
+```
+
+## After (fixed)
+
+```
+  QEMU exits (Cmd+Q / red X)
+       |
+       v
+  MonitorLoop: wait() returns, detects critical exit
+       |
+       v
+  MonitorLoop: sets running=false, returns
+       |
+       v
+  child_sock_->Shutdown(SHUT_RDWR)
+       |    Interrupts ReadMonitorSocketLoop's blocking
+       |    ReceiveMessage() -- the read returns EOF/error.
+       v
+  parent_comms.get()  <-- returns (with expected error)
+       |
+       v
+  StopSubprocesses()  <-- kills all host processes in reverse order
+       |
+       v
+  Monitor child exits (std::exit(0))
+       |    Socket pair child end closed by kernel.
+       |    Parent's end gets EOF.
+       v
+  ServerLoop: Select() detects monitor_fd readable (EOF)
+       |
+       v
+  WaitForMonitorExit() -- waitpid() on monitor child
+       |
+       v
+  Parent run_cvd exits (std::exit(0))
+
+  Result: all host processes cleaned up, run_cvd exits,
+          other instances unaffected.
+```
+
+## Architecture (Select-based ServerLoop)
+
+```
+  Parent run_cvd (ServerLoop)
+  ============================
+       |
+       |  Select() watches two fds:
+       |
+       |--- server_ (launcher_monitor_socket)
+       |       Accepts connections from cvd stop,
+       |       cvd restart, cvd powerwash, etc.
+       |
+       |--- monitor_fd (parent end of socket pair)
+       |       Becomes readable (EOF) when monitor
+       |       child exits due to critical process
+       |       death. Triggers WaitForMonitorExit()
+       |       and std::exit(0).
+       |
+       v
+  Monitor child (forked by ProcessMonitor)
+  =========================================
+       |
+       |  Two concurrent tasks:
+       |
+       |--- MonitorLoop (main thread)
+       |       Blocks in wait(). When critical process
+       |       (QEMU) exits: sets running=false, breaks.
+       |
+       |--- ReadMonitorSocketLoop (async thread)
+       |       Blocks in ReceiveMessage(). Handles kStop,
+       |       kSuspend, kResume from parent.
+       |
+       |  After MonitorLoop returns:
+       |    1. Shutdown(SHUT_RDWR) on child socket
+       |       to unblock ReadMonitorSocketLoop
+       |    2. Join the async thread
+       |    3. StopSubprocesses() in reverse order
+       |    4. Exit
+       |
+       v
+  Managed subprocesses (per-instance)
+  ====================================
+       QEMU, webRTC, logcat_receiver, kernel_log_monitor,
+       secure_env, modem_simulator, casimir, netsimd,
+       sensors_simulator, console_forwarder, ...
+       (~35 processes per instance)
+```
+
+## Changes
+
+### process_monitor.h
+- Add child_sock_ member: raw SharedFD of child socket, used to
+  call Shutdown() to interrupt ReadMonitorSocketLoop
+- Add parent_monitor_sock_ member: raw SharedFD of parent socket,
+  exposed to ServerLoop for Select()-based exit detection
+- Add GetMonitorFd(): returns parent_monitor_sock_ for Select()
+- Add WaitForMonitorExit(): waitpid() without sending kStop,
+  for when the monitor child has already exited on its own
+
+### process_monitor.cc
+- StartAndMonitorProcesses(): store child_sock_ and
+  parent_monitor_sock_ before wrapping in SharedFdChannel.
+  Close parent_sock in child process to avoid fd leak.
+- MonitorRoutine(): after MonitorLoop returns, call
+  child_sock_->Shutdown(SHUT_RDWR) to interrupt the blocking
+  ReceiveMessage(). Handle parent_comms error gracefully since
+  the shutdown intentionally causes it. StopSubprocesses() now
+  always executes.
+- Implement GetMonitorFd() and WaitForMonitorExit().
+
+### server_loop_impl.cpp
+- Add shared_select.h include.
+- Replace bare Accept() loop with Select()-based loop watching
+  both server_ and monitor_fd. When monitor_fd is readable (EOF
+  from monitor child exit), call WaitForMonitorExit() and exit.
+  This also addresses the existing TODO on the old Accept() call.
+
+## Correctness
+
+- kStop path (cvd stop): ReadMonitorSocketLoop receives kStop,
+  sets running=false, wakes MonitorLoop. MonitorLoop exits.
+  Shutdown() is harmless (thread already exited). StopSubprocesses
+  runs. Monitor child exits. Parent's StopMonitoredProcesses()
+  was already handling this synchronously. No behavior change.
+
+- Critical exit path (QEMU killed): MonitorLoop exits. Shutdown()
+  unblocks ReadMonitorSocketLoop. StopSubprocesses runs. Monitor
+  child exits. Parent detects EOF via Select(), exits. Fixed.
+
+- Multi-instance: each run_cvd has its own ProcessMonitor and
+  forked monitor child. Killing one QEMU only affects that
+  instance's process tree. Other instances are unaffected.
+
+- Platform: Shutdown(), Select(), and socket-pair EOF detection
+  all work identically on Linux and macOS. No platform-specific
+  code added.
+
+Test Plan:
+Test: launched two Cuttlefish instances with QEMU on macOS,
+killed cvd-1 via Cmd+Q, verified cvd-1 processes cleaned up
+and cvd-2 remained fully operational. Then killed cvd-2,
+verified complete cleanup with zero orphaned processes.
+```
+❯ Ok i started running a cuttlefish instance now. Make sure it's running. After that i will exit qemu
+
+⏺ Bash(ps -eo pid,ppid,command | grep ".device" | grep -v grep)
+  ⎿    233   231 /Users/achong/.device/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/bin/launch_cvd -system_image_dir=/Users/achong/.device/cache/emul
+     ators/<device>_cf_emu_arm64-66190000003761-1627850944972311 -serial_number=CFCVD-E7B2ECB2 -num_instances=1 --vm_manager=qemu_cli --qemu_binary_dir=/Users/achong/.mau
+     i/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/qemu-cf/darwin-aarch64/bin --enable_host_uwb=false -console=true --start_webrtc=true --vhost_
+     … +56 lines (ctrl+o to expand)
+
+⏺ Bash(# Find the QEMU process specifically
+      ps -eo pid,ppid,command | grep ".device" | grep -i qemu | grep -v grep)
+  ⎿    233   231 /Users/achong/.device/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/bin/launch_cvd -system_image_dir=/Users/achong/.device/cache/emul
+     ators/<device>_cf_emu_arm64-66190000003761-1627850944972311 -serial_number=CFCVD-E7B2ECB2 -num_instances=1 --vm_manager=qemu_cli --qemu_binary_dir=/Users/achong/.mau
+     i/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/qemu-cf/darwin-aarch64/bin --enable_host_uwb=false -console=true --start_webrtc=true --vhost_
+     user_vsock -device_external_network=slirp -report_anonymous_usage_stats=n
+
+⏺ Bash(# QEMU binary might have a different name - check children of the monitor child (PID 905)
+      ps -eo pid,ppid,command | grep -E "^[ ]*[0-9]+[ ]+(905|921)" | grep -v…)
+  ⎿    906   905 /Users/achong/.device/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/bin/modem_simulator -sim_type=1 -server_fds=61
+       919   905 /Users/achong/.device/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/bin/log_tee --process_name=vhost_device_vsock --log_fd_in=100
+       921   905 /Users/achong/.device/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/bin/process_restarter -when_killed -when_dumped -when_exited_wi
+     … +52 lines (ctrl+o to expand)
+
+⏺ Bash(# Find the QEMU process - it's likely a child of process_restarter or directly of PID 905
+      ps -eo pid,ppid,command | grep -i "qemu-system" | grep -v grep)
+  ⎿   1642   905 /Users/achong/.device/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/qemu-cf/darwin-aarch64/bin/qemu-system-aarch64 -name guest=cvd-
+     1,debug-threads=on -machine virt,gic-version=3,usb=off,memory-backend=vm_ram -accel hvf -object memory-backend-file,size=9216M,prealloc=on,share=on,mem-path=/Users/ach
+     ong/.device/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/cuttlefish/instances/cvd-1/internal/qemu.mem,id=vm_ram -m size=9216M,maxmem=9220M -ov
+     … +43 lines (ctrl+o to expand)
+
+⏺ The instance is fully running. Here's the process tree:
+
+  ┌──────────┬──────┬─────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │   PID    │ PPID │       Process       │                                                Role                                                │
+  ├──────────┼──────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 233      │ 231  │ launch_cvd          │ Launcher (parent of everything)                                                                    │
+  ├──────────┼──────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 699      │ 233  │ run_cvd             │ Parent run_cvd (ServerLoop)                                                                        │
+  ├──────────┼──────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 905      │ 699  │ run_cvd             │ Monitor child (forked, runs MonitorRoutine)                                                        │
+  ├──────────┼──────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 1642     │ 905  │ qemu-system-aarch64 │ The VM — critical process                                                                          │
+  ├──────────┼──────┼─────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+  │ 906-1204 │ 905  │ ~35 host processes  │ webRTC, logcat_receiver, kernel_log_monitor, secure_env, netsimd, casimir, sensors_simulator, etc. │
+  └──────────┴──────┴─────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  QEMU (PID 1642) is running with -display cocoa — that's the macOS window you'll close. It's a direct child of the monitor child (PID 905) and marked is_critical.
+
+  Go ahead and exit QEMU (Cmd+Q or red X). I'll check what happens to the host processes afterward.
+
+❯ It's started now
+
+⏺ Bash(ps -eo pid,ppid,command | grep ".device" | grep -v grep | wc -l && echo "---" && ps -p 1642 -o pid,command 2>/dev/null | tail -1)
+  ⎿  39
+     ---
+      1642 /Users/achong/.device/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/qemu-cf/darwin-aarch64/bin/qemu-system-aarch64 -name guest=cvd-1,debu
+     … +43 lines (ctrl+o to expand)
+
+⏺ Confirmed — 39 processes running with .device/cache in their path, and QEMU (PID 1642) is alive. Go ahead and exit QEMU. I'll check what's left afterward.
+
+❯ i have exited qemu
+
+⏺ Bash(ps -eo pid,ppid,command | grep ".device" | grep -v grep)
+  ⎿  No matches found
+
+⏺ Bash(# Double-check with broader searches
+      ps -eo pid,ppid,command | grep -E "run_cvd|launch_cvd|qemu-system|webrtc|logcat_receiver|kernel_log|secure_env|modem_sim|ca…)
+  ⎿    704     1 netsimd --instance_num=1 --hci_port=7300 --no_test_beacons --no_shutdown
+
+⏺ Almost a clean sweep — 38 of 39 processes are gone. There's one orphan:
+
+  ┌─────┬──────┬──────────────────────────────────────────────────────────────────────────┐
+  │ PID │ PPID │                                 Process                                  │
+  ├─────┼──────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 704 │ 1    │ netsimd --instance_num=1 --hci_port=7300 --no_test_beacons --no_shutdown │
+  └─────┴──────┴──────────────────────────────────────────────────────────────────────────┘
+
+  This netsimd was reparented to PID 1 (launchd) and survived the cleanup. Note that it's a different process from the one the monitor child managed (that was PID 1196 with a
+  different command line including -s {"devices":...}). This one (PID 704) was likely started by launch_cvd or assemble_cvd before run_cvd took over, so it was outside the
+  ProcessMonitor's tracking scope.
+
+  Key observations:
+  - QEMU exit (PID 1642) — gone
+  - Monitor child (PID 905) — gone
+  - Parent run_cvd (PID 699) — gone
+  - launch_cvd (PID 233) — gone
+  - All ~35 host processes under the monitor child — gone
+  - One orphan netsimd (PID 704) — survived, started outside ProcessMonitor's scope
+
+  The ProcessMonitor cleanup worked for everything it tracked. The orphaned netsimd is a separate issue — it would need to be registered with the ProcessMonitor or cleaned up by
+   launch_cvd to be caught.
+
+✻ Churned for 37s
+
+❯ ok im going to try launching multiple instances
+
+⏺ Bash(# Kill the orphaned netsimd first so we start clean
+      ps -eo pid,ppid,command | grep -E "netsimd|run_cvd|launch_cvd|qemu" | grep -v grep)
+  ⎿    704     1 netsimd --instance_num=1 --hci_port=7300 --no_test_beacons --no_shutdown
+
+⏺ There's still that orphaned netsimd from the last run. Go ahead and launch your instances — I'll check the process state once they're up.
+
+❯ Ok I now have two instances
+
+  Bash(ps -eo pid,ppid,command | grep ".device" | grep -v grep | wc -l && echo "---" && ps -eo pid,ppid,command | grep "qemu-system" | grep -v grep && echo "---" && ps -…)
+  ⎿  Running…
+
+✳ Infusing… (4s · ↓ 151 tokens)
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt
+
+  ┌─────┬──────┬──────────────────────────────────────────────────────────────────────────┐
+  │ PID │ PPID │                                 Process                                  │
+  ├─────┼──────┼──────────────────────────────────────────────────────────────────────────┤
+  │ 704 │ 1    │ netsimd --instance_num=1 --hci_port=7300 --no_test_beacons --no_shutdown │
+  └─────┴──────┴──────────────────────────────────────────────────────────────────────────┘
+
+  This netsimd was reparented to PID 1 (launchd) and survived the cleanup. Note that it's a different process from the one the monitor child managed (that was PID 1196 with a
+  different command line including -s {"devices":...}). This one (PID 704) was likely started by launch_cvd or assemble_cvd before run_cvd took over, so it was outside the
+  ProcessMonitor's tracking scope.
+
+  Key observations:
+  - QEMU exit (PID 1642) — gone
+  - Monitor child (PID 905) — gone
+  - Parent run_cvd (PID 699) — gone
+  - launch_cvd (PID 233) — gone
+  - All ~35 host processes under the monitor child — gone
+  - One orphan netsimd (PID 704) — survived, started outside ProcessMonitor's scope
+
+  The ProcessMonitor cleanup worked for everything it tracked. The orphaned netsimd is a separate issue — it would need to be registered with the ProcessMonitor or cleaned up by
+   launch_cvd to be caught.
+
+✻ Churned for 37s
+
+❯ ok im going to try launching multiple instances
+
+⏺ Bash(# Kill the orphaned netsimd first so we start clean
+      ps -eo pid,ppid,command | grep -E "netsimd|run_cvd|launch_cvd|qemu" | grep -v grep)
+  ⎿    704     1 netsimd --instance_num=1 --hci_port=7300 --no_test_beacons --no_shutdown
+
+⏺ There's still that orphaned netsimd from the last run. Go ahead and launch your instances — I'll check the process state once they're up.
+
+❯ Ok I now have two instances
+
+⏺ Bash(ps -eo pid,ppid,command | grep ".device" | grep -v grep | wc -l && echo "---" && ps -eo pid,ppid,command | grep "qemu-system" | grep -v grep && echo "---" && ps -…)
+  ⎿        72
+     ---
+      4737  4607 /Users/achong/.device/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/qemu-cf/darwin-aarch64/bin/qemu-system-aarch64 -name guest=cvd-
+     … +93 lines (ctrl+o to expand)
+
+⏺ Both instances confirmed — 72 total processes:
+
+  ┌──────────┬────────────────┬───────────────┬──────────┐
+  │ Instance │ Parent run_cvd │ Monitor child │ QEMU PID │
+  ├──────────┼────────────────┼───────────────┼──────────┤
+  │ cvd-1    │ 4594           │ 4607          │ 4737     │
+  ├──────────┼────────────────┼───────────────┼──────────┤
+  │ cvd-2    │ 4596           │ 4624          │ 4741     │
+  └──────────┴────────────────┴───────────────┴──────────┘
+
+  Go ahead and exit one of the QEMU windows. I'll check that only that instance's processes get cleaned up while the other stays running.
+
+❯ I've killed cvd-1
+
+⏺ Bash(# Check if cvd-1 QEMU is gone and cvd-2 QEMU is still alive
+      echo "=== QEMU processes ===" && ps -eo pid,ppid,command | grep "qemu-system" | grep -v grep && echo…)
+  ⎿  === QEMU processes ===
+      4741  4624 /Users/achong/.device/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/qemu-cf/darwin-aarch64/bin/qemu-system-aarch64 -name guest=cvd-
+     2,debug-threads=on -machine virt,gic-version=3,usb=off,memory-backend=vm_ram -accel hvf -object memory-backend-file,size=9216M,prealloc=on,share=on,mem-path=/Users/ach
+     … +46 lines (ctrl+o to expand)
+
+⏺ Clean instance-scoped cleanup:
+
+  - cvd-1: Completely gone — QEMU (4737), run_cvd parent (4594), monitor child (4607), and all ~35 host processes cleaned up
+  - cvd-2: Fully intact — QEMU (4741), run_cvd parent (4596), monitor child (4624), and all host processes still running
+  - Process count dropped from 72 to 34 — exactly one instance's worth
+
+  The fix works correctly for multi-instance: killing one QEMU only cleans up that instance's processes while leaving the other instance completely unaffected.
+
+❯ i've now killed cvd-2
+
+⏺ Bash(ps -eo pid,ppid,command | grep ".device" | grep -v grep && echo "=== orphans ===" && ps -eo pid,ppid,command | grep -E "run_cvd|qemu-system|webrtc|logcat_receiver…)
+  ⎿  No matches found
+
+⏺ All clean. Zero orphaned processes — both instances fully cleaned up. The fix handles single-instance exit, multi-instance selective exit, and full teardown correctly.
+
+❯ ok create a commit for this change. Include an ascii diagram
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+
+  ⎿        72
+     ---
+      4737  4607 /Users/achong/.device/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/qemu-cf/darwin-aarch64/bin/qemu-system-aarch64 -name guest=cvd-
+     … +93 lines (ctrl+o to expand)
+
+⏺ Both instances confirmed — 72 total processes:
+
+  ┌──────────┬────────────────┬───────────────┬──────────┐
+  │ Instance │ Parent run_cvd │ Monitor child │ QEMU PID │
+  ├──────────┼────────────────┼───────────────┼──────────┤
+  │ cvd-1    │ 4594           │ 4607          │ 4737     │
+  ├──────────┼────────────────┼───────────────┼──────────┤
+  │ cvd-2    │ 4596           │ 4624          │ 4741     │
+  └──────────┴────────────────┴───────────────┴──────────┘
+
+  Go ahead and exit one of the QEMU windows. I'll check that only that instance's processes get cleaned up while the other stays running.
+
+❯ I've killed cvd-1
+
+⏺ Bash(# Check if cvd-1 QEMU is gone and cvd-2 QEMU is still alive
+      echo "=== QEMU processes ===" && ps -eo pid,ppid,command | grep "qemu-system" | grep -v grep && echo…)
+  ⎿  === QEMU processes ===
+      4741  4624 /Users/achong/.device/cache/emulators/<device>_cf_emu_arm64-66190000003761-1627850944972311/qemu-cf/darwin-aarch64/bin/qemu-system-aarch64 -name guest=cvd-
+     2,debug-threads=on -machine virt,gic-version=3,usb=off,memory-backend=vm_ram -accel hvf -object memory-backend-file,size=9216M,prealloc=on,share=on,mem-path=/Users/ach
+     … +46 lines (ctrl+o to expand)
+
+⏺ Clean instance-scoped cleanup:
+
+  - cvd-1: Completely gone — QEMU (4737), run_cvd parent (4594), monitor child (4607), and all ~35 host processes cleaned up
+  - cvd-2: Fully intact — QEMU (4741), run_cvd parent (4596), monitor child (4624), and all host processes still running
+  - Process count dropped from 72 to 34 — exactly one instance's worth
+
+  The fix works correctly for multi-instance: killing one QEMU only cleans up that instance's processes while leaving the other instance completely unaffected.
+
+❯ i've now killed cvd-2
+
+⏺ Bash(ps -eo pid,ppid,command | grep ".device" | grep -v grep && echo "=== orphans ===" && ps -eo pid,ppid,command | grep -E "run_cvd|qemu-system|webrtc|logcat_receiver…)
+  ⎿  No matches found
+
+⏺ All clean. Zero orphaned processes — both instances fully cleaned up. The fix handles single-instance exit, multi-instance selective exit, and full teardown correctly.
+```
+
+Reviewers: josephknox, #cuttlefish-cross-platform, <internal-group>, #ar_signals, hzalek
+
+Reviewed By: josephknox
+
+Subscribers: albertguan, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D103449245
+
+Tasks: T268326787
+
+Tags: aarch64
+---
+ host/commands/run_cvd/server_loop_impl.cpp   | 88 +++++++++++++-------
+ host/libs/process_monitor/process_monitor.cc | 32 ++++++-
+ host/libs/process_monitor/process_monitor.h  | 10 +++
+ 3 files changed, 98 insertions(+), 32 deletions(-)
+
+diff --git a/host/commands/run_cvd/server_loop_impl.cpp b/host/commands/run_cvd/server_loop_impl.cpp
+index c0298f94b..ba8c59a59 100644
+--- a/host/commands/run_cvd/server_loop_impl.cpp
++++ b/host/commands/run_cvd/server_loop_impl.cpp
+@@ -33,6 +33,7 @@
+ 
+ #include "common/libs/fs/shared_buf.h"
+ #include "common/libs/fs/shared_fd.h"
++#include "common/libs/fs/shared_select.h"
+ #include "common/libs/utils/files.h"
+ #include "common/libs/utils/result.h"
+ #include "common/libs/utils/subprocess.h"
+@@ -105,40 +106,65 @@ Result<void> ServerLoopImpl::Run() {
+   CF_EXPECT(process_monitor.StartAndMonitorProcesses());
+   device_status_ = DeviceStatus::kActive;
+ 
++  SharedFD monitor_fd = process_monitor.GetMonitorFd();
++
+   while (true) {
+-    // TODO: use select to handle simultaneous connections.
+-    auto client = SharedFD::Accept(*server_);
+-    while (client->IsOpen()) {
+-      auto launcher_action_with_info_result = ReadLauncherActionFromFd(client);
+-      if (!launcher_action_with_info_result.ok()) {
+-        LOG(ERROR) << "Reading launcher command from monitor failed: "
+-                   << launcher_action_with_info_result.error().FormatForEnv();
+-        break;
+-      }
+-      auto launcher_action_opt = std::move(*launcher_action_with_info_result);
+-      if (!launcher_action_opt.has_value()) {
+-        // client disconnected
+-        break;
+-      }
+-      auto launcher_action = *launcher_action_opt;
+-      if (launcher_action.action != LauncherAction::kExtended) {
+-        HandleActionWithNoData(launcher_action.action, client, process_monitor);
+-        continue;
+-      }
+-      auto result = HandleExtended(launcher_action, process_monitor);
+-      auto response = LauncherResponse::kSuccess;
+-      if (!result.ok()) {
+-        LOG(ERROR) << "Failed to handle extended action request.";
+-        LOG(ERROR) << result.error().FormatForEnv();
+-        response = LauncherResponse::kError;
++    SharedFDSet read_set;
++    read_set.Set(server_);
++    if (monitor_fd->IsOpen()) {
++      read_set.Set(monitor_fd);
++    }
++
++    Select(&read_set, nullptr, nullptr, nullptr);
++
++    if (monitor_fd->IsOpen() && read_set.IsSet(monitor_fd)) {
++      LOG(ERROR) << "Monitor process exited due to critical process failure, "
++                    "shutting down instance";
++      auto wait_result = process_monitor.WaitForMonitorExit();
++      if (!wait_result.ok()) {
++        LOG(ERROR) << "Failed to wait for monitor: "
++                   << wait_result.error().FormatForEnv();
+       }
+-      const auto n_written = client->Write(&response, sizeof(response));
+-      if (n_written != sizeof(response)) {
+-        LOG(ERROR) << "Failed to write response";
++      std::exit(0);
++    }
++
++    if (read_set.IsSet(server_)) {
++      auto client = SharedFD::Accept(*server_);
++      while (client->IsOpen()) {
++        auto launcher_action_with_info_result =
++            ReadLauncherActionFromFd(client);
++        if (!launcher_action_with_info_result.ok()) {
++          LOG(ERROR) << "Reading launcher command from monitor failed: "
++                     << launcher_action_with_info_result.error().FormatForEnv();
++          break;
++        }
++        auto launcher_action_opt =
++            std::move(*launcher_action_with_info_result);
++        if (!launcher_action_opt.has_value()) {
++          // client disconnected
++          break;
++        }
++        auto launcher_action = *launcher_action_opt;
++        if (launcher_action.action != LauncherAction::kExtended) {
++          HandleActionWithNoData(launcher_action.action, client,
++                                process_monitor);
++          continue;
++        }
++        auto result = HandleExtended(launcher_action, process_monitor);
++        auto response = LauncherResponse::kSuccess;
++        if (!result.ok()) {
++          LOG(ERROR) << "Failed to handle extended action request.";
++          LOG(ERROR) << result.error().FormatForEnv();
++          response = LauncherResponse::kError;
++        }
++        const auto n_written = client->Write(&response, sizeof(response));
++        if (n_written != sizeof(response)) {
++          LOG(ERROR) << "Failed to write response";
++        }
++        // extended operations for now are 1 time request-response exchanges.
++        // thus, we will close the client FD.
++        client->Close();
+       }
+-      // extended operations for now are 1 time request-response exchanges.
+-      // thus, we will close the client FD.
+-      client->Close();
+     }
+   }
+ }
+diff --git a/host/libs/process_monitor/process_monitor.cc b/host/libs/process_monitor/process_monitor.cc
+index 3f3fff778..e34ca4c3b 100644
+--- a/host/libs/process_monitor/process_monitor.cc
++++ b/host/libs/process_monitor/process_monitor.cc
+@@ -392,6 +392,21 @@ Result<void> ProcessMonitor::ResumeMonitoredProcesses() {
+   return {};
+ }
+ 
++SharedFD ProcessMonitor::GetMonitorFd() const { return parent_monitor_sock_; }
++
++Result<void> ProcessMonitor::WaitForMonitorExit() {
++  if (monitor_ == -1) {
++    return {};
++  }
++  pid_t last_monitor = monitor_;
++  monitor_ = -1;
++  parent_channel_.reset();
++  int wstatus;
++  CF_EXPECT(waitpid(last_monitor, &wstatus, 0) == last_monitor,
++            "Failed to wait for monitor process");
++  return {};
++}
++
+ Result<void> ProcessMonitor::StartAndMonitorProcesses() {
+   CF_EXPECT(monitor_ == -1, "The monitor process was already started");
+   CF_EXPECT(!parent_channel_.has_value(),
+@@ -401,6 +416,8 @@ Result<void> ProcessMonitor::StartAndMonitorProcesses() {
+   SharedFD::SocketPair(AF_UNIX, SOCK_STREAM, 0, &parent_sock, &child_sock);
+   monitor_ = fork();
+   if (monitor_ == 0) {
++    parent_sock->Close();
++    child_sock_ = child_sock;
+     child_channel_ = transport::SharedFdChannel(child_sock, child_sock);
+     Result<void> monitor_result = MonitorRoutine();
+     if (!monitor_result.ok()) {
+@@ -409,6 +426,7 @@ Result<void> ProcessMonitor::StartAndMonitorProcesses() {
+     }
+     std::exit(monitor_result.ok() ? 0 : 1);
+   } else {
++    parent_monitor_sock_ = parent_sock;
+     parent_channel_ = transport::SharedFdChannel(parent_sock, parent_sock);
+     return {};
+   }
+@@ -444,7 +462,19 @@ Result<void> ProcessMonitor::MonitorRoutine() {
+   CF_EXPECT(MonitorLoop(running, properties_mutex_,
+                         properties_.restart_subprocesses_,
+                         properties_.entries_));
+-  CF_EXPECT(parent_comms.get(), "Should have exited if monitoring stopped");
++
++  // Interrupt ReadMonitorSocketLoop's blocking ReceiveMessage() call.
++  // In the kStop path, ReadMonitorSocketLoop has already exited so this is
++  // harmless. In the critical-exit path, this unblocks the deadlock.
++  if (child_sock_->IsOpen()) {
++    child_sock_->Shutdown(SHUT_RDWR);
++  }
++
++  auto comms_result = parent_comms.get();
++  if (!comms_result.ok()) {
++    LOG(DEBUG) << "ReadMonitorSocketLoop exited after socket shutdown: "
++               << comms_result.error().FormatForEnv();
++  }
+ 
+   CF_EXPECT(StopSubprocesses(properties_.entries_));
+   LOG(DEBUG) << "Done monitoring subprocesses";
+diff --git a/host/libs/process_monitor/process_monitor.h b/host/libs/process_monitor/process_monitor.h
+index 0ef61c2f0..6f2740bd7 100644
+--- a/host/libs/process_monitor/process_monitor.h
++++ b/host/libs/process_monitor/process_monitor.h
+@@ -67,6 +67,14 @@ class ProcessMonitor {
+   Result<void> StartAndMonitorProcesses();
+   // Stops all monitored subprocesses.
+   Result<void> StopMonitoredProcesses();
++  // Waits for the monitor process to exit without sending kStop.
++  // Use when the monitor child has already exited on its own (e.g. critical
++  // process death).
++  Result<void> WaitForMonitorExit();
++  // Returns the parent's end of the monitor socket pair. Becomes readable
++  // (EOF) when the monitor child exits, allowing the caller to detect
++  // unexpected monitor termination via Select().
++  SharedFD GetMonitorFd() const;
+   // Suspend all host subprocesses
+   Result<void> SuspendMonitoredProcesses();
+   // Resume all host subprocesses
+@@ -90,6 +98,8 @@ class ProcessMonitor {
+   pid_t monitor_;
+   std::optional<transport::SharedFdChannel> parent_channel_;
+   std::optional<transport::SharedFdChannel> child_channel_;
++  SharedFD child_sock_;
++  SharedFD parent_monitor_sock_;
+ 
+   /*
+    * The lock that should be acquired when multiple threads

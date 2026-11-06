@@ -1,0 +1,44 @@
+From ccfe513cc5c1a1f0ad6317a96f2839ea88acf895 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 7 Aug 2025 10:56:58 -0700
+Subject: [PATCH 3/7] rust_bingen support for 15.5 macosx sdk
+
+Summary:
+```
+/Applications/Xcode_16.4.0_16F6_fb.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/usr/include/_string.h:176:73: error: unknown type name 'rsize_t'
+```
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform
+
+Reviewed By: tcare
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D79822784
+
+Tags: aarch64
+---
+ crates/grpcio-sys/Android.bp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/crates/grpcio-sys/Android.bp b/crates/grpcio-sys/Android.bp
+index 0c57ac9b..b9b4663c 100644
+--- a/crates/grpcio-sys/Android.bp
++++ b/crates/grpcio-sys/Android.bp
+@@ -100,6 +100,7 @@ rust_bindgen {
+         "--blocklist-type=gpr_once",
+     ],
+     min_sdk_version: "29",
++    cpp_std: "gnu++17",
+ }
+ 
+ rust_test {

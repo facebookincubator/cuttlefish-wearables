@@ -1,0 +1,136 @@
+From 27db2efde9857695af09e5fcaba78ae00d4f6028 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 17 Feb 2026 14:30:38 -1000
+Subject: [PATCH 35/63] add non-zero length custom.css to avoid bug in
+ libwebsockets
+
+Summary:
+# Motivation:
+libwebsockets seems to fail to serve up a zero-length static file.
+
+```
+% curl 'https://localhost:8443/custom.css' --insecure -v
+* Host localhost:8443 was resolved.
+* IPv6: ::1
+* IPv4: 127.0.0.1
+*   Trying [::1]:8443...
+* connect to ::1 port 8443 from ::1 port 52456 failed: Connection refused
+*   Trying 127.0.0.1:8443...
+* Connected to localhost (127.0.0.1) port 8443
+* ALPN: curl offers h2,http/1.1
+* (304) (OUT), TLS handshake, Client hello (1):
+* (304) (IN), TLS handshake, Server hello (2):
+* (304) (IN), TLS handshake, Unknown (8):
+* (304) (IN), TLS handshake, Certificate (11):
+* (304) (IN), TLS handshake, CERT verify (15):
+* (304) (IN), TLS handshake, Finished (20):
+* (304) (OUT), TLS handshake, Finished (20):
+* SSL connection using TLSv1.3 / AEAD-CHACHA20-POLY1305-SHA256 / [blank] / UNDEF
+* ALPN: server accepted h2
+* Server certificate:
+*  subject: C=US; ST=California; L=Santa Clara; O=Beyond Aggravated; CN=localhost
+*  start date: May  8 06:50:00 2021 GMT
+*  expire date: Feb 20 06:50:00 2295 GMT
+*  issuer: C=US; ST=California; L=Santa Clara; O=Beyond Aggravated; CN=localhost
+*  SSL certificate verify result: self signed certificate (18), continuing anyway.
+* using HTTP/2
+* [HTTP/2] [1] OPENED stream for https://localhost:8443/custom.css
+* [HTTP/2] [1] [:method: GET]
+* [HTTP/2] [1] [:scheme: https]
+* [HTTP/2] [1] [:authority: localhost:8443]
+* [HTTP/2] [1] [:path: /custom.css]
+* [HTTP/2] [1] [user-agent: curl/8.7.1]
+* [HTTP/2] [1] [accept: */*]
+> GET /custom.css HTTP/2
+> Host: localhost:8443
+> User-Agent: curl/8.7.1
+> Accept: */*
+>
+* Request completely sent off
+< HTTP/2 200
+< content-security-policy: default-src 'self' https://ajax.googleapis.com; style-src 'self' https://fonts.googleapis.com/; font-src  https://fonts.gstatic.com/;
+< content-type: text/css
+< cache-control: no-store
+< etag: 0000000069964235
+<
+* Closing connection
+curl: (16) Error in the HTTP2 framing layer
+```
+
+# Overview:
+- add a comment so GET request completes
+
+# Alternatively:
+https://www.internalfb.com/diff/D93647995
+
+Test Plan:
+# Before:
+ {F1985716767}
+# After:
+```
+% curl 'https://localhost:8443/custom.css' --insecure -v
+* Host localhost:8443 was resolved.
+* IPv6: ::1
+* IPv4: 127.0.0.1
+*   Trying [::1]:8443...
+* connect to ::1 port 8443 from ::1 port 52899 failed: Connection refused
+*   Trying 127.0.0.1:8443...
+* Connected to localhost (127.0.0.1) port 8443
+* ALPN: curl offers h2,http/1.1
+* (304) (OUT), TLS handshake, Client hello (1):
+* (304) (IN), TLS handshake, Server hello (2):
+* (304) (IN), TLS handshake, Unknown (8):
+* (304) (IN), TLS handshake, Certificate (11):
+* (304) (IN), TLS handshake, CERT verify (15):
+* (304) (IN), TLS handshake, Finished (20):
+* (304) (OUT), TLS handshake, Finished (20):
+* SSL connection using TLSv1.3 / AEAD-CHACHA20-POLY1305-SHA256 / [blank] / UNDEF
+* ALPN: server accepted h2
+* Server certificate:
+*  subject: C=US; ST=California; L=Santa Clara; O=Beyond Aggravated; CN=localhost
+*  start date: May  8 06:50:00 2021 GMT
+*  expire date: Feb 20 06:50:00 2295 GMT
+*  issuer: C=US; ST=California; L=Santa Clara; O=Beyond Aggravated; CN=localhost
+*  SSL certificate verify result: self signed certificate (18), continuing anyway.
+* using HTTP/2
+* [HTTP/2] [1] OPENED stream for https://localhost:8443/custom.css
+* [HTTP/2] [1] [:method: GET]
+* [HTTP/2] [1] [:scheme: https]
+* [HTTP/2] [1] [:authority: localhost:8443]
+* [HTTP/2] [1] [:path: /custom.css]
+* [HTTP/2] [1] [user-agent: curl/8.7.1]
+* [HTTP/2] [1] [accept: */*]
+> GET /custom.css HTTP/2
+> Host: localhost:8443
+> User-Agent: curl/8.7.1
+> Accept: */*
+>
+* Request completely sent off
+< HTTP/2 200
+< content-security-policy: default-src 'self' https://ajax.googleapis.com; style-src 'self' https://fonts.googleapis.com/; font-src  https://fonts.gstatic.com/;
+< content-type: text/css
+< cache-control: no-store
+< etag: 000000596996425B
+<
+/* Add non-zero length css file to prevent causing issues with libwebsockets on macOS */
+* Connection #0 to host localhost left intact
+```
+ {F1985716773}
+
+Reviewers: hzalek, #cuttlefish-cross-platform, <internal-group>, benthomas
+
+Reviewed By: hzalek
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D93543764
+---
+ host/frontend/webrtc/html_client/custom.css | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/host/frontend/webrtc/html_client/custom.css b/host/frontend/webrtc/html_client/custom.css
+index e69de29bb..f6cb94fcf 100644
+--- a/host/frontend/webrtc/html_client/custom.css
++++ b/host/frontend/webrtc/html_client/custom.css
+@@ -0,0 +1 @@
++/* Add non-zero length css file to prevent causing issues with libwebsockets on macOS */

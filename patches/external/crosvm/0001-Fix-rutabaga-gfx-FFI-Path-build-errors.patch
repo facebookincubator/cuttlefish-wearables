@@ -1,0 +1,53 @@
+From b745b44e4028e2010e523039d93fa83de63e57d9 Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Fri, 14 Nov 2025 12:06:41 -0800
+Subject: [PATCH] Fix rutabaga-gfx FFI Path build errors
+
+Summary: Fix the type mismatch in rutabaga-gfx
+
+Test Plan:
+```
+# cd rutabaga_gfx/ffi
+# meson setup build
+# ninja
+[1/1] Generating rutabaga_gfx_ffi_build with a custom command
+   Compiling rutabaga_gfx_ffi v0.1.3 (/Users/tcare/qemu/build/deps/crosvm/rutabaga_gfx/ffi)
+...
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.98s
+```
+
+Rollback Plan:
+
+Reviewers: achong, olja, benthomas
+
+Reviewed By: achong
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D87096516
+---
+ rutabaga_gfx/ffi/src/lib.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/rutabaga_gfx/ffi/src/lib.rs b/rutabaga_gfx/ffi/src/lib.rs
+index b134c45c3..f0ef3e59a 100644
+--- a/rutabaga_gfx/ffi/src/lib.rs
++++ b/rutabaga_gfx/ffi/src/lib.rs
+@@ -699,7 +699,7 @@ pub unsafe extern "C" fn rutabaga_snapshot(ptr: &mut rutabaga, dir: *const c_cha
+         let result = c_str_slice.to_str();
+         let directory = return_on_error!(result);
+ 
+-        let result = ptr.snapshot(directory);
++        let result = ptr.snapshot(Path::new(directory));
+         return_result(result)
+     }))
+     .unwrap_or(-ESRCH)
+@@ -715,7 +715,7 @@ pub unsafe extern "C" fn rutabaga_restore(ptr: &mut rutabaga, dir: *const c_char
+         let result = c_str_slice.to_str();
+         let directory = return_on_error!(result);
+ 
+-        let result = ptr.restore(directory);
++        let result = ptr.restore(Path::new(directory));
+         return_result(result)
+     }))
+     .unwrap_or(-ESRCH)

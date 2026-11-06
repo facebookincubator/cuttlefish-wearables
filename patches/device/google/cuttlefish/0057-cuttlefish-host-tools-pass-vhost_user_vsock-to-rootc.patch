@@ -1,0 +1,113 @@
+From 6aef763297e6348412e62e824452c4fbd657c44a Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Fri, 10 Apr 2026 12:51:00 -0700
+Subject: [PATCH 57/63] [cuttlefish host-tools] pass --vhost_user_vsock to
+ rootcanal and netsim proxies
+
+Summary:
+## Problem
+
+On macOS, `socket_vsock_proxy` instances launched for Root Canal
+(Bluetooth HCI/test ports 7300/7500) and netsim fail with:
+
+```
+Unrecoverable vsock server error - Port: 7500, vhost-user CID: none,
+Error: Operation not supported by device (errno: 19)
+```
+
+macOS has no native `AF_VSOCK` kernel driver. When `--vhost_user_vsock`
+is not passed, the proxy calls `socket(AF_VSOCK, SOCK_STREAM, 0)` which
+returns `ENODEV` (errno 19). With the flag, it uses a Unix domain socket
+path instead (`/tmp/vsock_<cid>_<uid>/vm.vsock_<port>`).
+
+The ADB proxy works because it correctly passes the flag:
+
+```
+ Working (ADB proxy)                 Broken (rootcanal proxy)
+      |                                    |
+ --vhost_user_vsock=true             (flag missing)
+      |                                    |
+ VsockServer(cid=Some(3))           VsockServer(cid=None)
+      |                                    |
+ Unix socket:                        socket(AF_VSOCK, ...)
+ /tmp/vsock_3_501/vm.vsock_5555          |
+      |                              errno 19: ENODEV
+   works on macOS                    SleepForever()
+```
+
+## Fix
+
+Add `--vhost_user_vsock=` parameter to all four proxy commands in
+`root_canal.cpp` (hci + test) and `netsim_server.cpp` (hci + test),
+matching the pattern from `host/libs/config/adb/launch.cpp:144-145`.
+
+The flag reads `instance_.vhost_user_vsock()` which is true when the
+VM uses vhost-user vsock (always true on macOS, false on Linux with
+kernel vsock).
+
+This is backwards compatible with linux because the value will be false there.
+
+Test Plan:
+```
+ . build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+Rebuilt launch_cvd. Verified no more "Operation not supported" errors in launcher.log for rootcanal proxy on macOS.
+
+Reviewers: josephknox, <internal-group>, hzalek
+
+Reviewed By: josephknox
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D100377341
+
+Tags: aarch64
+---
+ host/commands/run_cvd/launch/netsim_server.cpp | 4 ++++
+ host/commands/run_cvd/launch/root_canal.cpp    | 4 ++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/host/commands/run_cvd/launch/netsim_server.cpp b/host/commands/run_cvd/launch/netsim_server.cpp
+index e352e3600..5aa20e918 100644
+--- a/host/commands/run_cvd/launch/netsim_server.cpp
++++ b/host/commands/run_cvd/launch/netsim_server.cpp
+@@ -131,6 +131,8 @@ class NetsimServer : public CommandSource {
+     hci_vsock_proxy.AddParameter("--client_tcp_host=127.0.0.1");
+     hci_vsock_proxy.AddParameter("--client_tcp_port=",
+                                  config_.rootcanal_hci_port());
++    hci_vsock_proxy.AddParameter("--vhost_user_vsock=",
++                                 instance_.vhost_user_vsock());
+ 
+     // Add command for forwarding the test port to a vsock server.
+     Command test_vsock_proxy(SocketVsockProxyBinary());
+@@ -143,6 +145,8 @@ class NetsimServer : public CommandSource {
+     test_vsock_proxy.AddParameter("--client_tcp_host=127.0.0.1");
+     test_vsock_proxy.AddParameter("--client_tcp_port=",
+                                   config_.rootcanal_test_port());
++    test_vsock_proxy.AddParameter("--vhost_user_vsock=",
++                                  instance_.vhost_user_vsock());
+ 
+     std::vector<MonitorCommand> commands;
+     commands.emplace_back(std::move(netsimd));
+diff --git a/host/commands/run_cvd/launch/root_canal.cpp b/host/commands/run_cvd/launch/root_canal.cpp
+index 4db21c275..b195c8b86 100644
+--- a/host/commands/run_cvd/launch/root_canal.cpp
++++ b/host/commands/run_cvd/launch/root_canal.cpp
+@@ -72,6 +72,8 @@ class RootCanal : public CommandSource {
+     hci_vsock_proxy.AddParameter("--client_tcp_host=127.0.0.1");
+     hci_vsock_proxy.AddParameter("--client_tcp_port=",
+                                  config_.rootcanal_hci_port());
++    hci_vsock_proxy.AddParameter("--vhost_user_vsock=",
++                                 instance_.vhost_user_vsock());
+ 
+     // Add command for forwarding the test port to a vsock server.
+     Command test_vsock_proxy(SocketVsockProxyBinary());
+@@ -84,6 +86,8 @@ class RootCanal : public CommandSource {
+     test_vsock_proxy.AddParameter("--client_tcp_host=127.0.0.1");
+     test_vsock_proxy.AddParameter("--client_tcp_port=",
+                                   config_.rootcanal_test_port());
++    test_vsock_proxy.AddParameter("--vhost_user_vsock=",
++                                  instance_.vhost_user_vsock());
+ 
+     std::vector<MonitorCommand> commands;
+     commands.emplace_back(

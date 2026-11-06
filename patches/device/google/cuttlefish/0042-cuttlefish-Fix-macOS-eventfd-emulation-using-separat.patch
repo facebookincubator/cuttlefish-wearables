@@ -1,0 +1,89 @@
+From 5fa4f37ef80ea736a28dd2cc6fc388e73164b123 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 19 Mar 2026 14:53:40 -0700
+Subject: [PATCH 42/63] [cuttlefish] Fix macOS eventfd emulation using separate
+ static maps
+
+Summary:
+# Motivation:
+Webrtc was seeing resource usage from adbhandler threads not being able to `.join()`
+
+# Overview:
+
+`SharedFD::Event()`, `EventfdWrite()`, and `Close()` each declared their own function-local static map for the eventfd pipe emulation:
+```
+static std::unordered_map<int, int> eventfd_write_fds;
+```
+These are three independent maps. Event() stored the write-end fd in its map, but EventfdWrite() looked it up in its own (always empty) map, so EventfdWrite() always returned EBADF. The shutdown signal never reached the pipe, causing ReadLoop threads to hang forever.
+
+- use a single file-level static map shared by all three functions. This makes cleanup work properly
+
+Test Plan:
+# Build host tools:
+```
+. build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+reconnect to webrtc interface multiple times - host cpu usage does not increase everytime
+
+Reviewers: jeffreyeffendy, <internal-group>, ivantsou
+
+Reviewed By: jeffreyeffendy
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D97374836
+
+Tags: aarch64
+---
+ common/libs/fs/shared_fd.cpp | 17 ++++++-----------
+ 1 file changed, 6 insertions(+), 11 deletions(-)
+
+diff --git a/common/libs/fs/shared_fd.cpp b/common/libs/fs/shared_fd.cpp
+index c734eb88e..3ce41ea03 100644
+--- a/common/libs/fs/shared_fd.cpp
++++ b/common/libs/fs/shared_fd.cpp
+@@ -58,6 +58,11 @@ struct KqueueWatch {
+   uint32_t mask;  // inotify mask
+ };
+ 
++// Global state for eventfd pipe emulation: maps read-end fd → write-end fd.
++// Shared by Event(), EventfdWrite(), and Close().
++static std::mutex eventfd_map_mutex;
++static std::unordered_map<int, int> eventfd_write_fds;
++
+ // Global state for kqueue-based inotify replacement
+ static std::mutex kqueue_mutex;
+ static std::unordered_map<int, std::unordered_map<int, KqueueWatch>> kqueue_watches; // kqueue_fd -> watch_id -> KqueueWatch
+@@ -284,9 +289,6 @@ void FileInstance::Close() {
+   } else {
+ #ifdef __APPLE__
+     // Clean up eventfd emulation resources if this is an eventfd
+-    static std::mutex eventfd_map_mutex;
+-    static std::unordered_map<int, int> eventfd_write_fds;
+-    
+     {
+       std::lock_guard<std::mutex> lock(eventfd_map_mutex);
+       auto it = eventfd_write_fds.find(fd_);
+@@ -559,11 +561,7 @@ SharedFD SharedFD::Event(int initval, int flags) {
+     write(pipe_fds[1], &val, sizeof(val));
+   }
+   
+-  // Store the write end in a global map so EventfdWrite can access it
+-  // This is a workaround since FileInstance only stores one fd
+-  static std::mutex eventfd_map_mutex;
+-  static std::unordered_map<int, int> eventfd_write_fds;
+-  
++  // Store the write end in the global map so EventfdWrite can access it
+   {
+     std::lock_guard<std::mutex> lock(eventfd_map_mutex);
+     eventfd_write_fds[pipe_fds[0]] = pipe_fds[1];
+@@ -1240,9 +1238,6 @@ int FileInstance::EventfdWrite(eventfd_t value) {
+ #elif defined(__APPLE__)
+   // macOS doesn't have eventfd_write, so we emulate it using write()
+   // We need to write to the write end of the pipe, not the read end
+-  static std::mutex eventfd_map_mutex;
+-  static std::unordered_map<int, int> eventfd_write_fds;
+-  
+   int write_fd;
+   {
+     std::lock_guard<std::mutex> lock(eventfd_map_mutex);

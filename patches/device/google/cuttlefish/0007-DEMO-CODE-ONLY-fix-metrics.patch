@@ -1,0 +1,137 @@
+From ce1518f2a0f8b65fc8dce698efa35e71c5c66644 Mon Sep 17 00:00:00 2001
+From: Olya Arkhangelskaia <olja@meta.com>
+Date: Wed, 6 Aug 2025 11:46:51 +0100
+Subject: [PATCH 07/63] DEMO CODE ONLY fix metrics
+
+Summary:
+Add macOS support for MAC address retrieval in metrics utils
+This is a part of D77880815.
+
+Implements platform-specific MAC address collection for macOS using BSD-style
+getifaddrs() API instead of Linux ioctl calls. Uses sockaddr_dl structure to
+access link-layer addresses and filters for Ethernet interfaces (IFT_ETHER).
+
+This enables Cuttlefish metrics collection to work on macOS hosts by providing
+the necessary system information for session ID generation and telemetry.
+
+Changes:
+- Add macOS-specific headers (ifaddrs.h, net/if_dl.h, net/if_types.h)
+- Implement getifaddrs()-based MAC address enumeration
+- Use LLADDR() macro to extract hardware addresses from sockaddr_dl
+- Proper memory cleanup with freeifaddrs()
+
+Test Plan:
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+Rollback Plan:
+
+Reviewers: achong, tcare, benthomas
+
+Reviewed By: achong
+
+Subscribers: ryanyu
+
+Differential Revision: https://phabricator.intern.facebook.com/D79718966
+
+Tags: aarch64
+
+Privacy Context Container: L1248481
+---
+ host/commands/metrics/utils.cc | 54 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/host/commands/metrics/utils.cc b/host/commands/metrics/utils.cc
+index 1f03b5312..3d17f53d9 100644
+--- a/host/commands/metrics/utils.cc
++++ b/host/commands/metrics/utils.cc
+@@ -27,6 +27,14 @@
+ #include <ctime>
+ #include <iostream>
+ 
++#ifdef __APPLE__
++#include <ifaddrs.h>
++#include <net/if_dl.h>
++#include <net/if_types.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#endif
++
+ #include "common/libs/utils/tee_logging.h"
+ #include "host/commands/metrics/metrics_defs.h"
+ #include "host/commands/metrics/utils.h"
+@@ -67,6 +75,7 @@ std::string GetOsVersion() {
+ }
+ 
+ std::string GetMacAddress() {
++#ifdef __linux__
+   int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+   if (sock == -1) {
+     LOG(ERROR) << "couldn't connect to socket";
+@@ -79,6 +88,7 @@ std::string GetMacAddress() {
+   ifc.ifc_buf = buf2;
+   if (ioctl(sock, SIOCGIFCONF, &ifc) == -1) {
+     LOG(ERROR) << "couldn't connect to socket";
++    close(sock);
+     return "";
+   }
+ 
+@@ -90,8 +100,8 @@ std::string GetMacAddress() {
+   for (; it != end; ++it) {
+     strcpy(ifr.ifr_name, it->ifr_name);
+     if (ioctl(sock, SIOCGIFFLAGS, &ifr) != 0) {
+-      LOG(ERROR) << "couldn't connect to socket";
+-      return "";
++      LOG(ERROR) << "couldn't get interface flags";
++	continue;
+     }
+     if (ifr.ifr_flags & IFF_LOOPBACK) {
+       continue;
+@@ -106,6 +116,46 @@ std::string GetMacAddress() {
+   sprintf(mac, "%02x:%02x:%02x:%02x:%02x:%02x", mac_address[0], mac_address[1],
+           mac_address[2], mac_address[3], mac_address[4], mac_address[5]);
+   return mac;
++#elif defined(__APPLE__)
++  // macOS implementation using getifaddrs
++  struct ifaddrs* ifap = nullptr;
++  struct ifaddrs* ifaptr = nullptr;
++  unsigned char mac_address[6] = {0};
++  
++  if (getifaddrs(&ifap) != 0) {
++    LOG(ERROR) << "getifaddrs failed";
++    return "";
++  }
++
++  for (ifaptr = ifap; ifaptr != nullptr; ifaptr = ifaptr->ifa_next) {
++    // Skip loopback interfaces
++    if (ifaptr->ifa_flags & IFF_LOOPBACK) {
++      continue;
++    }
++    
++    // Look for link-layer addresses (MAC addresses)
++    if (ifaptr->ifa_addr && ifaptr->ifa_addr->sa_family == AF_LINK) {
++      struct sockaddr_dl* sdl = (struct sockaddr_dl*)ifaptr->ifa_addr;
++      
++      // Check if this is an Ethernet interface (type 6) with 6-byte address
++      if (sdl->sdl_type == IFT_ETHER && sdl->sdl_alen == 6) {
++        memcpy(mac_address, LLADDR(sdl), 6);
++        break;
++      }
++    }
++  }
++  
++  freeifaddrs(ifap);
++
++  char mac[100];
++  sprintf(mac, "%02x:%02x:%02x:%02x:%02x:%02x", mac_address[0], mac_address[1],
++          mac_address[2], mac_address[3], mac_address[4], mac_address[5]);
++  return mac;
++
++#else
++  LOG(ERROR) << "GetMacAddress not implemented for this platform";
++  return "";
++#endif
+ }
+ 
+ std::string GetCompany() {

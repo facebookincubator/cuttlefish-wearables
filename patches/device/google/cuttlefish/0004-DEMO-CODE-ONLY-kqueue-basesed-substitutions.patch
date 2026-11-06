@@ -1,0 +1,262 @@
+From 2964c706c3ee2da0c4247ff280f0ef0f22c55d14 Mon Sep 17 00:00:00 2001
+From: Olya Arkhangelskaia <olja@meta.com>
+Date: Tue, 5 Aug 2025 19:42:46 +0100
+Subject: [PATCH 04/63] [DEMO CODE ONLY] kqueue basesed substitutions
+
+Summary:
+This is a part of D77880815.
+kqueue substitutions
+
+Test Plan:
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+Rollback Plan:
+
+Reviewers: achong, benthomas
+
+Reviewed By: achong
+
+Subscribers: ryanyu
+
+Differential Revision: https://phabricator.intern.facebook.com/D79663716
+
+Tags: aarch64
+
+Privacy Context Container: L1248481
+---
+ common/libs/utils/inotify.cpp    | 103 ++++++++++++++++++++++++++++++-
+ common/libs/utils/subprocess.cpp |  52 +++++++++++++++-
+ common/libs/utils/subprocess.h   |   2 +
+ 3 files changed, 154 insertions(+), 3 deletions(-)
+
+diff --git a/common/libs/utils/inotify.cpp b/common/libs/utils/inotify.cpp
+index 345216f93..cf299240a 100644
+--- a/common/libs/utils/inotify.cpp
++++ b/common/libs/utils/inotify.cpp
+@@ -16,24 +16,84 @@
+ 
+ #include <limits.h>
+ #include <string.h>
+-#include <sys/inotify.h>
+ #include <unistd.h>
+ #include <string>
+ #include <vector>
+ 
++#ifdef __linux__
++#include <sys/inotify.h>
++#elif defined(__APPLE__)
++#include <sys/event.h>
++#include <sys/time.h>
++#include <fcntl.h>
++#include <errno.h>
++#endif
++
+ #include <android-base/logging.h>
+ 
+ #include "inotify.h"
+ 
++#ifdef __APPLE__
++// Define inotify constants for macOS compatibility
++#define IN_ACCESS        0x00000001  /* File was accessed */
++#define IN_MODIFY        0x00000002  /* File was modified */
++#define IN_ATTRIB        0x00000004  /* Metadata changed */
++#define IN_CLOSE_WRITE   0x00000008  /* Writtable file was closed */
++#define IN_CLOSE_NOWRITE 0x00000010  /* Unwrittable file closed */
++#define IN_OPEN          0x00000020  /* File was opened */
++#define IN_MOVED_FROM    0x00000040  /* File was moved from X */
++#define IN_MOVED_TO      0x00000080  /* File was moved to Y */
++#define IN_CREATE        0x00000100  /* Subfile was created */
++#define IN_DELETE        0x00000200  /* Subfile was deleted */
++#define IN_DELETE_SELF   0x00000400  /* Self was deleted */
++#define IN_MOVE_SELF     0x00000800  /* Self was moved */
++
++// Define a compatible inotify_event structure for macOS
++struct inotify_event {
++  int wd;           /* Watch descriptor */
++  uint32_t mask;    /* Mask of events */
++  uint32_t cookie;  /* Unique cookie associating related events */
++  uint32_t len;     /* Length of name field */
++  char name[];      /* Optional null-terminated name */
++};
++
++// Convert kqueue events to inotify-like events
++uint32_t KqueueFilterToInotifyMask(uint32_t kqueue_filter) {
++  uint32_t inotify_mask = 0;
++  
++  if (kqueue_filter & NOTE_DELETE) {
++    inotify_mask |= IN_DELETE;
++  }
++  if (kqueue_filter & NOTE_WRITE) {
++    inotify_mask |= IN_MODIFY;
++  }
++  if (kqueue_filter & NOTE_EXTEND) {
++    inotify_mask |= IN_ACCESS;
++  }
++  if (kqueue_filter & NOTE_ATTRIB) {
++    inotify_mask |= IN_ATTRIB;
++  }
++  if (kqueue_filter & NOTE_RENAME) {
++    inotify_mask |= IN_MOVED_FROM;
++  }
++  
++  return inotify_mask;
++}
++#endif
++
+ namespace cuttlefish {
+ 
+ std::vector<std::string> GetCreatedFileListFromInotifyFd(int fd) {
+   return GetFileListFromInotifyFd(fd, IN_CREATE);
+ }
+-
++#ifdef __linux__
+ #define INOTIFY_MAX_EVENT_SIZE (sizeof(struct inotify_event) + NAME_MAX + 1)
++#elif defined(__APPLE__)
++#define INOTIFY_MAX_EVENT_SIZE (sizeof(struct inotify_event) + NAME_MAX + 1)
++#endif
+ 
+ std::vector<std::string> GetFileListFromInotifyFd(int fd, uint32_t mask) {
++  #ifdef __linux__
+   char event_readout[INOTIFY_MAX_EVENT_SIZE];
+   int bytes_parsed = 0;
+   std::vector<std::string> result;
+@@ -68,6 +128,45 @@ std::vector<std::string> GetFileListFromInotifyFd(int fd, uint32_t mask) {
+   }
+ 
+   return result;
++#elif defined(__APPLE__)
++std::vector<std::string> result;
++  
++  // Use kqueue to read events
++  struct kevent events[10];
++  struct timespec timeout = {0, 0}; // Non-blocking
++  
++  int num_events = kevent(fd, nullptr, 0, events, 10, &timeout);
++  if (num_events == -1) {
++    LOG(ERROR) << __FUNCTION__
++               << ": Couldn't read out kqueue event due to error: '"
++               << strerror(errno) << "' (" << errno << ")";
++    return result;
++  }
++  
++  for (int i = 0; i < num_events; i++) {
++    struct kevent& event = events[i];
++    
++    // Convert kqueue filter flags to inotify mask
++    uint32_t event_mask = KqueueFilterToInotifyMask(event.fflags);
++    
++    if (!(event_mask & mask)) {
++      continue; // Event doesn't match requested mask
++    }
++    
++    // For kqueue, we don't get the filename directly in the event
++    // This is a limitation of the kqueue-based implementation
++    // In a full implementation, we'd need to track filenames separately
++    // For now, we'll return a placeholder indicating an event occurred
++    result.push_back("kqueue_event_detected");
++  }
++  
++  return result;
++#else
++  (void)fd;
++  (void)mask;
++  LOG(ERROR) << __FUNCTION__ << ": inotify not supported on this platform";
++  return std::vector<std::string>();
++#endif
+ }
+ 
+ }  // namespace cuttlefish
+diff --git a/common/libs/utils/subprocess.cpp b/common/libs/utils/subprocess.cpp
+index f0f1d4c0f..b4d69322b 100644
+--- a/common/libs/utils/subprocess.cpp
++++ b/common/libs/utils/subprocess.cpp
+@@ -18,6 +18,9 @@
+ 
+ #ifdef __linux__
+ #include <sys/prctl.h>
++#elif defined(__APPLE__)
++#include <sys/event.h>
++#include <sys/time.h>
+ #endif
+ 
+ #include <errno.h>
+@@ -130,7 +133,7 @@ SubprocessOptions SubprocessOptions::Verbose(bool verbose) && {
+   return std::move(*this);
+ }
+ 
+-#ifdef __linux__
++#if defined(__linux__) || defined(__APPLE__)
+ SubprocessOptions& SubprocessOptions::ExitWithParent(bool v) & {
+   exit_with_parent_ = v;
+   return *this;
+@@ -431,6 +434,53 @@ Subprocess Command::Start(SubprocessOptions options) const {
+     if (options.ExitWithParent()) {
+       prctl(PR_SET_PDEATHSIG, SIGHUP); // Die when parent dies
+     }
++// MacOS variation of ExitWithParent
++#elif defined(__APPLE__)
++    if (options.ExitWithParent()) {
++      // macOS doesn't have prctl(PR_SET_PDEATHSIG), so we implement
++      // exit-with-parent using kqueue to monitor the parent process
++      pid_t parent_pid = getppid();
++      
++      // Create a kqueue to monitor parent process
++      int kq = kqueue();
++      if (kq != -1) {
++        struct kevent kev;
++        // Monitor parent process for exit
++        EV_SET(&kev, parent_pid, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, NULL);
++        
++        if (kevent(kq, &kev, 1, NULL, 0, NULL) == 0) {
++          // Fork a monitoring process to watch for parent exit
++          pid_t monitor_pid = fork();
++          if (monitor_pid == 0) {
++            // Monitor child process - wait for parent to exit
++            struct kevent event;
++            int nev = kevent(kq, NULL, 0, &event, 1, NULL);
++            close(kq);
++            if (nev > 0 && event.filter == EVFILT_PROC && event.fflags & NOTE_EXIT) {
++              // Parent exited, kill the main child process
++              kill(getppid(), SIGTERM);
++            }
++            _exit(0);
++          } else if (monitor_pid > 0) {
++            // Main child process continues normally
++            close(kq);
++          } else {
++            // Fork failed, fall back to simple polling
++            close(kq);
++            pid_t simple_monitor = fork();
++            if (simple_monitor == 0) {
++              while (kill(parent_pid, 0) == 0) {
++                usleep(500000); // Check every 500ms
++              }
++              kill(getppid(), SIGTERM);
++              _exit(0);
++            }
++          }
++        } else {
++          close(kq);
++        }
++      }
++    }
+ #endif
+ 
+     do_redirects(redirects_);
+diff --git a/common/libs/utils/subprocess.h b/common/libs/utils/subprocess.h
+index 37521a126..b3e62d49e 100644
+--- a/common/libs/utils/subprocess.h
++++ b/common/libs/utils/subprocess.h
+@@ -110,8 +110,10 @@ class SubprocessOptions {
+       : verbose_(true), exit_with_parent_(true), in_group_(false) {}
+   SubprocessOptions& Verbose(bool verbose) &;
+   SubprocessOptions Verbose(bool verbose) &&;
++#if defined(__linux__) || defined(__APPLE__)
+   SubprocessOptions& ExitWithParent(bool exit_with_parent) &;
+   SubprocessOptions ExitWithParent(bool exit_with_parent) &&;
++#endif
+   SubprocessOptions& SandboxArguments(std::vector<std::string>) &;
+   SubprocessOptions SandboxArguments(std::vector<std::string>) &&;
+   // The subprocess runs as head of its own process group.

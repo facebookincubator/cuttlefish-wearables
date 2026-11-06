@@ -1,0 +1,280 @@
+From 2b011f381fb4668e6dcdb6bdd9a8f8eff8344b10 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 4 Mar 2026 10:49:44 -1000
+Subject: [PATCH 43/63] [cuttlefish] Make WebRTC signaling server per-instance
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+# Motivation:
+Developers running multiple emulator types simultaneously on macOS need each instance to have its own WebRTC signaling server. Previously, only the first instance started the signaling server, so stopping it broke WebRTC streaming for all other instances.
+
+```
+  BEFORE (shared signaling server):   AFTER (per-instance servers):
+
+  run_cvd (instance 1)                run_cvd (instance 1)
+       |                                   |
+       v                                   v
+  sig_server :8443 <── all instances  sig_server :8443 <── instance 1
+       |
+       X (stop instance 1)            run_cvd (instance 2)
+       |                                   |
+  instances 2..N lose WebRTC!              v
+                                      sig_server :8444 <── instance 2
+```
+
+# Overview:
+Move sig_server_port from global CuttlefishConfig to per-instance InstanceSpecific config. Each instance now gets its own signaling server port (8443 + instance_num - 1) and can independently start its own signaling server. Use gflags::GetCommandLineFlagInfoOrDie to detect explicit --webrtc_sig_server_port vs default, ensuring per-instance ports are assigned correctly. Updated all consumers: streamer.cpp, webrtc/main.cpp, status/main.cc, and flags.cc.
+
+Test Plan:
+```
+ AOSP % . build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+localhost:8443
+localhost:8444
+
+Reviewers: guolinliu, <internal-group>, ivantsou, jeffreyeffendy
+
+Reviewed By: guolinliu
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D96518707
+
+Tags: aarch64
+---
+ host/commands/assemble_cvd/assemble_cvd.cc      |  4 ++++
+ host/commands/assemble_cvd/flags.cc             | 17 ++++++++++-------
+ host/commands/run_cvd/launch/streamer.cpp       |  6 +++---
+ host/commands/status/main.cc                    |  2 +-
+ host/frontend/webrtc/libdevice/streamer.h       |  4 ++--
+ host/frontend/webrtc/main.cpp                   |  2 +-
+ .../frontend/webrtc_operator/device_handler.cpp | 11 ++++++-----
+ host/libs/config/cuttlefish_config.cpp          |  8 --------
+ host/libs/config/cuttlefish_config.h            |  9 ++++-----
+ host/libs/config/cuttlefish_config_instance.cpp |  8 ++++++++
+ 10 files changed, 39 insertions(+), 32 deletions(-)
+
+diff --git a/host/commands/assemble_cvd/assemble_cvd.cc b/host/commands/assemble_cvd/assemble_cvd.cc
+index 0a99ea01c..e7b625e5d 100644
+--- a/host/commands/assemble_cvd/assemble_cvd.cc
++++ b/host/commands/assemble_cvd/assemble_cvd.cc
+@@ -177,6 +177,10 @@ Result<void> CreateLegacySymlinks(
+   const auto legacy_mac80211_uds_path =
+       instance.PerInstanceInternalPath(mac80211_uds_name);
+ 
++  if (FileExists(legacy_mac80211_uds_path, /* follow_symlinks */ false)) {
++    CF_EXPECT(RemoveFile(legacy_mac80211_uds_path),
++              "Failed to remove symlink " << legacy_mac80211_uds_path);
++  }
+   if (symlink(mac80211_uds_path.c_str(), legacy_mac80211_uds_path.c_str())) {
+     return CF_ERRNO("symlink(\"" << mac80211_uds_path << "\", \""
+                                  << legacy_mac80211_uds_path << "\") failed");
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index 838e7efa5..c44a8dc5f 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -1185,8 +1185,6 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+   // streaming, webrtc setup
+   tmp_config_obj.set_webrtc_certs_dir(FLAGS_webrtc_certs_dir);
+   tmp_config_obj.set_sig_server_secure(FLAGS_webrtc_sig_server_secure);
+-  // Note: This will be overridden if the sig server is started by us
+-  tmp_config_obj.set_sig_server_port(FLAGS_webrtc_sig_server_port);
+   tmp_config_obj.set_sig_server_address(FLAGS_webrtc_sig_server_addr);
+   tmp_config_obj.set_sig_server_path(FLAGS_webrtc_sig_server_path);
+   tmp_config_obj.set_sig_server_strict(FLAGS_verify_sig_server_certificate);
+@@ -1946,14 +1944,19 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+ 
+     instance.set_group_id(FLAGS_group_id);
+ 
+-    if (!is_first_instance || !start_webrtc_vec[instance_index]) {
+-      // Only the first instance starts the signaling server or proxy
++    // Each instance gets its own signaling server port so they can be
++    // started and stopped independently. Only use the flag value if
++    // explicitly set by the user; otherwise assign per-instance ports.
++    auto sig_port_info =
++        gflags::GetCommandLineFlagInfoOrDie("webrtc_sig_server_port");
++    auto port = sig_port_info.is_default ? 8443 + num - 1
++                                         : FLAGS_webrtc_sig_server_port;
++    instance.set_sig_server_port(port);
++
++    if (!start_webrtc_vec[instance_index]) {
+       instance.set_start_webrtc_signaling_server(false);
+       instance.set_start_webrtc_sig_server_proxy(false);
+     } else {
+-      auto port = 8443 + num - 1;
+-      // Change the signaling server port for all instances
+-      tmp_config_obj.set_sig_server_port(port);
+       // Either the signaling server or the proxy is started, never both
+       instance.set_start_webrtc_signaling_server(FLAGS_start_webrtc_sig_server);
+       // The proxy is only started if the host operator is available
+diff --git a/host/commands/run_cvd/launch/streamer.cpp b/host/commands/run_cvd/launch/streamer.cpp
+index 2b3887ba5..b413830fa 100644
+--- a/host/commands/run_cvd/launch/streamer.cpp
++++ b/host/commands/run_cvd/launch/streamer.cpp
+@@ -224,7 +224,7 @@ class WebRtcServer : public virtual CommandSource,
+     }
+     std::ostringstream out;
+     out << "Point your browser to https://localhost:"
+-        << config_.sig_server_port() << " to interact with the device.";
++        << instance_.sig_server_port() << " to interact with the device.";
+     return {out.str()};
+   }
+ 
+@@ -239,13 +239,13 @@ class WebRtcServer : public virtual CommandSource,
+       if (!config_.webrtc_certs_dir().empty()) {
+         sig_server.AddParameter("-certs_dir=", config_.webrtc_certs_dir());
+       }
+-      sig_server.AddParameter("-http_server_port=", config_.sig_server_port());
++      sig_server.AddParameter("-http_server_port=", instance_.sig_server_port());
+       commands.emplace_back(std::move(sig_server));
+     }
+ 
+     if (instance_.start_webrtc_sig_server_proxy()) {
+       Command sig_proxy(WebRtcSigServerProxyBinary());
+-      sig_proxy.AddParameter("-server_port=", config_.sig_server_port());
++      sig_proxy.AddParameter("-server_port=", instance_.sig_server_port());
+       commands.emplace_back(std::move(sig_proxy));
+     }
+ 
+diff --git a/host/commands/status/main.cc b/host/commands/status/main.cc
+index 4e284f01d..41861384c 100644
+--- a/host/commands/status/main.cc
++++ b/host/commands/status/main.cc
+@@ -99,7 +99,7 @@ Json::Value PopulateDevicesInfoFromInstance(
+       CalcWebAccessUrl({.sig_server_addr = config.sig_server_address(),
+                         .webrtc_device_id = webrtc_device_id});
+   device_info["adb_serial"] = instance_config.adb_ip_and_port();
+-  device_info["webrtc_port"] = std::to_string(config.sig_server_port());
++  device_info["webrtc_port"] = std::to_string(instance_config.sig_server_port());
+   for (int i = 0; i < instance_config.display_configs().size(); i++) {
+     device_info["displays"][i] =
+         std::to_string(instance_config.display_configs()[i].width) + " x " +
+diff --git a/host/frontend/webrtc/libdevice/streamer.h b/host/frontend/webrtc/libdevice/streamer.h
+index 8dc9a8899..69fafcd11 100644
+--- a/host/frontend/webrtc/libdevice/streamer.h
++++ b/host/frontend/webrtc/libdevice/streamer.h
+@@ -51,8 +51,8 @@ struct StreamerConfig {
+   ServerConfig operator_server;
+   // The port ranges webrtc is allowed to use.
+   // [0,0] means all ports
+-  std::pair<uint16_t, uint16_t> udp_port_range = {15550, 15599};
+-  std::pair<uint16_t, uint16_t> tcp_port_range = {15550, 15599};
++  std::pair<uint16_t, uint16_t> udp_port_range = {15550, 15999};
++  std::pair<uint16_t, uint16_t> tcp_port_range = {15550, 15999};
+   // WebRTC device id obtaining openwrt instance.
+   std::string openwrt_device_id;
+   // Openwrt IP address for accessing Luci interface.
+diff --git a/host/frontend/webrtc/main.cpp b/host/frontend/webrtc/main.cpp
+index 9127cfcc3..b283c7e06 100644
+--- a/host/frontend/webrtc/main.cpp
++++ b/host/frontend/webrtc/main.cpp
+@@ -277,7 +277,7 @@ int CuttlefishMain() {
+   streamer_config.control_env_proxy_server_path =
+       instance.grpc_socket_path() + "/ControlEnvProxyServer.sock";
+   streamer_config.operator_server.addr = cvd_config->sig_server_address();
+-  streamer_config.operator_server.port = cvd_config->sig_server_port();
++  streamer_config.operator_server.port = instance.sig_server_port();
+   streamer_config.operator_server.path = cvd_config->sig_server_path();
+   if (cvd_config->sig_server_secure()) {
+     streamer_config.operator_server.security =
+diff --git a/host/frontend/webrtc_operator/device_handler.cpp b/host/frontend/webrtc_operator/device_handler.cpp
+index af503d4bd..2cb732a12 100644
+--- a/host/frontend/webrtc_operator/device_handler.cpp
++++ b/host/frontend/webrtc_operator/device_handler.cpp
+@@ -62,15 +62,16 @@ void DeviceHandler::HandleRegistrationRequest(const Json::Value& message) {
+     Close();
+     return;
+   }
+-  device_id_ = message[webrtc_signaling::kDeviceIdField].asString();
+-  if (message.isMember(webrtc_signaling::kDeviceInfoField)) {
+-    device_info_ = message[webrtc_signaling::kDeviceInfoField];
+-  }
+-  if (!registry_->RegisterDevice(device_id_, weak_from_this())) {
++  auto id = message[webrtc_signaling::kDeviceIdField].asString();
++  if (!registry_->RegisterDevice(id, weak_from_this())) {
+     LOG(ERROR) << "Device registration failed";
+     Close();
+     return;
+   }
++  device_id_ = std::move(id);
++  if (message.isMember(webrtc_signaling::kDeviceInfoField)) {
++    device_info_ = message[webrtc_signaling::kDeviceInfoField];
++  }
+ 
+   SendServerConfig();
+ }
+diff --git a/host/libs/config/cuttlefish_config.cpp b/host/libs/config/cuttlefish_config.cpp
+index 9a9358daa..0bf5011e8 100644
+--- a/host/libs/config/cuttlefish_config.cpp
++++ b/host/libs/config/cuttlefish_config.cpp
+@@ -173,14 +173,6 @@ std::string CuttlefishConfig::webrtc_certs_dir() const {
+   return (*dictionary_)[kWebRTCCertsDir].asString();
+ }
+ 
+-static constexpr char kSigServerPort[] = "webrtc_sig_server_port";
+-void CuttlefishConfig::set_sig_server_port(int port) {
+-  (*dictionary_)[kSigServerPort] = port;
+-}
+-int CuttlefishConfig::sig_server_port() const {
+-  return (*dictionary_)[kSigServerPort].asInt();
+-}
+-
+ static constexpr char kSigServerAddress[] = "webrtc_sig_server_addr";
+ void CuttlefishConfig::set_sig_server_address(const std::string& addr) {
+   (*dictionary_)[kSigServerAddress] = addr;
+diff --git a/host/libs/config/cuttlefish_config.h b/host/libs/config/cuttlefish_config.h
+index 1cf3a9ecd..54ece703f 100644
+--- a/host/libs/config/cuttlefish_config.h
++++ b/host/libs/config/cuttlefish_config.h
+@@ -234,11 +234,6 @@ class CuttlefishConfig {
+   void set_webrtc_certs_dir(const std::string& certs_dir);
+   std::string webrtc_certs_dir() const;
+ 
+-  // The port for the webrtc signaling server. It's used by the signaling server
+-  // to bind to it and by the webrtc process to connect to and register itself
+-  void set_sig_server_port(int port);
+-  int sig_server_port() const;
+-
+   // The address of the signaling server
+   void set_sig_server_address(const std::string& addr);
+   std::string sig_server_address() const;
+@@ -520,6 +515,9 @@ class CuttlefishConfig {
+     // Whether this instance should start the webrtc signaling server
+     bool start_webrtc_sig_server() const;
+ 
++    // The port for the webrtc signaling server
++    int sig_server_port() const;
++
+     // Whether to start a reverse proxy to the webrtc signaling server already
+     // running in the host
+     bool start_webrtc_sig_server_proxy() const;
+@@ -813,6 +811,7 @@ class CuttlefishConfig {
+     void set_webrtc_device_id(const std::string& id);
+     void set_group_id(const std::string& id);
+     void set_start_webrtc_signaling_server(bool start);
++    void set_sig_server_port(int port);
+     void set_start_webrtc_sig_server_proxy(bool start);
+     void set_start_rootcanal(bool start);
+     void set_start_casimir(bool start);
+diff --git a/host/libs/config/cuttlefish_config_instance.cpp b/host/libs/config/cuttlefish_config_instance.cpp
+index 49741af4b..def942b44 100644
+--- a/host/libs/config/cuttlefish_config_instance.cpp
++++ b/host/libs/config/cuttlefish_config_instance.cpp
+@@ -1935,6 +1935,14 @@ bool CuttlefishConfig::InstanceSpecific::start_webrtc_sig_server() const {
+   return (*Dictionary())[kStartSigServer].asBool();
+ }
+ 
++static constexpr char kSigServerPort[] = "webrtc_sig_server_port";
++void CuttlefishConfig::MutableInstanceSpecific::set_sig_server_port(int port) {
++  (*Dictionary())[kSigServerPort] = port;
++}
++int CuttlefishConfig::InstanceSpecific::sig_server_port() const {
++  return (*Dictionary())[kSigServerPort].asInt();
++}
++
+ static constexpr char kStartSigServerProxy[] = "webrtc_start_sig_server_proxy";
+ void CuttlefishConfig::MutableInstanceSpecific::
+     set_start_webrtc_sig_server_proxy(bool start) {

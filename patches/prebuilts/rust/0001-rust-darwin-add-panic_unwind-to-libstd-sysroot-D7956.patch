@@ -1,0 +1,35 @@
+From 6478e9536c9a4371e0e73ccc6ab31fd970760c91 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 27 Jul 2026 16:27:28 -0700
+Subject: [PATCH] rust: darwin: add panic_unwind to libstd sysroot (D79568265)
+
+libstd only pulled libpanic_unwind.rust_sysroot for linux_musl. macOS uses
+the unwind panic strategy, so the from-source darwin sysroot needs the
+panic_unwind crate too; without it rustc reports E0463 (can't find crate for
+panic_unwind). Add a darwin target block mirroring linux_musl.
+---
+ Android.bp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/Android.bp b/Android.bp
+index 9630f12..e8c305c 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -364,6 +364,14 @@ rust_toolchain_library {
+                 "libpanic_unwind.rust_sysroot",
+             ],
+         },
++        darwin: {
++            // macOS host uses the unwind panic strategy, so std must pull in
++            // the panic_unwind crate (built from source alongside libunwind).
++            rlibs: [
++                "libpanic_abort.rust_sysroot",
++                "libpanic_unwind.rust_sysroot",
++            ],
++        },
+         android: {
+             rlibs: ["libpanic_abort.rust_sysroot"],
+         },
+-- 
+2.50.1
+

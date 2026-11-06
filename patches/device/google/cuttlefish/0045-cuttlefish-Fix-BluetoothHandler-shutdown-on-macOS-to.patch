@@ -1,0 +1,68 @@
+From 98a5fc0ce49f7adfb13b1973f6a843ee52f3b23e Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 19 Mar 2026 14:43:47 -0700
+Subject: [PATCH 45/63] [cuttlefish] Fix BluetoothHandler shutdown on macOS to
+ prevent thread leak
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+# Motivation:
+
+Same bug as adbhandler. Refreshing webrtc page will eventually freeze and fail to reconnect.
+
+# Overview:
+- use EventfdWrite() which looks up the pipe's write end from an internal map. This is backwards compatible — on Linux, EventfdWrite() calls the native eventfd_write() which works identically.
+
+Test Plan:
+# before:
+refresh webrtc page like crazy, fails to connect after 5 times
+
+# after:
+rebuild host tools
+```
+cd /Volumes/AOSP && source build/envsetup.sh && lunch aosp_cf_arm64_phone-userdebug && m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+```
+rm -r bin com.android.i18n lib64 nativetest64/ framework etc usr
+ln -s  /Volumes/AOSP/out/host/darwin-x86/cvd-host_package/*
+start_cuttlefish.py
+```
+
+{F1987038615}
+
+refresh webrtc page like crazy, still works
+
+Reviewers: shaochi, <internal-group>, drahul
+
+Reviewed By: shaochi
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D97374840
+
+Tags: aarch64
+---
+ host/frontend/webrtc/bluetooth_handler.cpp | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/host/frontend/webrtc/bluetooth_handler.cpp b/host/frontend/webrtc/bluetooth_handler.cpp
+index be5710bda..da062761f 100644
+--- a/host/frontend/webrtc/bluetooth_handler.cpp
++++ b/host/frontend/webrtc/bluetooth_handler.cpp
+@@ -37,9 +37,10 @@ BluetoothHandler::BluetoothHandler(
+ }
+ 
+ BluetoothHandler::~BluetoothHandler() {
+-  // Send a message to the looper to shut down.
+-  uint64_t v = 1;
+-  shutdown_->Write(&v, sizeof(v));
++  // Signal the ReadLoop to exit. Must use EventfdWrite (not Write) because
++  // on macOS, Event() is emulated with a pipe and the SharedFD wraps the
++  // read end — Write() to the read end silently fails.
++  shutdown_->EventfdWrite(1);
+   // Shut down the socket as well.  Not strictly necessary.
+   rootcanal_socket_->Shutdown(SHUT_RDWR);
+   read_thread_.join();

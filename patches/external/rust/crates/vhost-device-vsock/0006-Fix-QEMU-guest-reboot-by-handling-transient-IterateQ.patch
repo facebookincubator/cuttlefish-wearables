@@ -1,0 +1,118 @@
+From 5d3cdfd114bca320f06f131783a6ef43cf00310f Mon Sep 17 00:00:00 2001
+From: jeffreyeffendy <jeffreyeffendy@fb.com>
+Date: Sun, 29 Mar 2026 18:12:47 -0700
+Subject: [PATCH 6/6] Fix QEMU guest reboot by handling transient IterateQueue
+ errors
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+When QEMU performs an in-place guest reset (e.g. via `adb reboot`), the
+vrings are temporarily in an invalid state while QEMU re-initializes them.
+During this transient period, `process_tx()` and `process_rx()` fail with
+`Error::IterateQueue` because the vring queue memory cannot be iterated.
+
+Previously, these errors propagated up and terminated the event handler,
+killing vhost_device_vsock entirely. Since process_restarter then restarts
+it, the new instance has no connection to QEMU and vsock connections from
+the host to the guest permanently fail — making the device unreachable
+via adb after reboot.
+
+This change catches `IterateQueue` errors in the BACKEND_EVENT and RX
+processing paths and logs them as warnings instead of propagating them.
+Once QEMU finishes re-initializing the vrings (typically within seconds),
+the errors stop and normal vsock operation resumes. This allows the
+device to remain reachable via adb across guest reboots on QEMU-based
+targets (e.g. arm64 cuttlefish on macOS).
+
+Test Plan:
+Start <device> emulator
+```
+$ . build/envsetup.sh
+$ lunch aosp_cf_arm64_phone-userdebug
+$ m out/host/darwin-x86/cvd-host_package.tar.gz
+...
+#### build completed successfully (58 seconds) ####
+
+$ device device virtual -t <device> --cache-only
+$ cd ~/.device/cache/emulators/<device>_cf_emu_arm64-15910000003901-1644523956582521
+$ ln -s ~/cvd-tools/out/host/darwin-x86/cvd-host_package/* .
+$ ./start_cuttlefish.py
+...
+VIRTUAL_DEVICE_BOOT_STARTED
+VIRTUAL_DEVICE_NETWORK_ETHERNET_CONNECTED
+VIRTUAL_DEVICE_BOOT_COMPLETED
+Virtual device booted successfully
+```
+
+Then reboot it
+```
+$ adb reboot
+$ adb devices -l
+0.0.0.0:6520           device product:<device>_cf_emu_arm64 model:<device>_Cuttlefish_arm64 device:<device>_cf_emu_arm64 transport_id:137
+
+$ adb shell getprop sys.boot_completed
+1
+```
+
+Reviewers: josephknox, achong, #cuttlefish-cross-platform
+
+Reviewed By: josephknox
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D98689756
+
+Tasks: T257338183
+
+Tags: aarch64
+---
+ src/vhu_vsock.rs | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/vhu_vsock.rs b/src/vhu_vsock.rs
+index 207a9b5..2898008 100644
+--- a/src/vhu_vsock.rs
++++ b/src/vhu_vsock.rs
+@@ -7,7 +7,7 @@ use std::{
+     u16, u32, u64, u8,
+ };
+ 
+-use log::warn;
++use log::{trace, warn};
+ use thiserror::Error as ThisError;
+ use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
+ use vhost_user_backend::{VhostUserBackend, VringRwLock};
+@@ -320,6 +320,12 @@ impl VhostUserBackend for VhostUserVsockBackend {
+                 thread.process_backend_evt(evset);
+                 if let Err(e) = thread.process_tx(vring_tx, evt_idx) {
+                     match e {
++                        Error::IterateQueue => {
++                            // It's the transient period where QEMU is re-initializing
++                            // the vrings after guest reboot
++                            // Using lowest level for logging to avoid spamming the logs
++                            trace!("Error processing TX: {:?}", e);
++                        }
+                         Error::NoMemoryConfigured => {
+                             warn!("Received a backend event before vring initialization")
+                         }
+@@ -338,7 +344,17 @@ impl VhostUserBackend for VhostUserVsockBackend {
+         }
+ 
+         if device_event != EVT_QUEUE_EVENT {
+-            thread.process_rx(vring_rx, evt_idx)?;
++            if let Err(e) = thread.process_rx(vring_rx, evt_idx) {
++                match e {
++                    Error::IterateQueue => {
++                        // It's the transient period where QEMU is re-initializing
++                        // the vrings after guest reboot
++                        // Using lowest level for logging to avoid spamming the logs
++                        trace!("Error processing RX: {:?}", e);
++                    }
++                    _ => return Err(e.into()),
++                }
++            }
+         }
+ 
+         Ok(())

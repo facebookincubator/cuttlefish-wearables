@@ -1,0 +1,34 @@
+From 6fca9a33e41093ecb703d8fa44ceade44612f0c5 Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Tue, 4 Nov 2025 15:37:26 -0800
+Subject: [PATCH 10/11] Remove unused runtime import
+
+Summary: Forgot to remove this when I disabled the Metalava runtime check.
+
+Test Plan: NINJA_REMOTE_NUM_JOBS=100 m out/host/darwin-x86/cvd-host_package.tar.gz -k
+
+Rollback Plan:
+
+Reviewers: achong, olja, benthomas
+
+Reviewed By: achong
+
+Subscribers: ilyatsunaev, jmgao, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D86250425
+---
+ java/droidstubs.go | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/java/droidstubs.go b/java/droidstubs.go
+index cdee96494..b30c8448a 100644
+--- a/java/droidstubs.go
++++ b/java/droidstubs.go
+@@ -18,7 +18,6 @@ import (
+ 	"fmt"
+ 	"path/filepath"
+ 	"regexp"
+-	"runtime"
+ 	"strings"
+ 
+ 	"github.com/google/blueprint"

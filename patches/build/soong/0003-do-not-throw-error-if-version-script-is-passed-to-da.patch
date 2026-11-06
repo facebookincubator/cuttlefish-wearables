@@ -1,0 +1,50 @@
+From 6c31e5e2899606e84a66326957ff2e73ec13a314 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:39:33 -0700
+Subject: [PATCH 03/11] do not throw error if version script is passed to
+ darwin
+
+Summary:
+# Motivation:
+One of the rust libraries used by cuttlefish host utils uses the version script argument in the .bp file. This causes the build to fail.
+
+# Overview:
+- remove throwing an error if version script is included on darwin
+
+Normally build/soong should not be modified like this, but this change is exclusively for the darwin host utils branch.
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ilyatsunaev, jmgao, ryanyu, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D79567136
+
+Tags: aarch64
+---
+ cc/linker.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/cc/linker.go b/cc/linker.go
+index 3d807a2db..fe3dbc800 100644
+--- a/cc/linker.go
++++ b/cc/linker.go
+@@ -592,7 +592,7 @@ func (linker *baseLinker) linkerFlags(ctx ModuleContext, flags Flags) Flags {
+ 
+ 		if versionScript.Valid() {
+ 			if ctx.Darwin() {
+-				ctx.AddMissingDependencies([]string{"version_script_not_supported_on_darwin"})
++				// ctx.AddMissingDependencies([]string{"version_script_not_supported_on_darwin"})
+ 			} else {
+ 				flags.Local.LdFlags = append(flags.Local.LdFlags,
+ 					config.VersionScriptFlagPrefix+versionScript.String())

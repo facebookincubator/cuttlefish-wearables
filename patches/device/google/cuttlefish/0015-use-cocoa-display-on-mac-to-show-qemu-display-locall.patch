@@ -1,0 +1,67 @@
+From 7b9ed71810e512f06916461185fd0ce97aa0a69d Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 11 Aug 2025 15:02:55 -0700
+Subject: [PATCH 15/63] use cocoa display on mac to show qemu display locally
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+# Motivation:
+I don't want to install vnc and figure it out 😁
+
+# Overview:
+- use display cocoa on mac
+
+Test Plan:
+# Build Host Tools
+```
+ . build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+unset TMPDIR
+HOME=/Users/achong/n-16/out/host/darwin-x86 out/host/darwin-x86/bin/launch_cvd  \
+--use-overlay=false --vm_manager=qemu_cli  --system_image_dir=/Users/achong/n-16/out/host/darwin-x86 \
+--qemu_binary_dir=/Users/achong/qemu/build --enable-audio=false \
+--enable_host_uwb=false -console=true --start_webrtc=true \
+-device_external_network=slirp \
+--enable_dev_qemu_monitor=true \
+--vhost_user_vsock
+
+```
+
+Rollback Plan:
+
+Reviewers: tcare, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: tcare
+
+Subscribers: ryanyu, <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D80041399
+---
+ host/libs/vm_manager/qemu_manager.cpp | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 1908bd2b6..6260d03b7 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -455,8 +455,13 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+              gpu_mode == kGpuModeGfxstreamGuestAngle ||
+              gpu_mode == kGpuModeGfxstreamGuestAngleHostSwiftShader ||
+              gpu_mode == kGpuModeGfxstreamGuestAngleHostLavapipe) {
+-    qemu_cmd.AddParameter("-vnc");
+-    qemu_cmd.AddParameter("127.0.0.1:", instance.qemu_vnc_server_port());
++#ifdef __APPLE__
++  qemu_cmd.AddParameter("-display");
++  qemu_cmd.AddParameter("cocoa");
++#else
++  qemu_cmd.AddParameter("-vnc");
++  qemu_cmd.AddParameter("127.0.0.1:", instance.qemu_vnc_server_port());
++#endif
+   } else {
+     qemu_cmd.AddParameter("-display");
+     qemu_cmd.AddParameter("none");

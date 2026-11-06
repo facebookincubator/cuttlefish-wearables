@@ -1,0 +1,157 @@
+From 6347a60e32f2f25bc8a57c6c9b206f051b6d7321 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 27 Jan 2026 14:46:05 -0800
+Subject: [PATCH 31/63] add back streamer and vhost_input_devices
+
+Summary:
+# Motivation:
+We want to support webrtc on macos.
+
+# Overview:
+- add back streamer, vhost input device components
+
+Test Plan:
+# Build host tools on mac host
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+# Launch:
+```
+# in device cache folder
+ln -s /Volumes/AOSP/out/host/darwin-x86/cvd-host_package/* .
+./start_cuttlefish.py
+```
+
+Rollback Plan:
+
+Reviewers: josephknox, <internal-group>, #cuttlefish-cross-platform, benthomas
+
+Reviewed By: josephknox
+
+Subscribers: <internal-group>
+
+Differential Revision: https://phabricator.intern.facebook.com/D91631172
+
+Tags: aarch64
+---
+ host/commands/run_cvd/Android.bp              |  6 ++----
+ host/commands/run_cvd/launch/streamer.cpp     |  8 +++++---
+ .../run_cvd/launch/vhost_input_devices.cpp    | 19 ++++++++++--------
+ host/commands/run_cvd/main.cc                 | 20 +++++++++----------
+ 4 files changed, 28 insertions(+), 25 deletions(-)
+
+diff --git a/host/commands/run_cvd/Android.bp b/host/commands/run_cvd/Android.bp
+index 33e2c2391..a0b3cd437 100644
+--- a/host/commands/run_cvd/Android.bp
++++ b/host/commands/run_cvd/Android.bp
+@@ -47,6 +47,8 @@ cc_binary_host {
+         "launch/streamer.cpp",
+         "launch/uwb_connector.cpp",
+         "launch/vhal_proxy_server.cpp",
++        "launch/vhost_device_vsock.cpp",
++        "launch/vhost_input_devices.cpp",
+         "launch/webrtc_controller.cpp",
+         "main.cc",
+         "reporting.cpp",
+@@ -106,8 +108,6 @@ cc_binary_host {
+                 // "launch/open_wrt.cpp",
+                 // "launch/ti50_emulator.cpp",
+                 // "launch/tombstone_receiver.cpp",
+-                "launch/vhost_device_vsock.cpp",
+-                // "launch/vhost_input_devices.cpp",
+                 // "launch/wmediumd_server.cpp",
+             ],
+         },
+@@ -123,8 +123,6 @@ cc_binary_host {
+                 "launch/open_wrt.cpp",
+                 "launch/ti50_emulator.cpp",
+                 "launch/tombstone_receiver.cpp",
+-                "launch/vhost_device_vsock.cpp",
+-                "launch/vhost_input_devices.cpp",
+                 "launch/wmediumd_server.cpp",
+             ],
+         },
+diff --git a/host/commands/run_cvd/launch/streamer.cpp b/host/commands/run_cvd/launch/streamer.cpp
+index 2050f3ba9..58d5a0ea5 100644
+--- a/host/commands/run_cvd/launch/streamer.cpp
++++ b/host/commands/run_cvd/launch/streamer.cpp
+@@ -107,9 +107,11 @@ class StreamerSockets : public virtual SetupFeature {
+            input_connections_provider_.TouchpadConnections()) {
+         touch_connections.push_back(touchpad_connection);
+       }
+-      cmd.AddParameter("-touch_fds=", touch_connections[0]);
+-      for (int i = 1; i < touch_connections.size(); ++i) {
+-        cmd.AppendToLastParameter(",", touch_connections[i]);
++      if (!touch_connections.empty()) {
++        cmd.AddParameter("-touch_fds=", touch_connections[0]);
++        for (int i = 1; i < touch_connections.size(); ++i) {
++          cmd.AppendToLastParameter(",", touch_connections[i]);
++        }
+       }
+     }
+     if (instance_.enable_mouse()) {
+diff --git a/host/commands/run_cvd/launch/vhost_input_devices.cpp b/host/commands/run_cvd/launch/vhost_input_devices.cpp
+index 8493ca27b..009123d0d 100644
+--- a/host/commands/run_cvd/launch/vhost_input_devices.cpp
++++ b/host/commands/run_cvd/launch/vhost_input_devices.cpp
+@@ -57,14 +57,17 @@ Result<DeviceSockets> NewDeviceSockets(const std::string& vhu_server_path) {
+ 
+   // The webRTC process currently doesn't read status updates from input
+   // devices, so the vhost processes will write that to /dev/null.
+-  // These calls shouldn't return errors since we already know these are a newly
+-  // created socket pair.
+-  CF_EXPECTF(ret.device_end->Shutdown(SHUT_WR) == 0,
+-             "Failed to close input connection's device for writes: {}",
+-             ret.device_end->StrError());
+-  CF_EXPECTF(ret.streamer_end->Shutdown(SHUT_RD) == 0,
+-             "Failed to close input connection's streamer end for reads: {}",
+-             ret.streamer_end->StrError());
++  // On Linux, shutdown succeeds on Unix socket pairs. On macOS, shutdown
++  // returns ENOTCONN for unconnected Unix sockets. Since these are freshly
++  // created socket pairs, we can safely ignore ENOTCONN errors.
++  if (ret.device_end->Shutdown(SHUT_WR) == 0 && ret.device_end->GetErrno() == ENOTCONN) {
++    return CF_ERRF("Failed to close input connection's device for writes: {}",
++                   ret.device_end->StrError());
++  }
++  if (ret.streamer_end->Shutdown(SHUT_RD) == 0 && ret.streamer_end->GetErrno() == ENOTCONN) {
++    return CF_ERRF("Failed to close input connection's streamer end for reads: {}",
++                   ret.streamer_end->StrError());
++  }
+ 
+   ret.vhu_server =
+       SharedFD::SocketLocalServer(vhu_server_path, false, SOCK_STREAM, 0600);
+diff --git a/host/commands/run_cvd/main.cc b/host/commands/run_cvd/main.cc
+index c86413549..5efe29cb9 100644
+--- a/host/commands/run_cvd/main.cc
++++ b/host/commands/run_cvd/main.cc
+@@ -134,17 +134,17 @@ fruit::Component<> runCvdComponent(
+       .bindInstance(*environment)
+       .install(AutoCmd<ConfigServer>::Component)
+       .install(AutoCmd<ModemSimulator>::Component)
+-//#ifdef __linux__
+-      // .install(AutoCmd<AutomotiveProxyService>::Component)
+-      // .install(AutoCmd<TombstoneReceiver>::Component)
+-      // .install(McuComponent)
++#ifdef __linux__
++      .install(AutoCmd<AutomotiveProxyService>::Component)
++      .install(AutoCmd<TombstoneReceiver>::Component)
++      .install(McuComponent)
++      .install(WmediumdServerComponent)
++      .install(AutoCmd<VhalProxyServer>::Component)
++      .install(Ti50EmulatorComponent)
++#endif
+       .install(VhostDeviceVsockComponent)
+-      // .install(VhostInputDevicesComponent)
+-      // .install(WmediumdServerComponent)
+-      // .install(launchStreamerComponent)
+-      // .install(AutoCmd<VhalProxyServer>::Component)
+-      // .install(Ti50EmulatorComponent)
+-//#endif
++      .install(VhostInputDevicesComponent)
++      .install(launchStreamerComponent)
+       .install(AdbConfigComponent)
+       .install(AdbConfigFragmentComponent)
+       .install(FastbootConfigComponent)
