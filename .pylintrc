@@ -1,0 +1,3 @@
+[SIMILARITIES]
+# Shared import lists are boilerplate, not duplicated implementation.
+ignore-imports=yes

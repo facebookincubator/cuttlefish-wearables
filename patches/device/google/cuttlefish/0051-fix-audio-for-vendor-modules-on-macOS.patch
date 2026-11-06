@@ -1,0 +1,31 @@
+From c20f42ba04c9cd484ab8e6eeca3f3463b27c3481 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 6 Apr 2026 15:04:07 -0700
+Subject: [PATCH 51/63] fix audio for vendor modules on macOS
+
+Summary:
+Detect virtio-snd support from the presence of CONFIG_SND_VIRTIO, including
+its disabled form, for kernels that load the driver as a vendor module.
+---
+ host/commands/assemble_cvd/flags.cc | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index 5abe02450..febc8b926 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -716,9 +716,12 @@ Result<std::vector<GuestConfig>> ReadGuestConfig() {
+           (guest_config.android_version_number != "13.0.0") &&
+           (guest_config.android_version_number != "11") &&
+           (guest_config.android_version_number != "13");
++      // GKI kernels load virtio-snd as a vendor module, so
++      // CONFIG_SND_VIRTIO won't be =m or =y in ikconfig. Check for
++      // the option's presence in any form (including "is not set")
++      // which indicates kernel >= 5.14 where virtio-snd is available.
+       guest_config.virtio_soundcard_supported =
+-          config.find("\nCONFIG_SND_VIRTIO=m") != std::string::npos ||
+-          config.find("\nCONFIG_SND_VIRTIO=y") != std::string::npos;
++          config.find("CONFIG_SND_VIRTIO") != std::string::npos;
+ 
+       unlink(ikconfig_path.c_str());
+     }

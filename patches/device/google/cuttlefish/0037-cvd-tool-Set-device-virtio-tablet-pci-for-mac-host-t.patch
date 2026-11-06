@@ -1,0 +1,44 @@
+From 0f2c79b767ae44eaff33285d7e288eccddc72ea0 Mon Sep 17 00:00:00 2001
+From: Jeffrey Effendy <jeffreyeffendy@meta.com>
+Date: Thu, 19 Feb 2026 07:43:38 +0000
+Subject: [PATCH 37/63] [cvd-tool] Set device virtio-tablet-pci for mac host to
+ enable using host cursor
+
+Summary:
+Use virtio-tablet-pci on macOS so pointer input uses absolute coordinates
+and the host cursor can enter and leave the QEMU window naturally.
+---
+ host/libs/vm_manager/qemu_manager.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 9b3d1fb4e..0c9fe11da 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -486,9 +486,9 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+ #ifdef __APPLE__
+   qemu_cmd.AddParameter("-display");
+   if (qemu_help.find("use-bgra") != std::string::npos) {
+-    qemu_cmd.AddParameter("cocoa,use-bgra=on");
++    qemu_cmd.AddParameter("cocoa,use-bgra=on,show-cursor=on");
+   } else {
+-    qemu_cmd.AddParameter("cocoa");
++    qemu_cmd.AddParameter("cocoa,show-cursor=on");
+   }
+ #else
+   qemu_cmd.AddParameter("-vnc");
+@@ -808,8 +808,14 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+ 
+   // TODO: Use the vhost-user devices instead if/when qemu is accessed via
+   // webRTC instead of VNC.
++#ifdef __APPLE__
++  // Treat interaction like touch screen devices so we can use host mouse cursor
++  qemu_cmd.AddParameter("-device");
++  qemu_cmd.AddParameter("virtio-tablet-pci");
++#else
+   qemu_cmd.AddParameter("-device");
+   qemu_cmd.AddParameter("virtio-mouse-pci,disable-legacy=on");
++#endif
+ 
+   qemu_cmd.AddParameter("-device");
+   qemu_cmd.AddParameter("virtio-keyboard-pci,disable-legacy=on");

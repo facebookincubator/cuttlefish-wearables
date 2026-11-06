@@ -1,0 +1,41 @@
+From 72afc97983db9e66b33117696862dfa3217e8f5b Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 18 Aug 2025 13:44:45 -0700
+Subject: [PATCH 26/63] remove dump-guest-core=off argument from machine or
+ macOS
+
+Summary:
+Omit dump-guest-core on macOS, where the QEMU machine argument is not
+supported. Keep the existing Linux behavior.
+---
+ host/libs/vm_manager/qemu_manager.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 6135102ba..749ba91f3 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -395,7 +395,11 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+     machine += ",mte=on";
+   }
+   qemu_cmd.AddParameter("-machine");
++#ifdef __APPLE__
++  qemu_cmd.AddParameter(machine, ",usb=off,memory-backend=vm_ram");
++#else
+   qemu_cmd.AddParameter(machine, ",usb=off,dump-guest-core=off,memory-backend=vm_ram");
++#endif
+ 
+   if (IsHostCompatible(arch_)) {
+     qemu_cmd.AddParameter("-accel");
+@@ -931,9 +935,9 @@ qemu_cmd.AddParameter("user,id=hostnet2,net=10.0.2.1/24,dns=1.1.1.1");
+   if (instance.vsock_guest_cid() >= 2) {
+     if (instance.vhost_user_vsock()) {
+       // Vhost user is supported on all posix platforms
+-      auto vsock_socket_path = fmt::format("{}/vsock_{}_{}/vhost.socket", 
++      auto vsock_socket_path = fmt::format("{}/vsock_{}_{}/vhost.socket",
+                                           TempDir(),
+-                                          instance.vsock_guest_cid(), 
++                                          instance.vsock_guest_cid(),
+                                           getuid());
+       qemu_cmd.AddParameter("-chardev");
+       qemu_cmd.AddParameter("socket,id=vhost-user-vsock,path=", vsock_socket_path);

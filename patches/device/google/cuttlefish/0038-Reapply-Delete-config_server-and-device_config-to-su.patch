@@ -1,0 +1,759 @@
+From c03d2817bfdbc4ce402bc7b929ed2da64c42a760 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 24 Feb 2026 13:25:48 -1000
+Subject: [PATCH 38/63] Reapply "Delete config_server and device_config" to
+ support older images
+
+Summary:
+Remove the restored config_server and device_config once DRM display
+configuration is available for the older images.
+
+Test Plan:
+```
+ . build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+---
+ build/Android.bp                              |  1 -
+ common/libs/device_config/Android.bp          | 77 -----------------
+ common/libs/device_config/device_config.cpp   | 36 --------
+ common/libs/device_config/device_config.h     | 46 -----------
+ common/libs/device_config/device_config.proto | 41 ----------
+ .../device_config/device_config_shared.cpp    | 26 ------
+ .../libs/device_config/device_config_shared.h | 29 -------
+ .../device_config/guest_device_config.cpp     | 82 -------------------
+ .../libs/device_config/host_device_config.cpp | 75 -----------------
+ .../commands/assemble_cvd/bootconfig_args.cpp |  5 --
+ host/commands/assemble_cvd/flags.cc           |  4 +-
+ host/commands/config_server/Android.bp        | 40 ---------
+ host/commands/run_cvd/Android.bp              |  2 -
+ .../commands/run_cvd/launch/config_server.cpp | 37 ---------
+ host/commands/run_cvd/launch/launch.h         |  2 -
+ host/commands/run_cvd/main.cc                 |  1 -
+ host/libs/config/known_paths.cpp              |  4 -
+ host/libs/config/known_paths.h                |  1 -
+ .../sepolicy/hal_graphics_composer.te         |  1 -
+ shared/sepolicy/vendor/property.te            |  1 -
+ shared/sepolicy/vendor/property_contexts      |  1 -
+ .../vendor/telephony/libcuttlefish_rild.te    |  1 -
+ 22 files changed, 2 insertions(+), 511 deletions(-)
+ delete mode 100644 common/libs/device_config/Android.bp
+ delete mode 100644 common/libs/device_config/device_config.cpp
+ delete mode 100644 common/libs/device_config/device_config.h
+ delete mode 100644 common/libs/device_config/device_config.proto
+ delete mode 100644 common/libs/device_config/device_config_shared.cpp
+ delete mode 100644 common/libs/device_config/device_config_shared.h
+ delete mode 100644 common/libs/device_config/guest_device_config.cpp
+ delete mode 100644 common/libs/device_config/host_device_config.cpp
+ delete mode 100644 host/commands/config_server/Android.bp
+ delete mode 100644 host/commands/run_cvd/launch/config_server.cpp
+
+diff --git a/build/Android.bp b/build/Android.bp
+index a25e8070a..461b24207 100644
+--- a/build/Android.bp
++++ b/build/Android.bp
+@@ -119,7 +119,6 @@ cvd_host_tools = [
+     "casimir_control_server",
+     "cf_vhost_user_input",
+     "common_crosvm",
+-    "config_server",
+     "console_forwarder",
+     "control_env_proxy_server",
+     "cvd_host_bugreport",
+diff --git a/common/libs/device_config/Android.bp b/common/libs/device_config/Android.bp
+deleted file mode 100644
+index d8307bd37..000000000
+--- a/common/libs/device_config/Android.bp
++++ /dev/null
+@@ -1,77 +0,0 @@
+-//
+-// Copyright (C) 2019 The Android Open Source Project
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//      http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package {
+-    default_applicable_licenses: ["Android-Apache-2.0"],
+-}
+-
+-cc_library {
+-    name: "libcuttlefish_device_config_proto",
+-    proto: {
+-        export_proto_headers: true,
+-        type: "full",
+-    },
+-    srcs: [
+-        "device_config.proto",
+-    ],
+-    defaults: ["cuttlefish_host"],
+-    target: {
+-        darwin: {
+-            enabled: true,
+-        },
+-    },
+-}
+-
+-cc_library_shared {
+-    name: "libcuttlefish_device_config",
+-    srcs: [
+-        "device_config.cpp",
+-        "device_config_shared.cpp",
+-    ],
+-    shared_libs: [
+-        "libbase",
+-        "liblog",
+-        "libcuttlefish_device_config_proto",
+-        "libcuttlefish_fs",
+-        "libcuttlefish_utils",
+-        "libprotobuf-cpp-full",
+-    ],
+-    target: {
+-        host: {
+-            srcs: [
+-                "host_device_config.cpp",
+-            ],
+-            shared_libs: [
+-                "libjsoncpp",
+-            ],
+-            static_libs: [
+-                "libcuttlefish_host_config",
+-            ],
+-        },
+-        darwin: {
+-            enabled: true,
+-        },
+-        android: {
+-            srcs: [
+-                "guest_device_config.cpp",
+-            ],
+-            shared_libs: [
+-                "libcutils",
+-            ],
+-        },
+-    },
+-    export_include_dirs: ["."],
+-    defaults: ["cuttlefish_host"],
+-}
+diff --git a/common/libs/device_config/device_config.cpp b/common/libs/device_config/device_config.cpp
+deleted file mode 100644
+index 0bbe903e3..000000000
+--- a/common/libs/device_config/device_config.cpp
++++ /dev/null
+@@ -1,36 +0,0 @@
+-/*
+- * Copyright (C) 2019 The Android Open Source Project
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#include "device_config.h"
+-
+-#include <sstream>
+-#include <type_traits>
+-
+-#include <android-base/logging.h>
+-
+-#include "common/libs/fs/shared_fd_stream.h"
+-
+-namespace cuttlefish {
+-
+-bool DeviceConfigHelper::SendDeviceConfig(SharedFD fd) {
+-  SharedFDOstream stream(fd);
+-  return device_config_.SerializeToOstream(&stream);
+-}
+-
+-DeviceConfigHelper::DeviceConfigHelper(const DeviceConfig& device_config)
+-  : device_config_(device_config) {}
+-
+-}  // namespace cuttlefish
+diff --git a/common/libs/device_config/device_config.h b/common/libs/device_config/device_config.h
+deleted file mode 100644
+index 7655e49e1..000000000
+--- a/common/libs/device_config/device_config.h
++++ /dev/null
+@@ -1,46 +0,0 @@
+-/*
+- * Copyright (C) 2019 The Android Open Source Project
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#pragma once
+-
+-#include <memory>
+-#include <string>
+-#include <vector>
+-
+-#include "common/libs/fs/shared_fd.h"
+-#include "device/google/cuttlefish/common/libs/device_config/device_config.pb.h"
+-
+-#ifdef CUTTLEFISH_HOST
+-#include "host/libs/config/cuttlefish_config.h"
+-#endif
+-
+-namespace cuttlefish {
+-
+-class DeviceConfigHelper {
+- public:
+-  static std::unique_ptr<DeviceConfigHelper> Get();
+-
+-  const DeviceConfig& GetDeviceConfig() const { return device_config_; }
+-
+-  bool SendDeviceConfig(SharedFD fd);
+-
+- private:
+-  explicit DeviceConfigHelper(const DeviceConfig& device_config);
+-
+-  DeviceConfig device_config_;
+-};
+-
+-}  // namespace cuttlefish
+diff --git a/common/libs/device_config/device_config.proto b/common/libs/device_config/device_config.proto
+deleted file mode 100644
+index 4a5a17016..000000000
+--- a/common/libs/device_config/device_config.proto
++++ /dev/null
+@@ -1,41 +0,0 @@
+-/*
+- * Copyright (C) 2020 The Android Open Source Project
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-syntax = "proto3";
+-
+-package cuttlefish;
+-
+-message DeviceConfig {
+-
+-  message RILConfig {
+-    string ipaddr = 1;
+-    string gateway = 2;
+-    string dns = 3;
+-    string broadcast = 4;
+-    int32 prefixlen = 5;
+-  };
+-
+-  RILConfig ril_config = 1;
+-
+-  message DisplayConfig {
+-    int32 width = 1;
+-    int32 height = 2;
+-    int32 dpi = 3;
+-    int32 refresh_rate_hz = 4;
+-  };
+-
+-  repeated DisplayConfig display_config = 2;
+-}
+diff --git a/common/libs/device_config/device_config_shared.cpp b/common/libs/device_config/device_config_shared.cpp
+deleted file mode 100644
+index ac4f8b46f..000000000
+--- a/common/libs/device_config/device_config_shared.cpp
++++ /dev/null
+@@ -1,26 +0,0 @@
+-/*
+- * Copyright (C) 2021 The Android Open Source Project
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#include "device_config.h"
+-
+-namespace cuttlefish {
+-
+-DeviceConfig GetDeviceConfig() {
+-  const auto device_config_helper = cuttlefish::DeviceConfigHelper::Get();
+-  return device_config_helper->GetDeviceConfig();
+-}
+-
+-}  // namespace cuttlefish
+\ No newline at end of file
+diff --git a/common/libs/device_config/device_config_shared.h b/common/libs/device_config/device_config_shared.h
+deleted file mode 100644
+index 3176917df..000000000
+--- a/common/libs/device_config/device_config_shared.h
++++ /dev/null
+@@ -1,29 +0,0 @@
+-/*
+- * Copyright (C) 2021 The Android Open Source Project
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#pragma once
+-
+-#include "device/google/cuttlefish/common/libs/device_config/device_config.pb.h"
+-
+-namespace cuttlefish {
+-
+-// Minimal version to share with Goldfish which doesn't include additional
+-// Cuttlefish headers.
+-//
+-// TODO(natsu): switch ranchu hwcomposer to drm for display discovery.
+-DeviceConfig GetDeviceConfig();
+-
+-}  // namespace cuttlefish
+\ No newline at end of file
+diff --git a/common/libs/device_config/guest_device_config.cpp b/common/libs/device_config/guest_device_config.cpp
+deleted file mode 100644
+index 29be97372..000000000
+--- a/common/libs/device_config/guest_device_config.cpp
++++ /dev/null
+@@ -1,82 +0,0 @@
+-/*
+- * Copyright (C) 2019 The Android Open Source Project
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#include "device_config.h"
+-
+-#include <chrono>
+-#include <thread>
+-
+-#include <android-base/logging.h>
+-#include <cutils/properties.h>
+-
+-#include "common/libs/fs/shared_fd_stream.h"
+-
+-namespace cuttlefish {
+-
+-namespace {
+-
+-static constexpr int kRetries = 5;
+-static constexpr int kRetryDelaySeconds = 5;
+-
+-bool GetRawFromServer(DeviceConfig* data) {
+-  auto port_property = "ro.boot.cuttlefish_config_server_port";
+-  auto port = property_get_int64(port_property, -1);
+-  if (port < 0) {
+-    LOG(ERROR) << "Unable to get config server port from property: " <<
+-        port_property;
+-    return false;
+-  }
+-
+-#ifdef CUTTLEFISH_HOST
+-  LOG(FATAL) << "it is supposed to run in the guest";
+-#endif
+-  auto config_server =
+-      SharedFD::VsockClient(2 /*host cid*/, static_cast<unsigned int>(port),
+-                            SOCK_STREAM, false /* it's guest */);
+-  if (!config_server->IsOpen()) {
+-    LOG(ERROR) << "Unable to connect to config server: "
+-               << config_server->StrError();
+-    return false;
+-  }
+-
+-  SharedFDIstream stream(config_server);
+-  if (!data->ParseFromIstream(&stream)) {
+-    LOG(ERROR) << "Error reading from config server: "
+-               << config_server->StrError();
+-  }
+-  return true;
+-}
+-
+-}  // namespace
+-
+-std::unique_ptr<DeviceConfigHelper> DeviceConfigHelper::Get() {
+-  DeviceConfig device_config;
+-
+-  int attempts_remaining = 1 + kRetries;
+-  while (attempts_remaining > 0) {
+-    if (GetRawFromServer(&device_config)) {
+-      return std::unique_ptr<DeviceConfigHelper>(
+-        new DeviceConfigHelper(device_config));
+-    }
+-
+-    std::this_thread::sleep_for(std::chrono::seconds(kRetryDelaySeconds));
+-
+-    --attempts_remaining;
+-  }
+-  return nullptr;
+-}
+-
+-}  // namespace cuttlefish
+diff --git a/common/libs/device_config/host_device_config.cpp b/common/libs/device_config/host_device_config.cpp
+deleted file mode 100644
+index 913430ca1..000000000
+--- a/common/libs/device_config/host_device_config.cpp
++++ /dev/null
+@@ -1,75 +0,0 @@
+-/*
+- * Copyright (C) 2017 The Android Open Source Project
+- *
+- * Licensed under the Apache License, Version 2.0 (the "License");
+- * you may not use this file except in compliance with the License.
+- * You may obtain a copy of the License at
+- *
+- *      http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-
+-#include <android-base/logging.h>
+-#include <stdio.h>
+-#include <string.h>
+-#include <sys/types.h>
+-
+-#include "device_config.h"
+-
+-namespace cuttlefish {
+-
+-namespace {
+-
+-bool InitializeNetworkConfiguration(const CuttlefishConfig& cuttlefish_config,
+-                                    DeviceConfig* device_config) {
+-  auto instance = cuttlefish_config.ForDefaultInstance();
+-
+-  DeviceConfig::RILConfig* ril_config = device_config->mutable_ril_config();
+-  ril_config->set_ipaddr(instance.ril_ipaddr());
+-  ril_config->set_gateway(instance.ril_gateway());
+-  ril_config->set_dns(instance.ril_dns());
+-  ril_config->set_broadcast(instance.ril_broadcast());
+-  ril_config->set_prefixlen(instance.ril_prefixlen());
+-
+-  return true;
+-}
+-
+-void InitializeScreenConfiguration(const CuttlefishConfig& cuttlefish_config,
+-                                   DeviceConfig* device_config) {
+-  auto instance = cuttlefish_config.ForDefaultInstance();
+-  for (const auto& cuttlefish_display_config : instance.display_configs()) {
+-    DeviceConfig::DisplayConfig* device_display_config =
+-      device_config->add_display_config();
+-
+-    device_display_config->set_width(cuttlefish_display_config.width);
+-    device_display_config->set_height(cuttlefish_display_config.height);
+-    device_display_config->set_dpi(cuttlefish_display_config.dpi);
+-    device_display_config->set_refresh_rate_hz(
+-        cuttlefish_display_config.refresh_rate_hz);
+-  }
+-}
+-
+-}  // namespace
+-
+-std::unique_ptr<DeviceConfigHelper> DeviceConfigHelper::Get() {
+-  auto cuttlefish_config = CuttlefishConfig::Get();
+-  if (!cuttlefish_config) {
+-    return nullptr;
+-  }
+-
+-  DeviceConfig device_config;
+-  if (!InitializeNetworkConfiguration(*cuttlefish_config, &device_config)) {
+-    return nullptr;
+-  }
+-  InitializeScreenConfiguration(*cuttlefish_config, &device_config);
+-
+-  return std::unique_ptr<DeviceConfigHelper>(
+-    new DeviceConfigHelper(device_config));
+-}
+-
+-}  // namespace cuttlefish
+diff --git a/host/commands/assemble_cvd/bootconfig_args.cpp b/host/commands/assemble_cvd/bootconfig_args.cpp
+index 83ed42341..7180c7090 100644
+--- a/host/commands/assemble_cvd/bootconfig_args.cpp
++++ b/host/commands/assemble_cvd/bootconfig_args.cpp
+@@ -121,11 +121,6 @@ Result<std::unordered_map<std::string, std::string>> BootconfigArgsFromConfig(
+   bootconfig_args["androidboot.enable_confirmationui"] =
+       std::to_string(enable_confui);
+ 
+-  if (instance.config_server_port()) {
+-    bootconfig_args["androidboot.cuttlefish_config_server_port"] =
+-        std::to_string(instance.config_server_port());
+-  }
+-
+   if (instance.audiocontrol_server_port()) {
+     bootconfig_args["androidboot.vendor.audiocontrol.server.cid"] =
+         std::to_string(instance.vsock_guest_cid());
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index e0fadf6a9..d38cd3ccf 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -1775,8 +1775,8 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+     instance.set_ethernet_ipv6(Ipv6ToString(ethernet_ipv6));
+ 
+     instance.set_tombstone_receiver_port(calc_vsock_port(6600));
+-    instance.set_audiocontrol_server_port(9410);  /* OK to use the same port number across instances */
+-    instance.set_config_server_port(calc_vsock_port(6800));
++    instance.set_audiocontrol_server_port(
++        9410); /* OK to use the same port number across instances */
+     instance.set_lights_server_port(calc_vsock_port(6900));
+ 
+     // gpu related settings
+diff --git a/host/commands/config_server/Android.bp b/host/commands/config_server/Android.bp
+deleted file mode 100644
+index b567bd902..000000000
+--- a/host/commands/config_server/Android.bp
++++ /dev/null
+@@ -1,40 +0,0 @@
+-//
+-// Copyright (C) 2019 The Android Open Source Project
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//      http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-package {
+-    default_applicable_licenses: ["Android-Apache-2.0"],
+-}
+-
+-cc_binary {
+-    name: "config_server",
+-    srcs: [
+-        "main.cpp",
+-    ],
+-    shared_libs: [
+-        "libbase",
+-        "libcuttlefish_fs",
+-        "libjsoncpp",
+-        "liblog",
+-        "libcuttlefish_utils",
+-        "libcuttlefish_device_config",
+-        "libcuttlefish_device_config_proto",
+-        "libprotobuf-cpp-full"
+-    ],
+-    static_libs: [
+-        "libcuttlefish_host_config",
+-        "libgflags",
+-    ],
+-    defaults: ["cuttlefish_host"],
+-}
+diff --git a/host/commands/run_cvd/Android.bp b/host/commands/run_cvd/Android.bp
+index a0b3cd437..317a88413 100644
+--- a/host/commands/run_cvd/Android.bp
++++ b/host/commands/run_cvd/Android.bp
+@@ -102,7 +102,6 @@ cc_binary_host {
+                 "gnss_grpc_proxy",
+             ],
+             srcs: [
+-                "launch/config_server.cpp",
+                 // "launch/mcu.cpp",
+                 "launch/modem.cpp",
+                 // "launch/open_wrt.cpp",
+@@ -117,7 +116,6 @@ cc_binary_host {
+                 "gnss_grpc_proxy",
+             ],
+             srcs: [
+-                "launch/config_server.cpp",
+                 "launch/mcu.cpp",
+                 "launch/modem.cpp",
+                 "launch/open_wrt.cpp",
+diff --git a/host/commands/run_cvd/launch/config_server.cpp b/host/commands/run_cvd/launch/config_server.cpp
+deleted file mode 100644
+index 3973de391..000000000
+--- a/host/commands/run_cvd/launch/config_server.cpp
++++ /dev/null
+@@ -1,37 +0,0 @@
+-//
+-// Copyright (C) 2019 The Android Open Source Project
+-//
+-// Licensed under the Apache License, Version 2.0 (the "License");
+-// you may not use this file except in compliance with the License.
+-// You may obtain a copy of the License at
+-//
+-//      http://www.apache.org/licenses/LICENSE-2.0
+-//
+-// Unless required by applicable law or agreed to in writing, software
+-// distributed under the License is distributed on an "AS IS" BASIS,
+-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-// See the License for the specific language governing permissions and
+-// limitations under the License.
+-
+-#include "host/commands/run_cvd/launch/launch.h"
+-
+-#include "common/libs/utils/result.h"
+-#include "host/libs/config/command_source.h"
+-#include "host/libs/config/known_paths.h"
+-
+-namespace cuttlefish {
+-
+-Result<MonitorCommand> ConfigServer(
+-    const CuttlefishConfig::InstanceSpecific& instance) {
+-  auto port = instance.config_server_port();
+-  auto socket =
+-      SharedFD::VsockServer(port, SOCK_STREAM,
+-                            instance.vhost_user_vsock()
+-                                ? std::make_optional(instance.vsock_guest_cid())
+-                                : std::nullopt);
+-  CF_EXPECTF(socket->IsOpen(), "Can't configuration server socket: '{}'",
+-             socket->StrError());
+-  return Command(ConfigServerBinary()).AddParameter("-server_fd=", socket);
+-}
+-
+-}  // namespace cuttlefish
+diff --git a/host/commands/run_cvd/launch/launch.h b/host/commands/run_cvd/launch/launch.h
+index 49aab2b29..decc226cf 100644
+--- a/host/commands/run_cvd/launch/launch.h
++++ b/host/commands/run_cvd/launch/launch.h
+@@ -64,8 +64,6 @@ Result<std::optional<MonitorCommand>> CasimirControlServer(
+     const CuttlefishConfig&, const CuttlefishConfig::EnvironmentSpecific&,
+     const CuttlefishConfig::InstanceSpecific&, GrpcSocketCreator&);
+ 
+-Result<MonitorCommand> ConfigServer(const CuttlefishConfig::InstanceSpecific&);
+-
+ Result<std::optional<MonitorCommand>> ConsoleForwarder(
+     const CuttlefishConfig::InstanceSpecific&);
+ std::string ConsoleInfo(const CuttlefishConfig::InstanceSpecific&);
+diff --git a/host/commands/run_cvd/main.cc b/host/commands/run_cvd/main.cc
+index 5efe29cb9..311179a46 100644
+--- a/host/commands/run_cvd/main.cc
++++ b/host/commands/run_cvd/main.cc
+@@ -132,7 +132,6 @@ fruit::Component<> runCvdComponent(
+       .bindInstance(*config)
+       .bindInstance(*instance)
+       .bindInstance(*environment)
+-      .install(AutoCmd<ConfigServer>::Component)
+       .install(AutoCmd<ModemSimulator>::Component)
+ #ifdef __linux__
+       .install(AutoCmd<AutomotiveProxyService>::Component)
+diff --git a/host/libs/config/known_paths.cpp b/host/libs/config/known_paths.cpp
+index 1d5cb3b23..ed6ff0053 100644
+--- a/host/libs/config/known_paths.cpp
++++ b/host/libs/config/known_paths.cpp
+@@ -34,10 +34,6 @@ std::string CasimirControlServerBinary() {
+   return HostBinaryPath("casimir_control_server");
+ }
+ 
+-std::string ConfigServerBinary() {
+-  return HostBinaryPath("config_server");
+-}
+-
+ std::string ConsoleForwarderBinary() {
+   return HostBinaryPath("console_forwarder");
+ }
+diff --git a/host/libs/config/known_paths.h b/host/libs/config/known_paths.h
+index 983f5c588..2d6ee2006 100644
+--- a/host/libs/config/known_paths.h
++++ b/host/libs/config/known_paths.h
+@@ -24,7 +24,6 @@ std::string AutomotiveProxyBinary();
+ std::string AvbToolBinary();
+ std::string CasimirBinary();
+ std::string CasimirControlServerBinary();
+-std::string ConfigServerBinary();
+ std::string ConsoleForwarderBinary();
+ std::string ControlEnvProxyServerBinary();
+ std::string DefaultKeyboardSpec();
+diff --git a/shared/graphics/sepolicy/hal_graphics_composer.te b/shared/graphics/sepolicy/hal_graphics_composer.te
+index aa851ecf7..de1900f5f 100644
+--- a/shared/graphics/sepolicy/hal_graphics_composer.te
++++ b/shared/graphics/sepolicy/hal_graphics_composer.te
+@@ -1,7 +1,6 @@
+ allow hal_graphics_composer_server hal_graphics_allocator_default_tmpfs:file read;
+ allow hal_graphics_composer_server self:{ socket vsock_socket } create_socket_perms_no_ioctl;
+ 
+-get_prop(hal_graphics_composer_server, vendor_cuttlefish_config_server_port_prop)
+ get_prop(hal_graphics_composer_server, vendor_hwcomposer_prop)
+ 
+ # Persistent memory for some hwcomposer configuration.
+diff --git a/shared/sepolicy/vendor/property.te b/shared/sepolicy/vendor/property.te
+index 64133cf35..ba1bf4598 100644
+--- a/shared/sepolicy/vendor/property.te
++++ b/shared/sepolicy/vendor/property.te
+@@ -1,4 +1,3 @@
+-vendor_restricted_prop(vendor_cuttlefish_config_server_port_prop)
+ vendor_internal_prop(vendor_modem_simulator_ports_prop)
+ vendor_internal_prop(vendor_boot_security_patch_level_prop)
+ vendor_internal_prop(vendor_hwcomposer_prop)
+diff --git a/shared/sepolicy/vendor/property_contexts b/shared/sepolicy/vendor/property_contexts
+index 22e7eb573..44a8b8761 100644
+--- a/shared/sepolicy/vendor/property_contexts
++++ b/shared/sepolicy/vendor/property_contexts
+@@ -1,4 +1,3 @@
+-ro.boot.cuttlefish_config_server_port  u:object_r:vendor_cuttlefish_config_server_port_prop:s0
+ ro.boot.enable_confirmationui  u:object_r:vendor_enable_confirmationui_prop:s0
+ ro.boot.modem_simulator_ports  u:object_r:vendor_modem_simulator_ports_prop:s0
+ ro.boot.wifi_mac_prefix  u:object_r:vendor_wifi_mac_prefix:s0 exact string
+diff --git a/shared/sepolicy/vendor/telephony/libcuttlefish_rild.te b/shared/sepolicy/vendor/telephony/libcuttlefish_rild.te
+index 6f1e4602e..a1e52a3fb 100644
+--- a/shared/sepolicy/vendor/telephony/libcuttlefish_rild.te
++++ b/shared/sepolicy/vendor/telephony/libcuttlefish_rild.te
+@@ -8,7 +8,6 @@ hal_server_domain(libcuttlefish_rild, hal_telephony)
+ # Failing to create these sockets appears to be non-fatal
+ net_domain(libcuttlefish_rild)
+ 
+-get_prop(libcuttlefish_rild, vendor_cuttlefish_config_server_port_prop)
+ get_prop(libcuttlefish_rild, vendor_modem_simulator_ports_prop)
+ 
+ starting_at_board_api(202504, `

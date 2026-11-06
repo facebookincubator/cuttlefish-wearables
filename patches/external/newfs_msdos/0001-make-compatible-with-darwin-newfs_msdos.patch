@@ -1,0 +1,36 @@
+From 3b9672cefad52f413a19a6f88549c65f18de1ba1 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 10:02:33 -0700
+Subject: [PATCH] make compatible with darwin newfs_msdos
+
+Summary:
+# Motivation:
+This binary is part of the list of cuttlefish host binaries. The macro is already defined in macos sdk
+
+# Overview:
+- only define macro if not already defined to avoid compilation error
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+---
+ freebsd-compat.h | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/freebsd-compat.h b/freebsd-compat.h
+index 7ab9d70..5f0ff2b 100644
+--- a/freebsd-compat.h
++++ b/freebsd-compat.h
+@@ -12,7 +12,9 @@
+ #define nitems(x) (sizeof((x))/sizeof((x)[0]))
+ 
+ // This is used as the size of the write buffer of sectors.
++#ifndef MAXPHYS
+ #define MAXPHYS (1024 * 1024)
++#endif
+ 
+ // On glibc, these headers use `__unused` as an identifier, so drag them in
+ // first.

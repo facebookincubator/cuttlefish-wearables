@@ -1,0 +1,77 @@
+From bf4273289844e475ecb3c72e02040d43db5dd9dd Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Fri, 1 Aug 2025 12:26:11 -0700
+Subject: [PATCH 2/2] darwin support for mkbootfs
+
+Summary: mkbootfs is one of the cuttlefish host binaries
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+---
+ libcutils/include/private/fs_config.h |  2 ++
+ mkbootfs/mkbootfs.cpp                 | 14 ++++++++++++--
+ 2 files changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/libcutils/include/private/fs_config.h b/libcutils/include/private/fs_config.h
+index 9a727bc58..9c52fed1d 100644
+--- a/libcutils/include/private/fs_config.h
++++ b/libcutils/include/private/fs_config.h
+@@ -27,7 +27,9 @@
+ #include <sys/cdefs.h>
+ #include <unistd.h>
+ 
++#ifdef __linux__
+ #include <linux/capability.h>
++#endif
+ 
+ /* Rules for directories and files has moved to system/code/libcutils/fs_config.c */
+ 
+diff --git a/mkbootfs/mkbootfs.cpp b/mkbootfs/mkbootfs.cpp
+index a45c6a20a..1ebae0550 100644
+--- a/mkbootfs/mkbootfs.cpp
++++ b/mkbootfs/mkbootfs.cpp
+@@ -10,11 +10,14 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
++#ifdef __linux__
+ #include <sys/sysmacros.h>
++#endif
+ #include <sys/types.h>
+ #include <unistd.h>
+-
++#ifdef __linux__
+ #include <linux/kdev_t.h>
++#endif
+ 
+ #include <private/android_filesystem_config.h>
+ #include <private/fs_config.h>
+@@ -69,7 +72,11 @@ static void fix_stat(const char *path, struct stat *s)
+         // Use the compiled-in fs_config() function.
+         unsigned st_mode = s->st_mode;
+         int is_dir = S_ISDIR(s->st_mode) || strcmp(path, TRAILER) == 0;
++#ifdef __APPLE__
++        fprintf(stderr, "fs_config() not supported on Apple platforms\n");
++#else
+         fs_config(path, is_dir, target_out_path, &s->st_uid, &s->st_gid, &st_mode, &capabilities);
++#endif
+         s->st_mode = (typeof(s->st_mode)) st_mode;
+     }
+ 
+@@ -322,8 +329,11 @@ static int append_devnodes_desc_nod(char* path, char* args)
+ 
+     if (sscanf(args, "%o %d %d %c %d %d", &s.st_mode, &s.st_uid, &s.st_gid,
+                &dev, &major, &minor) != 6) return -1;
+-
++#ifdef __APPLE__
++    fprintf(stderr, "mkbootfs does not support dev nodes on Apple platforms\n");
++#else
+     s.st_rdev = MKDEV(major, minor);
++#endif
+     switch (dev) {
+     case 'b':
+         s.st_mode |= S_IFBLK;

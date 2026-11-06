@@ -1,0 +1,106 @@
+From 99d30a9982be0992d5fbf32c72209f7b0d4c4ce0 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 27 Apr 2026 13:21:39 -1000
+Subject: [PATCH 52/63] Include both compact (3f000000) and highmem
+ (4010000000) ECAM  addresses
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+Include the compact and high-memory PCI ECAM addresses when describing
+the virtual machine. Add the hypervisor entitlement for the macOS tools.
+---
+ host/libs/vm_manager/Android.bp              |  6 ++++
+ host/libs/vm_manager/hypervisor.entitlements |  8 +++++
+ host/libs/vm_manager/qemu_manager.cpp        | 31 ++++++++++++++++----
+ 3 files changed, 40 insertions(+), 5 deletions(-)
+ create mode 100644 host/libs/vm_manager/hypervisor.entitlements
+
+diff --git a/host/libs/vm_manager/Android.bp b/host/libs/vm_manager/Android.bp
+index 23a399f24..54cace73d 100644
+--- a/host/libs/vm_manager/Android.bp
++++ b/host/libs/vm_manager/Android.bp
+@@ -49,6 +49,12 @@ cc_library {
+     target: {
+         darwin: {
+             enabled: true,
++            host_ldlibs: [
++                "-framework Hypervisor",
++            ],
++            data: [
++                "hypervisor.entitlements",
++            ],
+         },
+     },
+ }
+diff --git a/host/libs/vm_manager/hypervisor.entitlements b/host/libs/vm_manager/hypervisor.entitlements
+new file mode 100644
+index 000000000..154f3308e
+--- /dev/null
++++ b/host/libs/vm_manager/hypervisor.entitlements
+@@ -0,0 +1,8 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++<dict>
++    <key>com.apple.security.hypervisor</key>
++    <true/>
++</dict>
++</plist>
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index d7688d2d1..fedb02f72 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -35,6 +35,10 @@
+ #include <android-base/logging.h>
+ #include <vulkan/vulkan.h>
+ 
++#if defined(__APPLE__) && defined(__aarch64__)
++#include <Hypervisor/Hypervisor.h>
++#endif
++
+ #include "common/libs/utils/architecture.h"
+ #include "common/libs/utils/files.h"
+ #include "common/libs/utils/result.h"
+@@ -52,6 +56,25 @@ namespace cuttlefish {
+ namespace vm_manager {
+ namespace {
+ 
++// QEMU's ARM virt machine places the PCI ECAM at one of two addresses:
++//   Compact: 0x3f000000 (always available)
++//   Highmem: 0x4010000000 (requires >= 40-bit IPA)
++// On macOS, query HVF for the host's max IPA size to predict which one
++// QEMU will use. On Linux, KVM on ARM64 always has >= 40-bit IPA.
++bool QemuUsesHighmemEcam() {
++#if defined(__APPLE__) && defined(__aarch64__)
++  uint32_t max_ipa;
++  if (hv_vm_config_get_max_ipa_size(&max_ipa) != HV_SUCCESS) {
++    LOG(WARNING) << "Failed to query HVF max IPA size";
++    return true;
++  }
++  LOG(INFO) << "HVF max IPA size: " << max_ipa << " bits";
++  return max_ipa >= 40;
++#else
++  return true;
++#endif
++}
++
+ std::string GetMonitorPath(const CuttlefishConfig& config) {
+   return config.ForDefaultInstance().PerInstanceInternalUdsPath(
+       "qemu_monitor.sock");
+@@ -231,11 +254,9 @@ QemuManager::ConfigureBootDevices(
+     case Arch::Arm:
+       return {{{"androidboot.boot_devices", "3f000000.pcie"}}};
+     case Arch::Arm64:
+-// #ifdef __APPLE__
+-//       return {{{"androidboot.boot_devices", "3f000000.pcie"}}};
+-// #else
+-      return {{{"androidboot.boot_devices", "4010000000.pcie"}}};
+-// #endif
++      return {{{"androidboot.boot_devices",
++                QemuUsesHighmemEcam() ? "4010000000.pcie"
++                                      : "3f000000.pcie"}}};
+     case Arch::RiscV64:
+       return {{{"androidboot.boot_devices", "soc/30000000.pci"}}};
+     case Arch::X86:

@@ -1,0 +1,44 @@
+From 7338dcf2c1edd5cc98d4bec7215426c6c02ec7d5 Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Mon, 7 Jul 2025 11:30:53 -0700
+Subject: [PATCH] Abseil build fixes for darwin
+
+Summary: Add framework to link args on darwin
+
+Test Plan:
+m libabsl
+m libabsl-host
+---
+ Android.bp | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/Android.bp b/Android.bp
+index 2290bdc1..78fd3a1d 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -46,6 +46,13 @@ cc_library_static {
+         "com.android.extservices",
+         "com.android.ondevicepersonalization",
+     ],
++    target: {
++        darwin: {
++            host_ldlibs: [
++                "-framework CoreFoundation",
++            ],
++        },
++    },
+     visibility: [
+         // go/keep-sorted start
+         "//external/anonymous-counting-tokens:__subpackages__",
+@@ -69,4 +76,11 @@ cc_library_host_static {
+     whole_static_libs: ["libabsl"],
+     export_include_dirs: ["."],
+     stl: "libc++",
++    target: {
++        darwin: {
++            host_ldlibs: [
++                "-framework CoreFoundation",
++            ],
++        },
++    },
+ }

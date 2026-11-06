@@ -1,0 +1,127 @@
+From 597843466b5d92cf38f250c90005eedcb5880111 Mon Sep 17 00:00:00 2001
+From: Olya Arkhangelskaia <olja@meta.com>
+Date: Wed, 6 Aug 2025 17:21:33 +0100
+Subject: [PATCH 10/63] DEMO CODE ONLY Fix SharedFd implementaion to fix adb
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+The macOS VSOCK implementation works by creating a complete emulation layer that translates VSOCK operations into Unix domain socket operations while maintaining the same.
+The SharedFD abstraction handles platform differences at the file descriptor level, the vhost_user_vsock device provides VirtIO compatibility, and the overall system uses Hypervisor.framework instead of KVM for virtualization.
+
+This "emulated VSOCK" approach  provides VSOCK functionality on macOS.
+
+Main changes:
+Eventfd Emulation Using Pipes
+Eventfd Read/Write Emulation
+Inotify Replacement with Kqueue
+
+VSOCK Communication Implementation for macOS uses Unix Domain Socket Emulation
+
+ADB Command → socket_vsock_proxy → Unix Socket → vhost_user_vsock →
+VirtIO Protocol → Guest VirtIO Driver →
+AF_VSOCK → adbd
+
+Test Plan:
+build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+---
+ common/libs/fs/shared_fd.cpp              | 48 +++++++++++++++++++----
+ common/libs/utils/socket2socket_proxy.cpp |  1 +
+ 2 files changed, 41 insertions(+), 8 deletions(-)
+
+diff --git a/common/libs/fs/shared_fd.cpp b/common/libs/fs/shared_fd.cpp
+index 2fff8cc43..e8acf236e 100644
+--- a/common/libs/fs/shared_fd.cpp
++++ b/common/libs/fs/shared_fd.cpp
+@@ -266,7 +266,23 @@ void FileInstance::Close() {
+   std::stringstream message;
+   if (fd_ == -1) {
+     errno_ = EBADF;
+-  } else if (close(fd_) == -1) {
++  } else {
++#ifdef __APPLE__
++    // Clean up eventfd emulation resources if this is an eventfd
++    static std::mutex eventfd_map_mutex;
++    static std::unordered_map<int, int> eventfd_write_fds;
++    {
++      std::lock_guard<std::mutex> lock(eventfd_map_mutex);
++      auto it = eventfd_write_fds.find(fd_);
++      if (it != eventfd_write_fds.end()) {
++        // Close the write end of the pipe
++        close(it->second);
++        // Remove from the map
++        eventfd_write_fds.erase(it);
++      }
++    }
++#endif
++      if (close(fd_) == -1) {
+     errno_ = errno;
+     if (identity_.size()) {
+       message << __FUNCTION__ << ": " << identity_ << " failed (" << StrError() << ")";
+@@ -279,6 +295,7 @@ void FileInstance::Close() {
+       std::string message_str = message.str();
+       Log(message_str.c_str());
+     }
++    }
+   }
+   fd_ = -1;
+ }
+@@ -522,12 +539,15 @@ SharedFD SharedFD::Event(int initval, int flags) {
+     write(pipe_fds[1], &val, sizeof(val));
+   }
+   
+-  // For eventfd emulation, we need to store both read and write ends
+-  // We'll return the read end as the main fd, and store the write end
+-  // This is a simplified implementation - a full implementation would
+-  // need a custom FileInstance subclass to handle both ends properly
+-  close(pipe_fds[1]); // For now, close write end
+-  
++  // Store the write end in a global map so EventfdWrite can access it
++  // This is a workaround since FileInstance only stores one fd
++  static std::mutex eventfd_map_mutex;
++  static std::unordered_map<int, int> eventfd_write_fds;
++
++  {
++    std::lock_guard<std::mutex> lock(eventfd_map_mutex);
++    eventfd_write_fds[pipe_fds[0]] = pipe_fds[1];
++  }
+   return std::shared_ptr<FileInstance>(new FileInstance(pipe_fds[0], 0));
+ #endif
+ }
+@@ -1182,8 +1202,20 @@ int FileInstance::EventfdWrite(eventfd_t value) {
+   return eventfd_write(fd_, value);
+ #elif defined(__APPLE__)
+   // macOS doesn't have eventfd_write, so we emulate it using write()
++  static std::mutex eventfd_map_mutex;
++  static std::unordered_map<int, int> eventfd_write_fds;
++  int write_fd;
++  {
++    std::lock_guard<std::mutex> lock(eventfd_map_mutex);
++    auto it = eventfd_write_fds.find(fd_);
++    if (it == eventfd_write_fds.end()) {
++      errno_ = EBADF;
++      return -1;
++    }
++    write_fd = it->second;
++  }
+   // eventfd_t is typically uint64_t, so we write the value directly
+-  ssize_t result = write(fd_, &value, sizeof(value));
++  ssize_t result = write(write_fd, &value, sizeof(value));  
+   if (result == sizeof(value)) {
+     return 0;  // Success
+   } else {
+diff --git a/common/libs/utils/socket2socket_proxy.cpp b/common/libs/utils/socket2socket_proxy.cpp
+index 63cc631ca..74e2581cd 100644
+--- a/common/libs/utils/socket2socket_proxy.cpp
++++ b/common/libs/utils/socket2socket_proxy.cpp
+@@ -162,6 +162,7 @@ ProxyServer::ProxyServer(SharedFD server, std::function<SharedFD()> clients_fact
+                    << watched.size();
+       } else {
+         LOG(ERROR) << "Cannot connect to the target to setup proxying: " << target->StrError();
++        client->Close(); // <=== Why?
+       }
+       // Unwatch completed proxy pairs
+       watched.remove_if([](ProxyPair& proxy) { return !proxy.Running(); });

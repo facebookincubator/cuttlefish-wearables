@@ -1,0 +1,192 @@
+From 9888c658dc4f4599596e7d3ce5a988d3c78a38dd Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:56:32 -0700
+Subject: [PATCH] webrtc darwin compatiblity
+
+Summary: support building webrtc on mac
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+---
+ Android.bp                                    | 67 +++++++++++++------
+ .../video_capture/linux/device_info_v4l2.cc   |  2 +
+ rtc_base/synchronization/mutex_pthread.h      |  2 +-
+ 3 files changed, 48 insertions(+), 23 deletions(-)
+
+diff --git a/Android.bp b/Android.bp
+index aa6a9a1093..27823fa06d 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -68,8 +68,6 @@ cc_defaults {
+         "-DWEBRTC_LIBRARY_IMPL",
+         "-DWEBRTC_ENABLE_AVX2",
+         "-DWEBRTC_NON_STATIC_TRACE_EVENT_HANDLERS=1",
+-        "-DWEBRTC_POSIX",
+-        "-DWEBRTC_LINUX",
+         "-DABSL_ALLOCATOR_NOTHROW=1",
+         "-DHAVE_ARM64_CRC32C=0",
+         "-DUSE_AURA=1",
+@@ -119,7 +117,17 @@ cc_defaults {
+     vendor: true,
+     target: {
+         darwin: {
+-            enabled: false,
++            enabled: true,
++            cflags: [
++                "-DWEBRTC_MAC",
++                "-DWEBRTC_POSIX",
++            ],
++        },
++        linux: {
++            cflags: [
++                "-DWEBRTC_POSIX",
++                "-DWEBRTC_LINUX",
++            ],
+         },
+     },
+     arch: {
+@@ -340,9 +348,6 @@ cc_library_static {
+         arm: {
+             enabled: false,
+         },
+-        arm64: {
+-            enabled: false,
+-        },
+         riscv64: {
+             enabled: false,
+         },
+@@ -1633,9 +1638,6 @@ cc_library_static {
+         arm: {
+             enabled: false,
+         },
+-        arm64: {
+-            enabled: false,
+-        },
+         riscv64: {
+             enabled: false,
+         },
+@@ -1818,9 +1820,6 @@ cc_library_static {
+         arm: {
+             enabled: false,
+         },
+-        arm64: {
+-            enabled: false,
+-        },
+         riscv64: {
+             enabled: false,
+         },
+@@ -3889,9 +3888,6 @@ cc_library_static {
+         arm: {
+             enabled: false,
+         },
+-        arm64: {
+-            enabled: false,
+-        },
+         riscv64: {
+             enabled: false,
+         },
+@@ -4192,6 +4188,13 @@ cc_library_static {
+         "rtc_base/unique_id_generator.cc",
+     ],
+     host_supported: true,
++    target: {
++        darwin: {
++            srcs: [
++                "rtc_base/mac_ifaddrs_converter.cc",
++            ],
++        },
++    },
+ }
+ 
+ /* From target:
+@@ -4309,6 +4312,16 @@ cc_library_static {
+         "rtc_base/thread.cc",
+     ],
+     host_supported: true,
++    target: {
++        darwin: {
++            srcs: [
++                "rtc_base/system/cocoa_threading.mm"
++            ],
++            host_ldlibs: [
++                "-framework CoreFoundation",
++            ],
++        },
++    },
+ }
+ 
+ /* From target:
+@@ -4803,12 +4816,18 @@ cc_library_static {
+     srcs: [
+         "system_wrappers/source/clock.cc",
+         "system_wrappers/source/cpu_features.cc",
+-        "system_wrappers/source/cpu_features_linux.cc",
+         "system_wrappers/source/cpu_info.cc",
+         "system_wrappers/source/rtp_to_ntp_estimator.cc",
+         "system_wrappers/source/sleep.cc",
+     ],
+     host_supported: true,
++    target: {
++        linux: {
++            srcs: [
++                "system_wrappers/source/cpu_features_linux.cc",
++            ],
++        },
++    },
+ }
+ 
+ /* From target:
+@@ -5479,12 +5498,16 @@ cc_library_static {
+ cc_library_static {
+     name: "webrtc_video_capture__video_capture_internal_impl",
+     defaults: ["webrtc_defaults"],
+-    srcs: [
+-        "modules/video_capture/linux/device_info_linux.cc",
+-        "modules/video_capture/linux/device_info_v4l2.cc",
+-        "modules/video_capture/linux/video_capture_linux.cc",
+-        "modules/video_capture/linux/video_capture_v4l2.cc",
+-    ],
++    target: {
++        linux: {
++            srcs: [
++                "modules/video_capture/linux/video_capture_v4l2.cc",
++                "modules/video_capture/linux/device_info_v4l2.cc",
++                "modules/video_capture/linux/video_capture_linux.cc",
++                "modules/video_capture/linux/device_info_linux.cc",
++            ],
++        },
++    },
+     host_supported: true,
+ }
+ 
+diff --git a/modules/video_capture/linux/device_info_v4l2.cc b/modules/video_capture/linux/device_info_v4l2.cc
+index 5af58015a7..120b70351f 100644
+--- a/modules/video_capture/linux/device_info_v4l2.cc
++++ b/modules/video_capture/linux/device_info_v4l2.cc
+@@ -18,7 +18,9 @@
+ #include <sys/ioctl.h>
+ #include <unistd.h>
+ // v4l includes
++#ifdef __linux__
+ #include <linux/videodev2.h>
++#endif
+ 
+ #include <vector>
+ 
+diff --git a/rtc_base/synchronization/mutex_pthread.h b/rtc_base/synchronization/mutex_pthread.h
+index c749a208aa..64ca6e1af9 100644
+--- a/rtc_base/synchronization/mutex_pthread.h
++++ b/rtc_base/synchronization/mutex_pthread.h
+@@ -31,7 +31,7 @@ class RTC_LOCKABLE MutexImpl final {
+     pthread_mutexattr_init(&mutex_attribute);
+ #if defined(WEBRTC_MAC)
+     pthread_mutexattr_setpolicy_np(&mutex_attribute,
+-                                   _PTHREAD_MUTEX_POLICY_FIRSTFIT);
++                                   PTHREAD_MUTEX_POLICY_FIRSTFIT_NP);
+ #endif
+     pthread_mutex_init(&mutex_, &mutex_attribute);
+     pthread_mutexattr_destroy(&mutex_attribute);

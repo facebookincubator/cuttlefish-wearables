@@ -1,0 +1,28 @@
+From 0dbc7a9061a3df70b35b7392c8111f9ab87a0991 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 27 Jul 2026 16:27:18 -0700
+Subject: [PATCH 64/67] cuttlefish: darwin: silence unused-parameter in
+ inotify_rm_watch
+
+The kqueue-based inotify shim's inotify_rm_watch(int kq, int wd) keeps the
+Linux-compatible signature but only uses wd; mark kq unused so the darwin
+build passes -Werror,-Wunused-parameter.
+---
+ common/libs/utils/inotify.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/common/libs/utils/inotify.cpp b/common/libs/utils/inotify.cpp
+index fcdc74d..cc1d44f 100644
+--- a/common/libs/utils/inotify.cpp
++++ b/common/libs/utils/inotify.cpp
+@@ -135,6 +135,7 @@ int inotify_add_watch(int kq, const char* pathname, uint32_t mask) {
+ 
+ // Function to remove a watch from a kqueue (inotify alternative for macOS)
+ int inotify_rm_watch(int kq, int wd) {
++  (void)kq;  // kqueue watch descriptor is the fd itself; kq is unused here
+   // For kqueue, we just close the file descriptor
+   if (close(wd) < 0) {
+     LOG(ERROR) << "Failed to close watch descriptor: " << strerror(errno);
+-- 
+2.50.1
+

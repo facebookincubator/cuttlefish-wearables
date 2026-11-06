@@ -1,0 +1,19 @@
+From 27db2efde9857695af09e5fcaba78ae00d4f6028 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 17 Feb 2026 14:30:38 -1000
+Subject: [PATCH 35/63] add non-zero length custom.css to avoid bug in
+ libwebsockets
+
+Summary:
+Provide a nonempty custom.css file so the WebRTC HTTP server does not
+close the connection while serving an empty stylesheet.
+---
+ host/frontend/webrtc/html_client/custom.css | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/host/frontend/webrtc/html_client/custom.css b/host/frontend/webrtc/html_client/custom.css
+index e69de29bb..f6cb94fcf 100644
+--- a/host/frontend/webrtc/html_client/custom.css
++++ b/host/frontend/webrtc/html_client/custom.css
+@@ -0,0 +1 @@
++/* Add non-zero length css file to prevent causing issues with libwebsockets on macOS */

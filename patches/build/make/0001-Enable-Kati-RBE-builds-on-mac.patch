@@ -1,0 +1,78 @@
+From 675456423520736d6318c9f3c58f8cb099e89b3e Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Mon, 27 Oct 2025 15:18:15 -0700
+Subject: [PATCH] Enable Kati RBE builds on mac
+
+Summary:
+Enable RBE for makefile based compiles that use RBE_CXX and RBE_JAVAC.
+- Add ld64.lld toolchain input on darwin
+- Add clang toolchain input explicitly for compile
+- Add java dir toolchain input for javac
+- Set platform/subplatform to RE requirements
+- Remove Pool and container image fields (we don't use them on our remote execution setup)
+---
+ core/definitions.mk |  1 +
+ core/rbe.mk         | 11 +++++------
+ rbesetup.sh         |  2 +-
+ 3 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/core/definitions.mk b/core/definitions.mk
+index 4587804934..74ddac2b36 100644
+--- a/core/definitions.mk
++++ b/core/definitions.mk
+@@ -1430,6 +1430,7 @@ $(hide) mkdir -p $(dir $@)
+ $(hide) $(BCC_COMPAT) -O3 -o $(dir $@)/$(notdir $(<:.bc=.o)) -fPIC -shared \
+   -rt-path $(RS_PREBUILT_CLCORE) -mtriple $(RS_COMPAT_TRIPLE) $<
+ $(hide) $(PRIVATE_CXX_LINK) -fuse-ld=lld -target $(CLANG_TARGET_TRIPLE) -shared -Wl,-soname,$(notdir $@) -nostdlib \
++  $(if $(filter darwin,$(HOST_OS)),--ld-path=$(dir $(PRIVATE_CXX_LINK))ld64.lld) \
+   -Wl,-rpath,\$$ORIGIN/../lib \
+   $(dir $@)/$(notdir $(<:.bc=.o)) \
+   $(RS_PREBUILT_COMPILER_RT) \
+diff --git a/core/rbe.mk b/core/rbe.mk
+index 0f90ddd6f9..be47eeeeaf 100644
+--- a/core/rbe.mk
++++ b/core/rbe.mk
+@@ -64,12 +64,12 @@ ifneq ($(filter-out false,$(USE_RBE)),)
+     d8_exec_strategy := remote_local_fallback
+   endif
+ 
+-  platform := container-image=docker://gcr.io/androidbuild-re-dockerimage/android-build-remoteexec-image@sha256:1eb7f64b9e17102b970bd7a1af7daaebdb01c3fb777715899ef462d6c6d01a45
+-  cxx_platform := $(platform),Pool=$(cxx_pool)
+-  java_r8_d8_platform := $(platform),Pool=$(java_pool)
++  platform := platform=mac,subplatform=xcode_26.0.0_17a321
++  cxx_platform := $(platform)
++  java_r8_d8_platform := $(platform)
+ 
+   RBE_WRAPPER := $(rbe_dir)/rewrapper
+-  RBE_CXX := --labels=type=compile,lang=cpp,compiler=clang --env_var_allowlist=PWD --exec_strategy=$(cxx_rbe_exec_strategy) --platform=$(cxx_platform) --compare=$(cxx_compare)
++  RBE_CXX := --labels=type=compile,lang=cpp,compiler=clang --env_var_allowlist=PWD --exec_strategy=$(cxx_rbe_exec_strategy) --platform=$(cxx_platform) --compare=$(cxx_compare) --toolchain_inputs=$(firstword $(SOONG_CLANG))
+ 
+   # Append rewrapper to existing *_WRAPPER variables so it's possible to
+   # use both ccache and rewrapper.
+@@ -77,7 +77,7 @@ ifneq ($(filter-out false,$(USE_RBE)),)
+   CXX_WRAPPER := $(strip $(CXX_WRAPPER) $(RBE_WRAPPER) $(RBE_CXX))
+ 
+   ifdef RBE_JAVAC
+-    JAVAC_WRAPPER := $(strip $(JAVAC_WRAPPER) $(RBE_WRAPPER) --labels=type=compile,lang=java,compiler=javac --exec_strategy=$(javac_exec_strategy) --platform=$(java_r8_d8_platform))
++    JAVAC_WRAPPER := $(strip $(JAVAC_WRAPPER) $(RBE_WRAPPER) --labels=type=compile,lang=java,compiler=javac --exec_strategy=$(javac_exec_strategy) --platform=$(java_r8_d8_platform) --toolchain_inputs=$(ANDROID_JAVA_HOME)/lib")
+   endif
+ 
+   ifdef RBE_R8
+@@ -90,4 +90,3 @@ ifneq ($(filter-out false,$(USE_RBE)),)
+ 
+   rbe_dir :=
+ endif
+-
+diff --git a/rbesetup.sh b/rbesetup.sh
+index 0da7a57647..a08263b5a8 100644
+--- a/rbesetup.sh
++++ b/rbesetup.sh
+@@ -39,7 +39,7 @@ function use_rbe() {
+   # Do not set an invocation-ID and let reproxy auto-generate one.
+   USE_RBE="true" \
+   FLAG_exec_root="$(gettop)" \
+-  FLAG_platform="container-image=docker://${DOCKER_IMAGE}" \
++  FLAG_platform="$( [[ "$(uname)" == "Darwin" ]] && echo "platform=mac,subplatform=xcode_26.0.0_17a321" )" \
+   RBE_use_application_default_credentials="true" \
+   RBE_reproxy_wait_seconds="20" \
+   RBE_CXX_EXEC_STRATEGY="remote_local_fallback" \

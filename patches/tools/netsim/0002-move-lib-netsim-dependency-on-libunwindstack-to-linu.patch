@@ -1,0 +1,45 @@
+From 14ed047d5040fb7b1a6247c0f45c6322d347eec0 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 7 Aug 2025 11:03:52 -0700
+Subject: [PATCH 2/3] move lib-netsim dependency on libunwindstack to linux
+ only
+
+Summary: libunwindstack is linux only
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+```
+---
+ Android.bp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/Android.bp b/Android.bp
+index 93a870a9..8a880ecb 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -184,7 +184,6 @@ cc_library_host_static {
+         "libbase",
+         "libgrpc++",
+         "libcrypto",
+-        "libunwindstack",
+     ],
+     static_libs: [
+         "breakpad_client",
+@@ -196,6 +195,13 @@ cc_library_host_static {
+     whole_static_libs: [
+         "libbt-rootcanal",
+     ],
++    target: {
++        linux: {
++            shared_libs: [
++                "libunwindstack",
++            ],
++        }
++    }
+ }
+ 
+ netsim_ui_modules = [

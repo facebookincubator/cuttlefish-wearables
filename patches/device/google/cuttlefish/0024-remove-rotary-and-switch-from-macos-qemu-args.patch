@@ -1,0 +1,46 @@
+From 7d79074590b1e4d22274900c40b4ffcd7befb636 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 20 Aug 2025 11:05:47 -0700
+Subject: [PATCH 24/63] remove rotary and switch from macos qemu args
+
+Summary:
+# Motivation:
+These don't work currently.
+
+# Overview:
+- ifndef __APPLE__ these devices
+---
+ host/libs/vm_manager/qemu_manager.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index f2df98ec4..fdc152b6f 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -793,10 +793,12 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+   qemu_cmd.AddParameter("virtio-keyboard-pci,disable-legacy=on");
+ 
+   // device padding for unsupported "switches" input
++#ifndef __APPLE__
+   qemu_cmd.AddParameter("-chardev");
+   qemu_cmd.AddParameter("socket,path=", instance.switches_socket_path(), ",id=switches0");
+   qemu_cmd.AddParameter("-device");
+   qemu_cmd.AddParameter("vhost-user-input-pci,chardev=switches0");
++#endif
+ //         qemu_cmd.AddPrerequisite([socket_path]() -> Result<void> {
+ // #if defined(__linux__) || defined(__APPLE__)
+ //         return WaitForUnixSocketListeningWithoutConnect(instance.switches_socket_path(),
+@@ -805,11 +807,12 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+ //         return CF_ERR("Unhandled check if vhost user block ready.");
+ // #endif
+ //       });
+-
++#ifndef __APPLE__
+   qemu_cmd.AddParameter("-chardev");
+   qemu_cmd.AddParameter("socket,path=", instance.rotary_socket_path(), ",id=rotary0");
+   qemu_cmd.AddParameter("-device");
+   qemu_cmd.AddParameter("vhost-user-input-pci,chardev=rotary0");
++#endif
+   //         qemu_cmd.AddPrerequisite([socket_path]() -> Result<void> {
+ // #if defined(__linux__) || defined(__APPLE__)
+ //         return WaitForUnixSocketListeningWithoutConnect(instance.rotary_socket_path(),

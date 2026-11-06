@@ -1,0 +1,122 @@
+From ba6f0123b20c71c56fcd59730850ebce2da7c419 Mon Sep 17 00:00:00 2001
+From: Roger Hernando <rogerhb@meta.com>
+Date: Tue, 9 Jun 2026 18:25:18 +0100
+Subject: [PATCH 63/63] [cuttlefish][darwin-host-tools] Backport
+ --extra_qemu_args passthrough
+
+Summary:
+Backport extra_qemu_args through the host-tool configuration and QEMU
+launcher. Keep commas intact by reading the raw flag value rather than
+the per-instance comma-splitting helper.
+---
+ host/commands/assemble_cvd/flags.cc           |  8 ++++++++
+ host/commands/assemble_cvd/flags_defaults.h   |  1 +
+ host/libs/config/cuttlefish_config.h          |  2 ++
+ .../config/cuttlefish_config_instance.cpp     | 19 +++++++++++++++++++
+ host/libs/vm_manager/qemu_manager.cpp         |  5 +++++
+ 5 files changed, 35 insertions(+)
+
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index 6b047f31f..1e07dedca 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -351,6 +351,8 @@ DEFINE_vec(extra_bootconfig_args_base64, CF_DEFAULTS_EXTRA_BOOTCONFIG_ARGS,
+ 
+ DEFINE_string(qemu_binary_dir, CF_DEFAULTS_QEMU_BINARY_DIR,
+               "Path to the directory containing the qemu binary to use");
++DEFINE_string(extra_qemu_args, CF_DEFAULTS_EXTRA_QEMU_ARGS,
++              "Space-separated list of extra arguments to pass to qemu");
+ DEFINE_string(crosvm_binary, CF_DEFAULTS_CROSVM_BINARY,
+               "The Crosvm binary to use");
+ DEFINE_vec(gem5_binary_dir, CF_DEFAULTS_GEM5_BINARY_DIR,
+@@ -1591,6 +1593,12 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+     instance.set_seccomp_policy_dir(seccomp_policy_dir_vec[instance_index]);
+     instance.set_qemu_binary_dir(qemu_binary_dir_vec[instance_index]);
+ 
++    // Read FLAGS_extra_qemu_args directly, not via GET_FLAG_STR_VALUE(): that
++    // helper splits on ',' (cuttlefish's per-instance separator), which would
++    // truncate qemu args that legitimately contain commas. Applied to all
++    // instances.
++    instance.set_extra_qemu_args(FLAGS_extra_qemu_args);
++
+     // wifi, bluetooth, Thread, connectivity setup
+ 
+     instance.set_vhost_net(vhost_net_vec[instance_index]);
+diff --git a/host/commands/assemble_cvd/flags_defaults.h b/host/commands/assemble_cvd/flags_defaults.h
+index b3fd160fd..d2efad0e3 100644
+--- a/host/commands/assemble_cvd/flags_defaults.h
++++ b/host/commands/assemble_cvd/flags_defaults.h
+@@ -69,6 +69,7 @@
+ 
+ // Qemu default parameters
+ #define CF_DEFAULTS_QEMU_BINARY_DIR cuttlefish::DefaultQemuBinaryDir()
++#define CF_DEFAULTS_EXTRA_QEMU_ARGS ""
+ 
+ // Gem5 default parameters
+ #define CF_DEFAULTS_GEM5_BINARY_DIR HostBinaryPath("gem5")
+diff --git a/host/libs/config/cuttlefish_config.h b/host/libs/config/cuttlefish_config.h
+index 35e2e333c..d18ce0609 100644
+--- a/host/libs/config/cuttlefish_config.h
++++ b/host/libs/config/cuttlefish_config.h
+@@ -673,6 +673,7 @@ class CuttlefishConfig {
+     std::string crosvm_binary() const;
+     std::string seccomp_policy_dir() const;
+     std::string qemu_binary_dir() const;
++    std::vector<std::string> extra_qemu_args() const;
+ 
+     // Configuration flags for a minimal device
+     bool enable_minimal_mode() const;
+@@ -904,6 +905,7 @@ class CuttlefishConfig {
+     void set_crosvm_binary(const std::string& crosvm_binary);
+     void set_seccomp_policy_dir(const std::string& seccomp_policy_dir);
+     void set_qemu_binary_dir(const std::string& qemu_binary_dir);
++    void set_extra_qemu_args(const std::string& extra_qemu_args);
+ 
+     void set_vhost_net(bool vhost_net);
+     void set_vhost_user_vsock(bool vhost_user_vsock);
+diff --git a/host/libs/config/cuttlefish_config_instance.cpp b/host/libs/config/cuttlefish_config_instance.cpp
+index d594bd93c..8bf02537f 100644
+--- a/host/libs/config/cuttlefish_config_instance.cpp
++++ b/host/libs/config/cuttlefish_config_instance.cpp
+@@ -1279,6 +1279,25 @@ void CuttlefishConfig::MutableInstanceSpecific::set_qemu_binary_dir(
+   (*Dictionary())[kQemuBinaryDir] = qemu_binary_dir;
+ }
+ 
++static constexpr char kExtraQemuArgs[] = "extra_qemu_args";
++std::vector<std::string>
++CuttlefishConfig::InstanceSpecific::extra_qemu_args() const {
++  std::string extra_qemu_args_str =
++      (*Dictionary())[kExtraQemuArgs].asString();
++  std::vector<std::string> qemu_args;
++  if (!extra_qemu_args_str.empty()) {
++    for (const auto& arg :
++         android::base::Split(extra_qemu_args_str, " ")) {
++      qemu_args.push_back(arg);
++    }
++  }
++  return qemu_args;
++}
++void CuttlefishConfig::MutableInstanceSpecific::set_extra_qemu_args(
++    const std::string& extra_qemu_args) {
++  (*Dictionary())[kExtraQemuArgs] = extra_qemu_args;
++}
++
+ static constexpr char kVhostNet[] = "vhost_net";
+ void CuttlefishConfig::MutableInstanceSpecific::set_vhost_net(bool vhost_net) {
+   (*Dictionary())[kVhostNet] = vhost_net;
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 1ac972b02..b32813b95 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -1131,6 +1131,11 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+     add_hvc_sink();
+   }
+ 
++  // Forward any user-supplied qemu args (e.g. -crashpad enable=on,...) verbatim.
++  for (const auto& arg : instance.extra_qemu_args()) {
++    qemu_cmd.AddParameter(arg);
++  }
++
+   commands.emplace_back(std::move(qemu_cmd), true);
+   return commands;
+ }

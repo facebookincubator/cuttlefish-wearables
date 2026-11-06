@@ -1,0 +1,45 @@
+From b4c3e836ec3c4701a75fdf7b5bef4943be593073 Mon Sep 17 00:00:00 2001
+From: Olya Arkhangelskaia <olja@meta.com>
+Date: Wed, 6 Aug 2025 11:52:19 +0100
+Subject: [PATCH 08/63] DEMO CODE only adding headers VHAL
+
+Summary:
+Fix header for  VHAL proxy server launcher for automotive Android emulation
+
+Implements launcher for Vehicle Hardware Abstraction Layer (VHAL) proxy server
+to enable automotive Android features in Cuttlefish. Supports both VHost-User
+VSOCK and traditional VSOCK transport with cross-platform compatibility.
+
+Key features:
+- Configurable Ethernet endpoint (192.168.98.1:9300+)
+- Multi-instance support with incremental ports
+- macOS/Linux VSOCK header compatibility
+- Conditional startup based on configuration
+
+Enables testing of Android Automotive OS (AAOS) applications without physical
+vehicle hardware by bridging VHAL calls between guest and host simulation.
+
+Test Plan:
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+---
+ host/commands/run_cvd/launch/vhal_proxy_server.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/host/commands/run_cvd/launch/vhal_proxy_server.cpp b/host/commands/run_cvd/launch/vhal_proxy_server.cpp
+index 296950bb1..fb5cf1366 100644
+--- a/host/commands/run_cvd/launch/vhal_proxy_server.cpp
++++ b/host/commands/run_cvd/launch/vhal_proxy_server.cpp
+@@ -21,7 +21,11 @@
+ #include "host/libs/config/known_paths.h"
+ #include "host/libs/vhal_proxy_server/vhal_proxy_server_eth_addr.h"
+ 
++#ifdef __APPLE__
++#include <sys/vsock.h>
++#else
+ #include <linux/vm_sockets.h>
++#endif
+ 
+ namespace cuttlefish {
+ 

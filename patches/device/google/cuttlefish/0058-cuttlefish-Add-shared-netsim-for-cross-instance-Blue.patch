@@ -1,0 +1,1222 @@
+From 4c1bba027f0ec0dcba9cf2e146894b76592445ee Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Fri, 17 Apr 2026 14:45:46 -0700
+Subject: [PATCH 58/63] [cuttlefish] Add shared netsim for cross-instance
+ Bluetooth
+
+Summary:
+# Motivation
+When multiple Cuttlefish emulators are launched independently (separate `launch_cvd` invocations), each starts its own `netsimd` daemon with an isolated rootcanal Bluetooth simulation. Devices in different instances
+cannot discover, pair, or connect with each other.
+
+# Overview:
+
+A single detached `netsimd` primary is launched by the first instance
+and shared by all. Every instance runs a lightweight connector that
+forwards HCI packets to the primary via gRPC. The primary's rootcanal
+manages all BT devices so they can discover and connect.
+
+# Details:
+- **First launch**: starts detached primary (fork+setsid), registers
+  in state file, starts own connector
+- **Subsequent launches**: detect existing primary via state file,
+  start as connector only
+- **Stop non-last instance**: deregister from state file, kill own
+  connector. Primary stays alive for remaining instances
+- **Stop last instance**: deregister, clear state file. Primary
+  auto-exits via netsim's built-in `LastDeviceRemoved` shutdown
+- **Primary crash**: watchdog thread (5s poll) detects dead primary,
+  re-launches it, connectors auto-reconnect via process monitor
+
+- **netsim_state.h/cpp** (new): State file manager with `flock()` for
+  atomic coordination between independent launch_cvd invocations
+- **netsim_watchdog.h/cpp** (new): Background health monitor thread
+  with automatic primary failover
+- **netsim_server.cpp** (modified): Per-instance FIFO creation,
+  detached primary launch, all-connector mode, watchdog startup
+- **stop/main.cc** (modified): Deregister client from shared state
+  on stop. Clear primary info when last client exits
+---
+ host/commands/assemble_cvd/flags.cc           |  17 +-
+ .../commands/run_cvd/launch/netsim_server.cpp | 310 ++++++++++++++----
+ host/commands/stop/main.cc                    |  33 ++
+ host/libs/config/Android.bp                   |   2 +
+ host/libs/config/netsim_state.cpp             | 239 ++++++++++++++
+ host/libs/config/netsim_state.h               |  96 ++++++
+ host/libs/config/netsim_watchdog.cpp          | 244 ++++++++++++++
+ host/libs/config/netsim_watchdog.h            |  68 ++++
+ 8 files changed, 931 insertions(+), 78 deletions(-)
+ create mode 100644 host/libs/config/netsim_state.cpp
+ create mode 100644 host/libs/config/netsim_state.h
+ create mode 100644 host/libs/config/netsim_watchdog.cpp
+ create mode 100644 host/libs/config/netsim_watchdog.h
+
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index 411e2e1c6..6b047f31f 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -1441,14 +1441,10 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+   tmp_config_obj.set_netsim_instance_num(netsim_instance_num);
+   LOG(DEBUG) << "netsim_instance_num: " << netsim_instance_num;
+   tmp_config_obj.set_netsim_args(FLAGS_netsim_args);
+-  // netsim built-in connector will forward packets to another daemon instance,
+-  // filling the role of bluetooth_connector when is_bt_netsim is true.
+-  auto netsim_connector_instance_num = netsim_instance_num;
+-  if (netsim_instance_num != rootcanal_instance_num) {
+-    netsim_connector_instance_num = rootcanal_instance_num;
+-  }
+-  tmp_config_obj.set_netsim_connector_instance_num(
+-      netsim_connector_instance_num);
++  // The connector target instance is now determined at runtime by the shared
++  // netsim state file, not at assemble time. Set connector_instance_num equal
++  // to netsim_instance_num so NetsimServer can override it.
++  tmp_config_obj.set_netsim_connector_instance_num(netsim_instance_num);
+ 
+   // crosvm should create fifos for UWB
+   auto pica_instance_num = *instance_nums.begin() - 1;
+@@ -1969,7 +1965,10 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+           !FLAGS_start_webrtc_sig_server);
+     }
+ 
+-    instance.set_start_netsim(is_first_instance && is_any_netsim);
++    // All instances with netsim radios participate in the shared netsim.
++    // The primary/connector decision is made at runtime in NetsimServer
++    // using the shared state file for coordination.
++    instance.set_start_netsim(is_any_netsim);
+ 
+     instance.set_start_rootcanal(is_first_instance && !is_bt_netsim &&
+                                  (FLAGS_rootcanal_instance_num <= 0));
+diff --git a/host/commands/run_cvd/launch/netsim_server.cpp b/host/commands/run_cvd/launch/netsim_server.cpp
+index 5aa20e918..2243e5212 100644
+--- a/host/commands/run_cvd/launch/netsim_server.cpp
++++ b/host/commands/run_cvd/launch/netsim_server.cpp
+@@ -15,11 +15,19 @@
+ 
+ #include "host/commands/run_cvd/launch/launch.h"
+ 
++#include <fcntl.h>
++#include <signal.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include <fstream>
+ #include <string>
+ #include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
++#include <android-base/logging.h>
++#include <fmt/format.h>
+ #include <fruit/fruit.h>
+ 
+ #include "common/libs/fs/shared_fd.h"
+@@ -27,21 +35,23 @@
+ #include "common/libs/utils/result.h"
+ #include "host/libs/config/command_source.h"
+ #include "host/libs/config/known_paths.h"
++#include "host/libs/config/netsim_state.h"
++#include "host/libs/config/netsim_watchdog.h"
+ 
+ namespace cuttlefish {
+ namespace {
+ 
+ // NetsimServer launches netsim server with fifos for radio HALs.
+ //
+-// netsimd -s '{devices:[
+-//  {"name":"0.0.0.0:5000", "chips":[
+-//    {"kind":"BLUETOOTH", "fdIn":10, "fdOut":11}],
+-//   "device_kind": {
+-//     "name":"0.0.0.0:5000", "kind":"CUTTLEFISH"}},
+-//  {"name":"0.0.0.0:5010", "chips":[
+-//    {"kind":"BLUETOOTH", "fdIn":14, "fdOut":15}],
+-//   "device_kind": {
+-//     "name":"0.0.0.0:5010", "kind":"CUTTLEFISH"}}]}
++// In shared mode, a single detached netsimd primary serves all independently-
++// launched instances. Each instance runs its own connector that forwards HCI
++// packets to the primary via gRPC. The primary's rootcanal simulation manages
++// all BT devices so they can discover and pair with each other.
++//
++// Coordination happens via /tmp/cf_avd_<uid>/netsim_state.json (flock'd).
++// The first instance to launch starts the detached primary. Subsequent
++// instances detect it and start as connectors. A watchdog thread in each
++// instance monitors primary health and re-launches it on failure.
+ 
+ // Chip and Device classes pass SharedFD fifos between ResultSetup and Commands
+ // and format the netsim json command line.
+@@ -85,6 +95,49 @@ class Device {
+   std::string name_;
+ };
+ 
++// Get the directory where netsim writes its discovery INI files.
++// netsim uses $TMPDIR (which on macOS is /var/folders/...), NOT /tmp.
++std::string NetsimDiscoveryDir() {
++  const char* tmpdir = getenv("TMPDIR");
++  if (tmpdir && *tmpdir) {
++    return tmpdir;
++  }
++  return "/tmp";
++}
++
++std::string NetsimIniPath(int external_instance_num) {
++  std::string ini_name;
++  if (external_instance_num == 1) {
++    ini_name = "netsim.ini";
++  } else {
++    ini_name = fmt::format("netsim_{}.ini", external_instance_num);
++  }
++  auto tmp = NetsimDiscoveryDir();
++  return fmt::format("{}/{}", tmp, ini_name);
++}
++
++// Read the gRPC port from netsim's discovery INI file.
++Result<int> ReadGrpcPortFromIni(int external_instance_num) {
++  auto ini_path = NetsimIniPath(external_instance_num);
++
++  // Wait up to 10 seconds for the INI file to appear
++  for (int i = 0; i < 20; ++i) {
++    if (FileExists(ini_path)) {
++      std::ifstream ifs(ini_path);
++      std::string line;
++      while (std::getline(ifs, line)) {
++        if (line.find("grpc.port=") == 0) {
++          return std::stoi(line.substr(10));
++        }
++      }
++      LOG(WARNING) << "INI file exists but grpc.port= not found: " << ini_path;
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(500));
++  }
++
++  return CF_ERR("Timed out waiting for netsim INI file: " << ini_path);
++}
++
+ class NetsimServer : public CommandSource {
+  public:
+   INJECT(NetsimServer(const CuttlefishConfig& config,
+@@ -98,22 +151,16 @@ class NetsimServer : public CommandSource {
+     AddDevicesParameter(netsimd);
+     // Release SharedFDs, they've been duped by Command
+     devices_.clear();
+-    // Port configuration.
++
++    // Port configuration — needed even in connector mode for rootcanal
++    // initialization and vsock proxy compatibility.
+     netsimd.AddParameter("--hci_port=", config_.rootcanal_hci_port());
+ 
+-    // When no connector is requested, add the instance number
+-    if (config_.netsim_connector_instance_num() ==
+-        config_.netsim_instance_num()) {
+-      // external instance numbers start at 1 not 0
+-      netsimd.AddParameter("--instance_num=",
+-                           config_.netsim_instance_num() + 1);
+-    } else {
+-      // If instance_num is not the target, then inform netsim to forward
+-      // packets to another netsim daemon that was launched from cuttlefish with
+-      // a different instance_num.
+-      netsimd.AddParameter("--connector_instance_num=",
+-                           config_.netsim_connector_instance_num() + 1);
+-    }
++    // Always run as connector, pointing to the shared primary
++    // external instance numbers start at 1 not 0
++    netsimd.AddParameter("--connector_instance_num=",
++                         primary_instance_num_ + 1);
++    netsimd.AddParameter("--no_test_beacons");
+ 
+     // Add parameters from passthrough option --netsim-args.
+     for (auto const& arg : config_.netsim_args()) {
+@@ -121,43 +168,28 @@ class NetsimServer : public CommandSource {
+     }
+ 
+     // Add command for forwarding the HCI port to a vsock server.
+-    Command hci_vsock_proxy(SocketVsockProxyBinary());
+-    hci_vsock_proxy.AddParameter("--server_type=vsock");
+-    hci_vsock_proxy.AddParameter("--server_vsock_port=",
+-                                 config_.rootcanal_hci_port());
+-    hci_vsock_proxy.AddParameter("--server_vsock_id=",
+-                                 instance_.vsock_guest_cid());
+-    hci_vsock_proxy.AddParameter("--client_type=tcp");
+-    hci_vsock_proxy.AddParameter("--client_tcp_host=127.0.0.1");
+-    hci_vsock_proxy.AddParameter("--client_tcp_port=",
+-                                 config_.rootcanal_hci_port());
+-    hci_vsock_proxy.AddParameter("--vhost_user_vsock=",
+-                                 instance_.vhost_user_vsock());
++    auto hci_vsock_proxy = MakeHciVsockProxy();
+ 
+     // Add command for forwarding the test port to a vsock server.
+-    Command test_vsock_proxy(SocketVsockProxyBinary());
+-    test_vsock_proxy.AddParameter("--server_type=vsock");
+-    test_vsock_proxy.AddParameter("--server_vsock_port=",
+-                                  config_.rootcanal_test_port());
+-    test_vsock_proxy.AddParameter("--server_vsock_id=",
+-                                  instance_.vsock_guest_cid());
+-    test_vsock_proxy.AddParameter("--client_type=tcp");
+-    test_vsock_proxy.AddParameter("--client_tcp_host=127.0.0.1");
+-    test_vsock_proxy.AddParameter("--client_tcp_port=",
+-                                  config_.rootcanal_test_port());
+-    test_vsock_proxy.AddParameter("--vhost_user_vsock=",
+-                                  instance_.vhost_user_vsock());
++    auto test_vsock_proxy = MakeTestVsockProxy();
+ 
+     std::vector<MonitorCommand> commands;
+     commands.emplace_back(std::move(netsimd));
+     commands.emplace_back(std::move(hci_vsock_proxy));
+     commands.emplace_back(std::move(test_vsock_proxy));
++
++    // Start the watchdog to monitor primary health
++    auto netsimd_path = HostBinaryPath("netsimd");
++    watchdog_ = std::make_unique<NetsimWatchdog>(
++        netsimd_path, primary_instance_num_, config_.rootcanal_hci_port(),
++        /*connector_restart_fn=*/nullptr  // Process monitor handles restart
++    );
++    watchdog_->Start();
++
+     return commands;
+   }
+ 
+-  // Convert devices_ to json for netsimd -s <arg>. The devices_, created and
+-  // validated during ResultSetup, contains all the SharedFDs and meta-data.
+-
++  // Convert devices_ to json for netsimd -s <arg>.
+   void AddDevicesParameter(Command& c) {
+     c.AddParameter(R"({"devices":[)");
+     for (int i = 0; i < devices_.size(); ++i) {
+@@ -171,7 +203,14 @@ class NetsimServer : public CommandSource {
+ 
+   // SetupFeature
+   std::string Name() const override { return "Netsim"; }
+-  bool Enabled() const override { return instance_.start_netsim(); }
++
++  // Enable for any instance that has netsim radios configured.
++  // The primary/connector decision is made at runtime, not assemble time.
++  bool Enabled() const override {
++    return config_.netsim_radio_enabled(
++               CuttlefishConfig::NetsimRadio::Bluetooth) ||
++           config_.netsim_radio_enabled(CuttlefishConfig::NetsimRadio::Uwb);
++  }
+ 
+  private:
+   std::unordered_set<SetupFeature*> Dependencies() const override { return {}; }
+@@ -181,27 +220,158 @@ class NetsimServer : public CommandSource {
+     CF_EXPECT(FileExists(netsimd),
+               "Failed to find netsimd binary: " << netsimd);
+ 
+-    for (const auto& instance : config_.Instances()) {
+-      Device device(instance.adb_ip_and_port());
+-      // Add bluetooth chip if enabled
+-      if (config_.netsim_radio_enabled(
+-              CuttlefishConfig::NetsimRadio::Bluetooth)) {
+-        Chip chip("BLUETOOTH");
+-        chip.fd_in = CF_EXPECT(MakeFifo(instance, "bt_fifo_vm.in"));
+-        chip.fd_out = CF_EXPECT(MakeFifo(instance, "bt_fifo_vm.out"));
+-        device.chips.emplace_back(chip);
++    // Only create FIFOs for THIS instance (not all instances).
++    Device device(instance_.adb_ip_and_port());
++    if (config_.netsim_radio_enabled(
++            CuttlefishConfig::NetsimRadio::Bluetooth)) {
++      Chip chip("BLUETOOTH");
++      chip.fd_in = CF_EXPECT(MakeFifo(instance_, "bt_fifo_vm.in"));
++      chip.fd_out = CF_EXPECT(MakeFifo(instance_, "bt_fifo_vm.out"));
++      device.chips.emplace_back(chip);
++    }
++    if (config_.netsim_radio_enabled(CuttlefishConfig::NetsimRadio::Uwb)) {
++      Chip chip("UWB");
++      chip.fd_in = CF_EXPECT(MakeFifo(instance_, "uwb_fifo_vm.in"));
++      chip.fd_out = CF_EXPECT(MakeFifo(instance_, "uwb_fifo_vm.out"));
++      device.chips.emplace_back(chip);
++    }
++    devices_.emplace_back(device);
++
++    // Check shared state — launch detached primary if none exists
++    auto state = CF_EXPECT(NetsimState::Acquire());
++    if (!state.HasHealthyPrimary()) {
++      auto [pid, grpc_port] = CF_EXPECT(LaunchDetachedPrimary());
++      state.SetPrimary(pid, grpc_port, config_.netsim_instance_num(), netsimd);
++      primary_instance_num_ = config_.netsim_instance_num();
++      LOG(INFO) << "NetsimServer: launched shared primary (PID " << pid
++                << ", gRPC port " << grpc_port << ")";
++    } else {
++      primary_instance_num_ = state.PrimaryInstanceNum();
++      LOG(INFO) << "NetsimServer: connecting to existing primary (instance "
++                << primary_instance_num_ << ")";
++    }
++
++    // Register this instance as a client
++    state.AddClient(instance_.id(), getpid(),
++                    instance_.adb_ip_and_port());
++    CF_EXPECT(state.Commit());
++
++    return {};
++  }
++
++  // Launch a detached netsimd primary via double-fork to avoid zombies.
++  // Uses a CLOEXEC pipe to detect exec failures and closes inherited FDs
++  // in the grandchild before exec. Returns (pid, grpc_port).
++  Result<std::pair<pid_t, int>> LaunchDetachedPrimary() {
++    auto netsimd_path = HostBinaryPath("netsimd");
++    CF_EXPECT(FileExists(netsimd_path));
++
++    int external_instance_num = config_.netsim_instance_num() + 1;
++    auto instance_arg =
++        fmt::format("--instance_num={}", external_instance_num);
++    auto hci_port_arg =
++        fmt::format("--hci_port={}", config_.rootcanal_hci_port());
++
++    auto stale_ini = NetsimIniPath(external_instance_num);
++    if (FileExists(stale_ini)) {
++      LOG(INFO) << "Removing stale netsim INI: " << stale_ini;
++      unlink(stale_ini.c_str());
++    }
++
++    int max_fd = static_cast<int>(sysconf(_SC_OPEN_MAX));
++    if (max_fd < 0) max_fd = 1024;
++
++    // CLOEXEC pipe: successful exec auto-closes write end (parent reads 0);
++    // failed exec writes errno before _exit.
++    int exec_pipe[2];
++    CF_EXPECT(pipe(exec_pipe) == 0, "pipe failed: " << strerror(errno));
++    fcntl(exec_pipe[1], F_SETFD, FD_CLOEXEC);
++
++    // Pipe for intermediate child to send grandchild PID.
++    int pid_pipe[2];
++    CF_EXPECT(pipe(pid_pipe) == 0, "pipe failed: " << strerror(errno));
++
++    pid_t child1 = fork();
++    CF_EXPECT(child1 >= 0, "fork failed: " << strerror(errno));
++
++    if (child1 == 0) {
++      close(pid_pipe[0]);
++      close(exec_pipe[0]);
++
++      pid_t child2 = fork();
++      if (child2 < 0) _exit(1);
++      if (child2 > 0) {
++        // Intermediate child: send grandchild PID and exit immediately.
++        // Parent reaps us with waitpid; grandchild is reparented to init.
++        write(pid_pipe[1], &child2, sizeof(child2));
++        close(pid_pipe[1]);
++        close(exec_pipe[1]);
++        _exit(0);
+       }
+-      // Add uwb chip if enabled
+-      if (config_.netsim_radio_enabled(CuttlefishConfig::NetsimRadio::Uwb)) {
+-        Chip chip("UWB");
+-        chip.fd_in = CF_EXPECT(MakeFifo(instance, "uwb_fifo_vm.in"));
+-        chip.fd_out = CF_EXPECT(MakeFifo(instance, "uwb_fifo_vm.out"));
+-        device.chips.emplace_back(chip);
++
++      // Grandchild: become session leader, close inherited FDs, exec.
++      close(pid_pipe[1]);
++      setsid();
++      for (int fd = 3; fd < max_fd; ++fd) {
++        if (fd != exec_pipe[1]) close(fd);
+       }
+-      // Add other chips if enabled
+-      devices_.emplace_back(device);
++
++      execl(netsimd_path.c_str(), "netsimd", instance_arg.c_str(),
++            hci_port_arg.c_str(), "--no_test_beacons", "--no_shutdown",
++            nullptr);
++      int err = errno;
++      write(exec_pipe[1], &err, sizeof(err));
++      _exit(1);
+     }
+-    return {};
++
++    // Parent: close write ends, reap intermediate child.
++    close(pid_pipe[1]);
++    close(exec_pipe[1]);
++    waitpid(child1, nullptr, 0);
++
++    pid_t grandchild;
++    auto n = read(pid_pipe[0], &grandchild, sizeof(grandchild));
++    close(pid_pipe[0]);
++    CF_EXPECT(n == static_cast<ssize_t>(sizeof(grandchild)),
++              "Failed to read grandchild PID");
++
++    int exec_err;
++    n = read(exec_pipe[0], &exec_err, sizeof(exec_err));
++    close(exec_pipe[0]);
++    CF_EXPECT(n == 0, "netsimd exec failed: " << strerror(exec_err));
++
++    auto port_result = ReadGrpcPortFromIni(external_instance_num);
++    if (!port_result.ok()) {
++      LOG(ERROR) << "Killing orphaned netsimd (PID " << grandchild
++                 << "): " << port_result.error().FormatForEnv();
++      kill(grandchild, SIGTERM);
++      return CF_ERR(port_result.error().FormatForEnv());
++    }
++    return std::make_pair(grandchild, *port_result);
++  }
++
++  Command MakeHciVsockProxy() {
++    Command cmd(SocketVsockProxyBinary());
++    cmd.AddParameter("--server_type=vsock");
++    cmd.AddParameter("--server_vsock_port=", config_.rootcanal_hci_port());
++    cmd.AddParameter("--server_vsock_id=", instance_.vsock_guest_cid());
++    cmd.AddParameter("--client_type=tcp");
++    cmd.AddParameter("--client_tcp_host=127.0.0.1");
++    cmd.AddParameter("--client_tcp_port=", config_.rootcanal_hci_port());
++    cmd.AddParameter("--vhost_user_vsock=", instance_.vhost_user_vsock());
++    return cmd;
++  }
++
++  Command MakeTestVsockProxy() {
++    Command cmd(SocketVsockProxyBinary());
++    cmd.AddParameter("--server_type=vsock");
++    cmd.AddParameter("--server_vsock_port=", config_.rootcanal_test_port());
++    cmd.AddParameter("--server_vsock_id=", instance_.vsock_guest_cid());
++    cmd.AddParameter("--client_type=tcp");
++    cmd.AddParameter("--client_tcp_host=127.0.0.1");
++    cmd.AddParameter("--client_tcp_port=", config_.rootcanal_test_port());
++    cmd.AddParameter("--vhost_user_vsock=", instance_.vhost_user_vsock());
++    return cmd;
+   }
+ 
+   Result<SharedFD> MakeFifo(const CuttlefishConfig::InstanceSpecific& instance,
+@@ -214,6 +384,8 @@ class NetsimServer : public CommandSource {
+   std::vector<Device> devices_;
+   const CuttlefishConfig& config_;
+   const CuttlefishConfig::InstanceSpecific& instance_;
++  int primary_instance_num_ = 0;
++  std::unique_ptr<NetsimWatchdog> watchdog_;
+ };
+ 
+ }  // namespace
+diff --git a/host/commands/stop/main.cc b/host/commands/stop/main.cc
+index 3df403342..5151b6ef1 100644
+--- a/host/commands/stop/main.cc
++++ b/host/commands/stop/main.cc
+@@ -41,6 +41,7 @@
+ #include "host/libs/command_util/util.h"
+ #include "host/libs/config/cuttlefish_config.h"
+ #include "host/libs/config/instance_registry.h"
++#include "host/libs/config/netsim_state.h"
+ #include "host/libs/metrics/metrics_receiver.h"
+ 
+ namespace cuttlefish {
+@@ -138,9 +139,41 @@ Result<void> CleanStopInstance(
+   return {};
+ }
+ 
++void DeregisterNetsimClient(
++    const CuttlefishConfig::InstanceSpecific& instance) {
++  auto state_result = NetsimState::Acquire();
++  if (!state_result.ok()) {
++    // State file may not exist if netsim was never used — not an error.
++    return;
++  }
++  auto& state = *state_result;
++
++  // Remove + clear are a single operation under the held flock so no
++  // other instance can observe an intermediate state.
++  bool was_last = state.RemoveClientAndCleanup(instance.id());
++  if (was_last) {
++    LOG(INFO) << "Last netsim client deregistered, primary will auto-exit";
++  } else {
++    LOG(INFO) << "Deregistered netsim client (instance "
++              << instance.id() << "), "
++              << state.ClientCount() << " remaining";
++  }
++
++  auto commit_result = state.Commit();
++  if (!commit_result.ok()) {
++    LOG(WARNING) << "Failed to commit netsim state: "
++                 << commit_result.error().FormatForEnv();
++  }
++}
++
+ int StopInstance(const CuttlefishConfig& config,
+                  const CuttlefishConfig::InstanceSpecific& instance,
+                  const std::int32_t wait_for_launcher) {
++  // Deregister from shared netsim state before stopping.
++  // This must happen before the process monitor kills the connector,
++  // so the state file accurately reflects remaining clients.
++  DeregisterNetsimClient(instance);
++
+   auto result = CleanStopInstance(instance, wait_for_launcher);
+   if (!result.ok()) {
+     LOG(ERROR) << "Clean stop failed: " << result.error().FormatForEnv();
+diff --git a/host/libs/config/Android.bp b/host/libs/config/Android.bp
+index e43a18a07..9ead68fa9 100644
+--- a/host/libs/config/Android.bp
++++ b/host/libs/config/Android.bp
+@@ -37,6 +37,8 @@ cc_library {
+         "kernel_args.cpp",
+         "known_paths.cpp",
+         "logging.cpp",
++        "netsim_state.cpp",
++        "netsim_watchdog.cpp",
+         "openwrt_args.cpp",
+         "secure_hals.cpp",
+         "touchpad.cpp",
+diff --git a/host/libs/config/netsim_state.cpp b/host/libs/config/netsim_state.cpp
+new file mode 100644
+index 000000000..93fba4c52
+--- /dev/null
++++ b/host/libs/config/netsim_state.cpp
+@@ -0,0 +1,239 @@
++/*
++ * Copyright (C) 2024 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "host/libs/config/netsim_state.h"
++
++#include <errno.h>
++#include <signal.h>
++#include <sys/file.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include <fstream>
++#include <sstream>
++#include <string>
++
++#include <android-base/logging.h>
++#include <fmt/format.h>
++#include <json/json.h>
++
++#include "common/libs/fs/shared_fd.h"
++#include "common/libs/utils/files.h"
++#include "common/libs/utils/known_paths.h"
++#include "common/libs/utils/result.h"
++
++namespace cuttlefish {
++
++namespace {
++
++constexpr char kPrimary[] = "primary";
++constexpr char kClients[] = "clients";
++constexpr char kPid[] = "pid";
++constexpr char kGrpcPort[] = "grpc_port";
++constexpr char kInstanceNum[] = "instance_num";
++constexpr char kNetsimdPath[] = "netsimd_path";
++constexpr char kInstanceId[] = "instance_id";
++constexpr char kRunCvdPid[] = "run_cvd_pid";
++constexpr char kDeviceName[] = "device_name";
++
++}  // namespace
++
++NetsimState::~NetsimState() {
++  if (lock_fd_->IsOpen() && !lock_released_) {
++    Release();
++  }
++}
++
++std::string NetsimState::StatePath() {
++  return fmt::format("{}/cf_avd_{}/netsim_state.json", TempDir(), getuid());
++}
++
++Result<NetsimState> NetsimState::Acquire() {
++  NetsimState state;
++
++  auto dir = fmt::format("{}/cf_avd_{}", TempDir(), getuid());
++  if (!DirectoryExists(dir)) {
++    CF_EXPECT(EnsureDirectoryExists(dir, 0770));
++  }
++
++  auto path = StatePath();
++
++  // Open or create the state file
++  state.lock_fd_ = SharedFD::Open(path, O_RDWR | O_CREAT, 0660);
++  CF_EXPECT(state.lock_fd_->IsOpen(),
++            "Failed to open netsim state file: " << path << ": "
++                                                 << state.lock_fd_->StrError());
++
++  // Acquire exclusive lock (blocks until available)
++  CF_EXPECT(state.lock_fd_->Flock(LOCK_EX));
++
++  // Read existing content
++  std::string content;
++  auto size = state.lock_fd_->LSeek(0, SEEK_END);
++  if (size > 0) {
++    state.lock_fd_->LSeek(0, SEEK_SET);
++    content.resize(size);
++    auto read = state.lock_fd_->Read(content.data(), size);
++    if (read > 0) {
++      content.resize(read);
++    } else {
++      content.clear();
++    }
++  }
++
++  // Parse JSON
++  if (!content.empty()) {
++    Json::Reader reader;
++    if (!reader.parse(content, state.state_)) {
++      LOG(WARNING) << "Failed to parse netsim state file, starting fresh";
++      state.state_ = Json::Value(Json::objectValue);
++    }
++  } else {
++    state.state_ = Json::Value(Json::objectValue);
++  }
++
++  if (!state.state_.isMember(kClients)) {
++    state.state_[kClients] = Json::Value(Json::arrayValue);
++  }
++
++  return state;
++}
++
++bool NetsimState::HasHealthyPrimary() const {
++  if (!state_.isMember(kPrimary)) return false;
++  const auto& primary = state_[kPrimary];
++  if (!primary.isMember(kPid)) return false;
++
++  pid_t pid = primary[kPid].asInt();
++  if (pid <= 0) return false;
++
++  // Check if process is alive
++  if (kill(pid, 0) != 0) {
++    return false;
++  }
++
++  // Check if gRPC port is accepting connections
++  if (!primary.isMember(kGrpcPort)) return false;
++  int port = primary[kGrpcPort].asInt();
++  auto fd = SharedFD::SocketLocalClient(port, SOCK_STREAM);
++  if (!fd->IsOpen() || fd->GetErrno() != 0) {
++    return false;
++  }
++  fd->Close();
++  return true;
++}
++
++void NetsimState::SetPrimary(pid_t pid, int grpc_port, int instance_num,
++                             const std::string& netsimd_path) {
++  state_[kPrimary] = Json::Value(Json::objectValue);
++  state_[kPrimary][kPid] = static_cast<int>(pid);
++  state_[kPrimary][kGrpcPort] = grpc_port;
++  state_[kPrimary][kInstanceNum] = instance_num;
++  state_[kPrimary][kNetsimdPath] = netsimd_path;
++}
++
++void NetsimState::ClearPrimary() {
++  state_.removeMember(kPrimary);
++}
++
++void NetsimState::AddClient(const std::string& instance_id,
++                            pid_t run_cvd_pid,
++                            const std::string& device_name) {
++  // Remove existing entry for this instance_id if any
++  RemoveClient(instance_id);
++
++  Json::Value client(Json::objectValue);
++  client[kInstanceId] = instance_id;
++  client[kRunCvdPid] = static_cast<int>(run_cvd_pid);
++  client[kDeviceName] = device_name;
++  state_[kClients].append(client);
++}
++
++bool NetsimState::RemoveClient(const std::string& instance_id) {
++  Json::Value new_clients(Json::arrayValue);
++  for (const auto& client : state_[kClients]) {
++    if (client[kInstanceId].asString() != instance_id) {
++      new_clients.append(client);
++    }
++  }
++  state_[kClients] = new_clients;
++  return new_clients.empty();
++}
++
++bool NetsimState::RemoveClientAndCleanup(const std::string& instance_id) {
++  bool was_last = RemoveClient(instance_id);
++  if (was_last) {
++    ClearPrimary();
++  }
++  return was_last;
++}
++
++int NetsimState::ClientCount() const {
++  return state_[kClients].size();
++}
++
++pid_t NetsimState::PrimaryPid() const {
++  if (!state_.isMember(kPrimary)) return -1;
++  return state_[kPrimary][kPid].asInt();
++}
++
++int NetsimState::PrimaryInstanceNum() const {
++  if (!state_.isMember(kPrimary)) return 0;
++  return state_[kPrimary][kInstanceNum].asInt();
++}
++
++int NetsimState::PrimaryGrpcPort() const {
++  if (!state_.isMember(kPrimary)) return 0;
++  return state_[kPrimary][kGrpcPort].asInt();
++}
++
++std::string NetsimState::PrimaryNetsimdPath() const {
++  if (!state_.isMember(kPrimary)) return "";
++  return state_[kPrimary][kNetsimdPath].asString();
++}
++
++Result<void> NetsimState::Commit() {
++  CF_EXPECT(lock_fd_->IsOpen(), "State file not open");
++
++  // Truncate and rewrite
++  CF_EXPECT(lock_fd_->LSeek(0, SEEK_SET) == 0);
++  CF_EXPECT(lock_fd_->Truncate(0) == 0);
++
++  std::ostringstream oss;
++  oss << state_;
++  auto data = oss.str();
++  auto written = lock_fd_->Write(data.data(), data.size());
++  CF_EXPECT(written == static_cast<ssize_t>(data.size()),
++            "Short write to state file");
++  CF_EXPECT(lock_fd_->Fsync() == 0);
++
++  // Release lock
++  lock_fd_->Flock(LOCK_UN);
++  lock_fd_->Close();
++  lock_released_ = true;
++  return {};
++}
++
++void NetsimState::Release() {
++  if (lock_fd_->IsOpen()) {
++    lock_fd_->Flock(LOCK_UN);
++    lock_fd_->Close();
++  }
++  lock_released_ = true;  // prevent destructor from double-releasing
++}
++
++}  // namespace cuttlefish
+diff --git a/host/libs/config/netsim_state.h b/host/libs/config/netsim_state.h
+new file mode 100644
+index 000000000..90f326043
+--- /dev/null
++++ b/host/libs/config/netsim_state.h
+@@ -0,0 +1,96 @@
++/*
++ * Copyright (C) 2024 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#pragma once
++
++#include <string>
++
++#include <json/json.h>
++
++#include "common/libs/fs/shared_fd.h"
++#include "common/libs/utils/result.h"
++
++namespace cuttlefish {
++
++// Manages shared netsim state across independently-launched Cuttlefish
++// instances. Uses /tmp/cf_avd_<uid>/netsim_state.json with flock() for atomic
++// coordination.
++//
++// When multiple emulators are launched independently, they need to share a
++// single netsimd primary. The first launcher starts a detached primary and
++// registers it here. Subsequent launchers detect the existing primary and
++// start as connectors. The state file tracks which instances are connected
++// so that cleanup happens correctly on stop.
++class NetsimState {
++ public:
++  NetsimState(NetsimState&& other) = default;
++  NetsimState& operator=(NetsimState&& other) = default;
++  NetsimState(const NetsimState&) = delete;
++  NetsimState& operator=(const NetsimState&) = delete;
++  ~NetsimState();
++
++  // Acquire an exclusive flock on the state file and read current state.
++  // The lock is held until Commit() or Release() is called (or destructor).
++  static Result<NetsimState> Acquire();
++
++  // Check if the registered primary is healthy:
++  //   1. PID is alive (kill(pid, 0) == 0)
++  //   2. gRPC port is accepting connections
++  bool HasHealthyPrimary() const;
++
++  // Register a detached primary netsimd.
++  void SetPrimary(pid_t pid, int grpc_port, int instance_num,
++                  const std::string& netsimd_path);
++
++  // Clear primary info (e.g., when last client stops).
++  void ClearPrimary();
++
++  // Add a client (emulator instance) to the state.
++  // instance_id is a unique string identifier (e.g., InstanceSpecific::id()).
++  void AddClient(const std::string& instance_id, pid_t run_cvd_pid,
++                 const std::string& device_name);
++
++  // Remove a client. Returns true if this was the last client.
++  bool RemoveClient(const std::string& instance_id);
++
++  // Atomically remove a client and clear primary info if this was the last.
++  // Returns true if this was the last client.
++  bool RemoveClientAndCleanup(const std::string& instance_id);
++
++  int ClientCount() const;
++
++  pid_t PrimaryPid() const;
++  int PrimaryInstanceNum() const;
++  int PrimaryGrpcPort() const;
++  std::string PrimaryNetsimdPath() const;
++
++  // Write updated state to disk and release the flock.
++  Result<void> Commit();
++
++  // Release the flock without writing changes.
++  void Release();
++
++  // Path to the state file.
++  static std::string StatePath();
++
++ private:
++  NetsimState() = default;
++
++  SharedFD lock_fd_;
++  Json::Value state_;
++  bool lock_released_ = false;
++};
++
++}  // namespace cuttlefish
+diff --git a/host/libs/config/netsim_watchdog.cpp b/host/libs/config/netsim_watchdog.cpp
+new file mode 100644
+index 000000000..14b689b4f
+--- /dev/null
++++ b/host/libs/config/netsim_watchdog.cpp
+@@ -0,0 +1,244 @@
++/*
++ * Copyright (C) 2024 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "host/libs/config/netsim_watchdog.h"
++
++#include <fcntl.h>
++#include <signal.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include <chrono>
++#include <fstream>
++#include <string>
++#include <thread>
++
++#include <android-base/logging.h>
++#include <fmt/format.h>
++
++#include "common/libs/utils/files.h"
++#include "host/libs/config/netsim_state.h"
++
++namespace cuttlefish {
++
++namespace {
++
++constexpr int kPollIntervalSeconds = 5;
++
++// Get the directory where netsim writes its discovery INI files.
++// netsim uses $TMPDIR (which on macOS is /var/folders/...), NOT /tmp.
++std::string NetsimDiscoveryDir() {
++  const char* tmpdir = getenv("TMPDIR");
++  if (tmpdir && *tmpdir) {
++    return tmpdir;
++  }
++  return "/tmp";
++}
++
++std::string NetsimIniPath(int external_instance_num) {
++  std::string ini_name;
++  if (external_instance_num == 1) {
++    ini_name = "netsim.ini";
++  } else {
++    ini_name = fmt::format("netsim_{}.ini", external_instance_num);
++  }
++  auto tmp = NetsimDiscoveryDir();
++  return fmt::format("{}/{}", tmp, ini_name);
++}
++
++// Read the gRPC port from netsim's discovery INI file.
++Result<int> ReadGrpcPortFromIni(int external_instance_num) {
++  auto ini_path = NetsimIniPath(external_instance_num);
++
++  // Wait up to 10 seconds for the INI file to appear
++  for (int i = 0; i < 20; ++i) {
++    if (FileExists(ini_path)) {
++      std::ifstream ifs(ini_path);
++      std::string line;
++      while (std::getline(ifs, line)) {
++        if (line.find("grpc.port=") == 0) {
++          return std::stoi(line.substr(10));
++        }
++      }
++      LOG(WARNING) << "INI file exists but grpc.port= not found: " << ini_path;
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(500));
++  }
++
++  return CF_ERR("Timed out waiting for netsim INI file: " << ini_path);
++}
++
++}  // namespace
++
++NetsimWatchdog::NetsimWatchdog(const std::string& netsimd_path,
++                               int netsim_instance_num, int hci_port,
++                               std::function<void()> connector_restart_fn)
++    : netsimd_path_(netsimd_path),
++      netsim_instance_num_(netsim_instance_num),
++      hci_port_(hci_port),
++      connector_restart_fn_(std::move(connector_restart_fn)) {}
++
++NetsimWatchdog::~NetsimWatchdog() { Stop(); }
++
++void NetsimWatchdog::Start() {
++  if (running_.load()) return;
++  running_.store(true);
++  thread_ = std::thread(&NetsimWatchdog::WatchdogLoop, this);
++}
++
++void NetsimWatchdog::Stop() {
++  running_.store(false);
++  if (thread_.joinable()) {
++    thread_.join();
++  }
++}
++
++void NetsimWatchdog::WatchdogLoop() {
++  while (running_.load()) {
++    std::this_thread::sleep_for(std::chrono::seconds(kPollIntervalSeconds));
++    if (!running_.load()) break;
++
++    auto state_result = NetsimState::Acquire();
++    if (!state_result.ok()) {
++      LOG(WARNING) << "Watchdog: failed to acquire netsim state: "
++                   << state_result.error().FormatForEnv();
++      continue;
++    }
++    auto& state = *state_result;
++
++    if (state.HasHealthyPrimary()) {
++      state.Release();
++      continue;
++    }
++
++    // Primary is dead — we won the race (flock ensures only one winner).
++    LOG(WARNING) << "Watchdog: netsim primary is dead, launching new one";
++
++    auto launch_result = LaunchNewPrimary(state);
++    if (!launch_result.ok()) {
++      LOG(ERROR) << "Watchdog: failed to launch new primary: "
++                 << launch_result.error().FormatForEnv();
++      state.Release();
++      continue;
++    }
++
++    // State was updated by LaunchNewPrimary, commit it
++    auto commit_result = state.Commit();
++    if (!commit_result.ok()) {
++      LOG(ERROR) << "Watchdog: failed to commit state: "
++                 << commit_result.error().FormatForEnv();
++      continue;
++    }
++
++    // Restart our local connector so it connects to the new primary.
++    if (connector_restart_fn_) {
++      LOG(INFO) << "Watchdog: restarting local connector";
++      connector_restart_fn_();
++    }
++  }
++}
++
++Result<void> NetsimWatchdog::LaunchNewPrimary(NetsimState& state) {
++  CF_EXPECT(FileExists(netsimd_path_),
++            "netsimd binary not found: " << netsimd_path_);
++
++  int external_instance_num = netsim_instance_num_ + 1;
++  auto instance_arg =
++      fmt::format("--instance_num={}", external_instance_num);
++  auto hci_port_arg = fmt::format("--hci_port={}", hci_port_);
++
++  auto stale_ini = NetsimIniPath(external_instance_num);
++  if (FileExists(stale_ini)) {
++    LOG(INFO) << "Watchdog: removing stale netsim INI: " << stale_ini;
++    unlink(stale_ini.c_str());
++  }
++
++  int max_fd = static_cast<int>(sysconf(_SC_OPEN_MAX));
++  if (max_fd < 0) max_fd = 1024;
++
++  int exec_pipe[2];
++  CF_EXPECT(pipe(exec_pipe) == 0, "pipe failed: " << strerror(errno));
++  fcntl(exec_pipe[1], F_SETFD, FD_CLOEXEC);
++
++  int pid_pipe[2];
++  CF_EXPECT(pipe(pid_pipe) == 0, "pipe failed: " << strerror(errno));
++
++  pid_t child1 = fork();
++  CF_EXPECT(child1 >= 0, "fork failed: " << strerror(errno));
++
++  if (child1 == 0) {
++    close(pid_pipe[0]);
++    close(exec_pipe[0]);
++
++    pid_t child2 = fork();
++    if (child2 < 0) _exit(1);
++    if (child2 > 0) {
++      write(pid_pipe[1], &child2, sizeof(child2));
++      close(pid_pipe[1]);
++      close(exec_pipe[1]);
++      _exit(0);
++    }
++
++    close(pid_pipe[1]);
++    setsid();
++    for (int fd = 3; fd < max_fd; ++fd) {
++      if (fd != exec_pipe[1]) close(fd);
++    }
++
++    execl(netsimd_path_.c_str(), "netsimd", instance_arg.c_str(),
++          hci_port_arg.c_str(), "--no_test_beacons", "--no_shutdown",
++          nullptr);
++    int err = errno;
++    write(exec_pipe[1], &err, sizeof(err));
++    _exit(1);
++  }
++
++  close(pid_pipe[1]);
++  close(exec_pipe[1]);
++  waitpid(child1, nullptr, 0);
++
++  pid_t grandchild;
++  auto n = read(pid_pipe[0], &grandchild, sizeof(grandchild));
++  close(pid_pipe[0]);
++  CF_EXPECT(n == static_cast<ssize_t>(sizeof(grandchild)),
++            "Failed to read grandchild PID");
++
++  int exec_err;
++  n = read(exec_pipe[0], &exec_err, sizeof(exec_err));
++  close(exec_pipe[0]);
++  CF_EXPECT(n == 0, "netsimd exec failed: " << strerror(exec_err));
++
++  auto port_result = ReadGrpcPortFromIni(external_instance_num);
++  if (!port_result.ok()) {
++    LOG(ERROR) << "Watchdog: killing orphaned netsimd (PID " << grandchild
++               << "): " << port_result.error().FormatForEnv();
++    kill(grandchild, SIGTERM);
++    return CF_ERR(port_result.error().FormatForEnv());
++  }
++  int grpc_port = *port_result;
++
++  // Verify the grandchild is still alive before registering it.
++  CF_EXPECT(kill(grandchild, 0) == 0,
++            "netsimd (PID " << grandchild << ") exited immediately after exec");
++
++  state.SetPrimary(grandchild, grpc_port, netsim_instance_num_, netsimd_path_);
++
++  LOG(INFO) << "Watchdog: new primary launched (PID " << grandchild
++            << ", gRPC port " << grpc_port << ")";
++  return {};
++}
++
++}  // namespace cuttlefish
+diff --git a/host/libs/config/netsim_watchdog.h b/host/libs/config/netsim_watchdog.h
+new file mode 100644
+index 000000000..f943b9ed7
+--- /dev/null
++++ b/host/libs/config/netsim_watchdog.h
+@@ -0,0 +1,68 @@
++/*
++ * Copyright (C) 2024 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++#pragma once
++
++#include <atomic>
++#include <functional>
++#include <string>
++#include <thread>
++
++#include "common/libs/utils/result.h"
++
++namespace cuttlefish {
++
++class NetsimState;
++
++// Background watchdog that monitors the health of a shared netsimd primary
++// and re-launches it if it crashes. Runs in each run_cvd process.
++//
++// Polls every 5 seconds. When the primary is detected as dead (PID gone or
++// gRPC unreachable), acquires the state file lock and launches a new primary.
++// The flock ensures only one watchdog wins the race in multi-instance setups.
++//
++// After launching a new primary, the watchdog calls the connector_restart_fn
++// callback so the caller can kill and restart its local connector process
++// (which needs to reconnect to the new primary).
++class NetsimWatchdog {
++ public:
++  // connector_restart_fn is called when a new primary has been launched and
++  // the local connector needs to be restarted.
++  // netsimd_path is the path to the netsimd binary for launching a new primary.
++  // netsim_instance_num is the internal instance number (0-based) for the
++  // primary.
++  NetsimWatchdog(const std::string& netsimd_path, int netsim_instance_num,
++                 int hci_port, std::function<void()> connector_restart_fn);
++  ~NetsimWatchdog();
++
++  NetsimWatchdog(const NetsimWatchdog&) = delete;
++  NetsimWatchdog& operator=(const NetsimWatchdog&) = delete;
++
++  void Start();
++  void Stop();
++
++ private:
++  void WatchdogLoop();
++  Result<void> LaunchNewPrimary(NetsimState& state);
++
++  std::string netsimd_path_;
++  int netsim_instance_num_;
++  int hci_port_;
++  std::function<void()> connector_restart_fn_;
++  std::atomic<bool> running_{false};
++  std::thread thread_;
++};
++
++}  // namespace cuttlefish

@@ -1,0 +1,1973 @@
+From 5aac6e36fd2ab69d37ef4c29363163afdfd71055 Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Mon, 28 Jul 2025 14:41:41 +0100
+Subject: [PATCH 21/63] Add vhost-user and vhost-user vsock support (except
+ rust crates)
+
+Summary: Cuttlefish side changes to support vhost-user vsock on mac.
+
+Test Plan:
+- Add a lot of debug logging
+- Update epoll
+- Fix temp paths for sockets to fit mac limits
+- Add mac inotify and test
+- Remove crosvm limitations
+- Small image generation fixes
+---
+ common/frontend/socket_vsock_proxy/client.cpp |  39 +++-
+ common/frontend/socket_vsock_proxy/server.cpp |  61 +++++-
+ .../socket_vsock_proxy/socket_vsock_proxy.cpp | 107 +++++++++-
+ common/libs/fs/epoll.cpp                      | 187 +++++++++++++++++
+ common/libs/fs/shared_fd.cpp                  |  80 +++++--
+ common/libs/fs/shared_fd.h                    |  17 +-
+ common/libs/utils/Android.bp                  |   1 +
+ common/libs/utils/files.cpp                   | 197 ++++++++++++++++++
+ common/libs/utils/files.h                     |   2 +-
+ common/libs/utils/files_monitor_test.cpp      | 174 ++++++++++++++++
+ common/libs/utils/inotify.cpp                 | 107 ++++++++--
+ common/libs/utils/known_paths.cpp             |   9 +-
+ common/libs/utils/socket2socket_proxy.cpp     |  80 +++++--
+ host/commands/assemble_cvd/disk_builder.cpp   |   4 -
+ host/commands/assemble_cvd/flags.cc           |   7 +-
+ host/commands/run_cvd/Android.bp              |  14 ++
+ host/commands/run_cvd/main.cc                 |  26 +--
+ host/libs/config/cuttlefish_config.h          |   1 +
+ .../libs/image_aggregator/image_aggregator.cc |  12 +-
+ host/libs/vm_manager/qemu_manager.cpp         |  59 +++++-
+ 20 files changed, 1073 insertions(+), 111 deletions(-)
+ create mode 100644 common/libs/utils/files_monitor_test.cpp
+
+diff --git a/common/frontend/socket_vsock_proxy/client.cpp b/common/frontend/socket_vsock_proxy/client.cpp
+index 91232b5cd..3c90503d0 100644
+--- a/common/frontend/socket_vsock_proxy/client.cpp
++++ b/common/frontend/socket_vsock_proxy/client.cpp
+@@ -85,21 +85,48 @@ std::string TcpClient::Describe() const {
+ }
+ 
+ VsockClient::VsockClient(int id, int port, bool vhost_user_vsock)
+-    : id_(id), port_(port), vhost_user_vsock_(vhost_user_vsock) {}
++    : id_(id), port_(port), vhost_user_vsock_(vhost_user_vsock) {
++  LOG(INFO) << "VsockClient created - CID: " << id_ << ", Port: " << port_ 
++            << ", vhost-user: " << (vhost_user_vsock_ ? "enabled" : "disabled");
++}
+ 
+ SharedFD VsockClient::Start() {
++  LOG(INFO) << "Attempting vsock connection - CID: " << id_ << ", Port: " << port_ 
++            << ", vhost-user: " << (vhost_user_vsock_ ? "enabled" : "disabled");
++  
++  if (vhost_user_vsock_) {
++    LOG(DEBUG) << "Using vhost-user vsock backend for connection";
++  } else {
++    LOG(DEBUG) << "Using standard vsock backend for connection";
++  }
++
+   auto vsock_socket =
+       SharedFD::VsockClient(id_, port_, SOCK_STREAM, vhost_user_vsock_);
+ 
+   if (vsock_socket->IsOpen()) {
+     last_failure_reason_ = 0;
+-    LOG(DEBUG) << "Connected to vsock:" << id_ << ":" << port_;
++    LOG(INFO) << "Successfully connected to vsock - CID: " << id_ << ", Port: " << port_
++              << ", vhost-user: " << (vhost_user_vsock_ ? "enabled" : "disabled");
++    
++    LOG(DEBUG) << "vsock connection ready for IO operations";
+   } else {
++    int current_errno = vsock_socket->GetErrno();
++    std::string error_str = vsock_socket->StrError();
++    
+     // Don't log if the previous connection failed with the same error
+-    if (last_failure_reason_ != vsock_socket->GetErrno()) {
+-      last_failure_reason_ = vsock_socket->GetErrno();
+-      LOG(ERROR) << "Unable to connect to vsock server: "
+-                 << vsock_socket->StrError();
++    if (last_failure_reason_ != current_errno) {
++      last_failure_reason_ = current_errno;
++      LOG(ERROR) << "Failed to connect to vsock server - CID: " << id_ << ", Port: " << port_
++                 << ", vhost-user: " << (vhost_user_vsock_ ? "enabled" : "disabled")
++                 << ", Error: " << error_str << " (errno: " << current_errno << ")";
++      
++      // Additional vhost-user specific error logging
++      if (vhost_user_vsock_) {
++        LOG(ERROR) << "vhost-user vsock connection failed - this may indicate issues with:"
++                   << " vhost-user device availability, socket permissions, or backend configuration";
++      }
++    } else {
++      LOG(DEBUG) << "vsock connection failed with same error as before (errno: " << current_errno << ")";
+     }
+   }
+   return vsock_socket;
+diff --git a/common/frontend/socket_vsock_proxy/server.cpp b/common/frontend/socket_vsock_proxy/server.cpp
+index 94447e64e..fc725f2e7 100644
+--- a/common/frontend/socket_vsock_proxy/server.cpp
++++ b/common/frontend/socket_vsock_proxy/server.cpp
+@@ -25,7 +25,7 @@ namespace socket_proxy {
+ namespace {
+ 
+ bool socketErrorIsRecoverable(int error) {
+-  std::set<int> unrecoverable{EACCES, EAFNOSUPPORT, EINVAL, EPROTONOSUPPORT, EADDRINUSE};
++  std::set<int> unrecoverable{EACCES, EAFNOSUPPORT, EINVAL, EPROTONOSUPPORT, EADDRINUSE, ENODEV};
+   return !Contains(unrecoverable, error);
+ }
+ 
+@@ -69,18 +69,73 @@ std::string TcpServer::Describe() const {
+ }
+ 
+ VsockServer::VsockServer(int port, std::optional<int> vhost_user_vsock_cid)
+-    : port_(port), vhost_user_vsock_cid_(vhost_user_vsock_cid) {}
++    : port_(port), vhost_user_vsock_cid_(vhost_user_vsock_cid) {
++  LOG(INFO) << "VsockServer created - Port: " << port_ 
++            << ", vhost-user CID: " << (vhost_user_vsock_cid_.has_value() ? 
++                std::to_string(vhost_user_vsock_cid_.value()) : "none (standard vsock)");
++}
+ 
+ Result<SharedFD> VsockServer::Start() {
++  LOG(INFO) << "Starting vsock server - Port: " << port_ 
++            << ", vhost-user CID: " << (vhost_user_vsock_cid_.has_value() ? 
++                std::to_string(vhost_user_vsock_cid_.value()) : "none (standard vsock)");
++  
++  if (vhost_user_vsock_cid_.has_value()) {
++    LOG(DEBUG) << "Using vhost-user vsock backend with CID: " << vhost_user_vsock_cid_.value();
++  } else {
++    LOG(DEBUG) << "Using standard vsock backend";
++  }
++
+   SharedFD server;
++  int attempt_count = 0;
+   do {
++    attempt_count++;
++    LOG(DEBUG) << "vsock server connection attempt #" << attempt_count;
++    
+     server = SharedFD::VsockServer(port_, SOCK_STREAM, vhost_user_vsock_cid_);
+-    if (!server->IsOpen() && !socketErrorIsRecoverable(server->GetErrno())) {
++    
++    if (server->IsOpen()) {
++      LOG(INFO) << "Successfully started vsock server - Port: " << port_
++                << ", vhost-user CID: " << (vhost_user_vsock_cid_.has_value() ? 
++                    std::to_string(vhost_user_vsock_cid_.value()) : "none")
++                << ", attempts: " << attempt_count;
++      
++      LOG(DEBUG) << "vsock server ready for IO operations and client connections";
++      break;
++    }
++    
++    int current_errno = server->GetErrno();
++    std::string error_str = server->StrError();
++    
++    if (!socketErrorIsRecoverable(current_errno)) {
++      LOG(ERROR) << "Unrecoverable vsock server error - Port: " << port_
++                 << ", vhost-user CID: " << (vhost_user_vsock_cid_.has_value() ? 
++                     std::to_string(vhost_user_vsock_cid_.value()) : "none")
++                 << ", Error: " << error_str << " (errno: " << current_errno << ")"
++                 << ", attempts: " << attempt_count;
++      
++      // Additional vhost-user specific error logging
++      if (vhost_user_vsock_cid_.has_value()) {
++        LOG(ERROR) << "vhost-user vsock server failed with unrecoverable error - this may indicate:"
++                   << " vhost-user device unavailable, incorrect CID configuration, "
++                   << "socket permissions issues, or backend misconfiguration";
++      }
++      
+       LOG(ERROR) << "Could not open vsock socket: " << server->StrError();
+       // socket_vsock_proxy will now wait forever in the guest on encountering an
+       // "unrecoverable" errno. This is to prevent churn from being restarted by
+       // init.vsoc.rc.
+       SleepForever();
++    } else {
++      LOG(WARNING) << "Recoverable vsock server error - Port: " << port_
++                   << ", vhost-user CID: " << (vhost_user_vsock_cid_.has_value() ? 
++                       std::to_string(vhost_user_vsock_cid_.value()) : "none")
++                   << ", Error: " << error_str << " (errno: " << current_errno << ")"
++                   << ", attempt: " << attempt_count << " - retrying...";
++      
++      if (vhost_user_vsock_cid_.has_value()) {
++        LOG(DEBUG) << "vhost-user vsock server retry - checking vhost-user device availability";
++      }
+     }
+   } while (!server->IsOpen());
+ 
+diff --git a/common/frontend/socket_vsock_proxy/socket_vsock_proxy.cpp b/common/frontend/socket_vsock_proxy/socket_vsock_proxy.cpp
+index 03b54f516..c26c0d67f 100644
+--- a/common/frontend/socket_vsock_proxy/socket_vsock_proxy.cpp
++++ b/common/frontend/socket_vsock_proxy/socket_vsock_proxy.cpp
+@@ -146,14 +146,47 @@ static std::unique_ptr<Client> BuildClient() {
+ }
+ 
+ static Result<std::unique_ptr<ProxyServer>> StartProxyAsync(Server& server, Client& client) {
++  LOG(INFO) << "Starting async proxy connection";
+   LOG(INFO) << "From: " << server.Describe();
+   LOG(INFO) << "To: " << client.Describe();
+-  return ProxyAsync(CF_EXPECT(server.Start()), [&client] { return client.Start(); });
++  
++  if (use_vhost_vsock()) {
++    LOG(INFO) << "Proxy using vhost-user vsock backend";
++  } else {
++    LOG(DEBUG) << "Proxy using standard vsock backend";
++  }
++  
++  LOG(DEBUG) << "Establishing server connection for proxy";
++  auto server_fd = CF_EXPECT(server.Start());
++  LOG(INFO) << "Server connection established successfully";
++  
++  LOG(DEBUG) << "Setting up client connection factory for proxy";
++  auto proxy_server = ProxyAsync(server_fd, [&client] { 
++    LOG(DEBUG) << "Creating client connection for new proxy session";
++    auto client_fd = client.Start();
++    if (client_fd->IsOpen()) {
++      LOG(INFO) << "Client connection established for proxy session";
++    } else {
++      LOG(ERROR) << "Failed to establish client connection for proxy session: " << client_fd->StrError();
++    }
++    return client_fd;
++  });
++  
++  LOG(INFO) << "Async proxy server started successfully - ready for IO operations";
++  return proxy_server;
+ }
+ 
+ static Result<void> ListenEventsAndProxy(int events_fd,
+                                          const monitor::Event start, const monitor::Event stop,
+                                          Server& server, Client& client) {
++  LOG(INFO) << "Setting up event-driven proxy control";
++  LOG(INFO) << "Start event ID: " << start << ", Stop event ID: " << stop;
++  LOG(INFO) << "Server: " << server.Describe() << ", Client: " << client.Describe();
++  
++  if (use_vhost_vsock()) {
++    LOG(INFO) << "Event-driven proxy configured for vhost-user vsock";
++  }
++  
+   auto events = SharedFD::Dup(events_fd);
+   close(events_fd);
+ 
+@@ -163,6 +196,10 @@ static Result<void> ListenEventsAndProxy(int events_fd,
+   if (FLAGS_restore) {
+     LOG(INFO) << "restoring proxy on CUTTLEFISH_HOST - wait for adbd to come "
+                  "online before starting proxy";
++    if (use_vhost_vsock()) {
++      LOG(DEBUG) << "Restore mode using vhost-user vsock backend";
++    }
++    
+     auto config = CF_EXPECT(CuttlefishConfig::Get());
+     auto instance = config->ForDefaultInstance();
+     SharedFD restore_pipe_read =
+@@ -171,6 +208,8 @@ static Result<void> ListenEventsAndProxy(int events_fd,
+       return CF_ERR(
+           "Error opening restore pipe: " << restore_pipe_read->StrError());
+     }
++    LOG(DEBUG) << "Waiting for restore pipe signal";
++    
+     // Try to read from restore pipe. IF successfully reads, that means logcat
+     // has started, and the VM has resumed. Exit the thread.
+     // TODO (@khei): Add a device status tracking mechanism. b/325614380
+@@ -180,13 +219,15 @@ static Result<void> ListenEventsAndProxy(int events_fd,
+       return CF_ERR(
+           "Could not read restore pipe: " << restore_pipe_read->StrError());
+     }
+-    LOG(INFO) << "restoring proxy on CUTTLEFISH_HOST - success";
++    LOG(INFO) << "restoring proxy on CUTTLEFISH_HOST - success, starting proxy";
+     proxy = CF_EXPECT(StartProxyAsync(server, client));
+   }
+ #endif
+ 
+   LOG(DEBUG) << "Start reading events to start/stop proxying";
++  int event_count = 0;
+   while (events->IsOpen()) {
++    LOG(DEBUG) << "Waiting for kernel log events...";
+     Result<std::optional<monitor::ReadEventResult>> received_event =
+         monitor::ReadEvent(events);
+ 
+@@ -203,41 +244,95 @@ static Result<void> ListenEventsAndProxy(int events_fd,
+       break;
+     }
+ 
++    event_count++;
++    LOG(DEBUG) << "Received kernel log event #" << event_count 
++               << " - Event ID: " << (*received_event)->event;
++
+     if (start != -1 && (*received_event)->event == start) {
+       if (!proxy) {
+         LOG(INFO) << "Start event (" << start << ") received. Starting proxy";
++        if (use_vhost_vsock()) {
++          LOG(INFO) << "Starting vhost-user vsock proxy due to start event";
++        }
+         proxy = CF_EXPECT(StartProxyAsync(server, client));
++        LOG(INFO) << "Proxy started successfully in response to start event";
++      } else {
++        LOG(DEBUG) << "Start event received but proxy already running";
+       }
+       continue;
+     }
+ 
+     if (stop != -1 && (*received_event)->event == stop) {
+-      LOG(INFO) << "Stop event (" << start << ") received. Stopping proxy";
+-      proxy.reset();
++      LOG(INFO) << "Stop event (" << stop << ") received. Stopping proxy";
++      if (proxy) {
++        if (use_vhost_vsock()) {
++          LOG(INFO) << "Stopping vhost-user vsock proxy due to stop event";
++        }
++        proxy.reset();
++        LOG(INFO) << "Proxy stopped successfully in response to stop event";
++      } else {
++        LOG(DEBUG) << "Stop event received but proxy was not running";
++      }
+       continue;
+     }
++    
++    LOG(DEBUG) << "Ignoring unhandled event ID: " << (*received_event)->event;
+   }
+ 
++  LOG(INFO) << "Event listening loop ended - processed " << event_count << " events";
+   return {};
+ }
+ 
+ Result<void> Main() {
++  LOG(INFO) << "socket_vsock_proxy starting - label: " << FLAGS_label;
++  LOG(INFO) << "Configuration - vhost_user_vsock: " << (use_vhost_vsock() ? "enabled" : "disabled");
++  
+   auto server = BuildServer();
+   auto client = BuildClient();
++  
++  LOG(INFO) << "Built server: " << server->Describe();
++  LOG(INFO) << "Built client: " << client->Describe();
+ 
+   if (FLAGS_events_fd != -1) {
++    LOG(INFO) << "Using event-driven proxy mode - events_fd: " << FLAGS_events_fd;
+     CF_EXPECT(FLAGS_start_event_id != -1, "start_event_id is required if events_fd is provided");
+ 
+     const monitor::Event start_event = static_cast<monitor::Event>(FLAGS_start_event_id);
+     const monitor::Event stop_event = static_cast<monitor::Event>(FLAGS_stop_event_id);
+ 
++    LOG(INFO) << "Event-driven mode configured - start_event: " << start_event 
++              << ", stop_event: " << stop_event;
++
+     CF_EXPECT(ListenEventsAndProxy(FLAGS_events_fd, start_event, stop_event,
+                                    *server, *client));
+   } else {
+-    LOG(DEBUG) << "Starting proxy";
+-    Proxy(CF_EXPECT(server->Start()), [&client] { return client->Start(); });
++    LOG(INFO) << "Using direct proxy mode (no event control)";
++    LOG(DEBUG) << "Starting direct proxy connection";
++    
++    if (use_vhost_vsock()) {
++      LOG(INFO) << "Direct proxy using vhost-user vsock backend";
++    }
++    
++    LOG(DEBUG) << "Establishing server connection";
++    auto server_fd = CF_EXPECT(server->Start());
++    LOG(INFO) << "Server connection established successfully";
++    
++    LOG(DEBUG) << "Starting synchronous proxy with client connection factory";
++    Proxy(server_fd, [&client] { 
++      LOG(DEBUG) << "Creating client connection for proxy session";
++      auto client_fd = client->Start();
++      if (client_fd->IsOpen()) {
++        LOG(INFO) << "Client connection established for proxy session";
++      } else {
++        LOG(ERROR) << "Failed to establish client connection for proxy session: " << client_fd->StrError();
++      }
++      return client_fd;
++    });
++    
++    LOG(INFO) << "Direct proxy completed";
+   }
+ 
++  LOG(INFO) << "socket_vsock_proxy main function completed";
+   return {};
+ }
+ 
+diff --git a/common/libs/fs/epoll.cpp b/common/libs/fs/epoll.cpp
+index e78f90e1f..cf6d1e6f4 100644
+--- a/common/libs/fs/epoll.cpp
++++ b/common/libs/fs/epoll.cpp
+@@ -16,7 +16,13 @@
+ 
+ #include "common/libs/fs/epoll.h"
+ 
++#ifdef __linux__
+ #include <sys/epoll.h>
++#elif defined(__APPLE__)
++#include <sys/event.h>
++#include <unordered_map>
++#include <vector>
++#endif
+ 
+ #include <memory>
+ #include <mutex>
+@@ -30,11 +36,69 @@
+ 
+ namespace cuttlefish {
+ 
++#ifdef __APPLE__
++// macOS kqueue-based epoll emulation
++namespace {
++struct KqueueEventData {
++  SharedFD fd;
++  uint32_t events;
++};
++
++// Global storage for kqueue event data
++static std::mutex kqueue_mutex;
++static std::unordered_map<int, std::unordered_map<int, KqueueEventData>> kqueue_data; // kqueue_fd -> fd -> KqueueEventData
++
++uint16_t EpollEventsToKqueueFilter(uint32_t epoll_events) {
++  uint16_t kqueue_filter = 0;
++  if (epoll_events & EPOLLIN) {
++    kqueue_filter |= EVFILT_READ;
++  }
++  if (epoll_events & EPOLLOUT) {
++    kqueue_filter |= EVFILT_WRITE;
++  }
++  return kqueue_filter;
++}
++
++uint32_t KqueueEventsToEpoll(uint16_t kqueue_filter, uint16_t kqueue_flags) {
++  uint32_t epoll_events = 0;
++  if (kqueue_filter == EVFILT_READ) {
++    epoll_events |= EPOLLIN;
++  }
++  if (kqueue_filter == EVFILT_WRITE) {
++    epoll_events |= EPOLLOUT;
++  }
++  if (kqueue_flags & EV_EOF) {
++    epoll_events |= EPOLLHUP;
++  }
++  if (kqueue_flags & EV_ERROR) {
++    epoll_events |= EPOLLERR;
++  }
++  return epoll_events;
++}
++}
++#endif
++
+ Result<Epoll> Epoll::Create() {
++#ifdef __linux__
+   int fd = epoll_create1(EPOLL_CLOEXEC);
+   if (fd == -1) {
+     return CF_ERRNO("Failed to create epoll");
+   }
++#elif defined(__APPLE__)
++  int fd = kqueue();
++  if (fd == -1) {
++    return CF_ERRNO("Failed to create kqueue");
++  }
++  // Set CLOEXEC flag
++  fcntl(fd, F_SETFD, FD_CLOEXEC);
++  
++  // Initialize the event data tracking for this kqueue
++  std::lock_guard<std::mutex> lock(kqueue_mutex);
++  kqueue_data[fd] = std::unordered_map<int, KqueueEventData>();
++#else
++  return CF_ERR("epoll not supported on this platform");
++#endif
++  
+   SharedFD shared{std::shared_ptr<FileInstance>(new FileInstance(fd, 0))};
+   return Epoll(shared);
+ }
+@@ -75,6 +139,8 @@ Result<void> Epoll::Add(SharedFD fd, uint32_t events) {
+   if (watched_.count(fd) != 0) {
+     return CF_ERRNO("Watched set already contains fd");
+   }
++
++#ifdef __linux__
+   epoll_event event;
+   event.events = events;
+   event.data.fd = fd->fd_;
+@@ -85,6 +151,32 @@ Result<void> Epoll::Add(SharedFD fd, uint32_t events) {
+   } else if (success != 0) {
+     return CF_ERRNO("epoll_ctl: Add failed");
+   }
++#elif defined(__APPLE__)
++  // Store event data for this kqueue
++  {
++    std::lock_guard<std::mutex> lock(kqueue_mutex);
++    kqueue_data[epoll_fd_->fd_][fd->fd_] = {fd, events};
++  }
++  
++  // Add read filter if EPOLLIN is requested
++  if (events & EPOLLIN) {
++    struct kevent kev;
++    EV_SET(&kev, fd->fd_, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, nullptr);
++    if (kevent(epoll_fd_->fd_, &kev, 1, nullptr, 0, nullptr) == -1) {
++      return CF_ERRNO("kevent: Add read filter failed");
++    }
++  }
++  
++  // Add write filter if EPOLLOUT is requested
++  if (events & EPOLLOUT) {
++    struct kevent kev;
++    EV_SET(&kev, fd->fd_, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, nullptr);
++    if (kevent(epoll_fd_->fd_, &kev, 1, nullptr, 0, nullptr) == -1) {
++      return CF_ERRNO("kevent: Add write filter failed");
++    }
++  }
++#endif
++
+   watched_.insert(fd);
+   return {};
+ }
+@@ -95,6 +187,7 @@ Result<void> Epoll::AddOrModify(SharedFD fd, uint32_t events) {
+   std::lock(watched_lock, epoll_lock);
+   CF_EXPECT(epoll_fd_->IsOpen(), "Empty Epoll instance");
+ 
++#ifdef __linux__
+   epoll_event event;
+   event.events = events;
+   event.data.fd = fd->fd_;
+@@ -104,6 +197,15 @@ Result<void> Epoll::AddOrModify(SharedFD fd, uint32_t events) {
+     std::string operation_str = operation == EPOLL_CTL_ADD ? "add" : "modify";
+     return CF_ERRNO("epoll_ctl: Operation " << operation_str << " failed");
+   }
++#elif defined(__APPLE__)
++  bool is_add = watched_.count(fd) == 0;
++  if (is_add) {
++    return Add(fd, events);
++  } else {
++    return Modify(fd, events);
++  }
++#endif
++
+   watched_.insert(fd);
+   return {};
+ }
+@@ -117,6 +219,8 @@ Result<void> Epoll::Modify(SharedFD fd, uint32_t events) {
+   if (watched_.count(fd) == 0) {
+     return CF_ERR("Watched set did not contain fd");
+   }
++
++#ifdef __linux__
+   epoll_event event;
+   event.events = events;
+   event.data.fd = fd->fd_;
+@@ -124,6 +228,20 @@ Result<void> Epoll::Modify(SharedFD fd, uint32_t events) {
+   if (success != 0) {
+     return CF_ERRNO("epoll_ctl: Modify failed");
+   }
++#elif defined(__APPLE__)
++  // First delete the existing filters
++  auto delete_result = Delete(fd);
++  if (!delete_result.ok()) {
++    return delete_result;
++  }
++  
++  // Then add with new events
++  auto add_result = Add(fd, events);
++  if (!add_result.ok()) {
++    return add_result;
++  }
++#endif
++
+   return {};
+ }
+ 
+@@ -136,15 +254,48 @@ Result<void> Epoll::Delete(SharedFD fd) {
+   if (watched_.count(fd) == 0) {
+     return CF_ERR("Watched set did not contain fd");
+   }
++
++#ifdef __linux__
+   int success = epoll_ctl(epoll_fd_->fd_, EPOLL_CTL_DEL, fd->fd_, nullptr);
+   if (success != 0) {
+     return CF_ERRNO("epoll_ctl: Delete failed");
+   }
++#elif defined(__APPLE__)
++  // Get the events for this fd to know which filters to delete
++  uint32_t events = 0;
++  {
++    std::lock_guard<std::mutex> lock(kqueue_mutex);
++    auto kqueue_it = kqueue_data.find(epoll_fd_->fd_);
++    if (kqueue_it != kqueue_data.end()) {
++      auto fd_it = kqueue_it->second.find(fd->fd_);
++      if (fd_it != kqueue_it->second.end()) {
++        events = fd_it->second.events;
++        kqueue_it->second.erase(fd_it);
++      }
++    }
++  }
++  
++  // Delete read filter if it was added
++  if (events & EPOLLIN) {
++    struct kevent kev;
++    EV_SET(&kev, fd->fd_, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
++    kevent(epoll_fd_->fd_, &kev, 1, nullptr, 0, nullptr);
++  }
++  
++  // Delete write filter if it was added
++  if (events & EPOLLOUT) {
++    struct kevent kev;
++    EV_SET(&kev, fd->fd_, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
++    kevent(epoll_fd_->fd_, &kev, 1, nullptr, 0, nullptr);
++  }
++#endif
++
+   watched_.erase(fd);
+   return {};
+ }
+ 
+ Result<std::optional<EpollEvent>> Epoll::Wait() {
++#ifdef __linux__
+   epoll_event event;
+   int success;
+   {
+@@ -175,6 +326,42 @@ Result<std::optional<EpollEvent>> Epoll::Wait() {
+     return {};
+   }
+   return ret;
++#elif defined(__APPLE__)
++  struct kevent kev;
++  int success;
++  {
++    std::shared_lock lock(epoll_mutex_);
++    CF_EXPECT(epoll_fd_->IsOpen(), "Empty Epoll instance");
++    success = TEMP_FAILURE_RETRY(kevent(epoll_fd_->fd_, nullptr, 0, &kev, 1, nullptr));
++  }
++  if (success == -1) {
++    return CF_ERRNO("kevent failed");
++  } else if (success == 0) {
++    return {};
++  } else if (success != 1) {
++    return CF_ERR("kevent returned an unexpected value");
++  }
++  
++  EpollEvent ret;
++  ret.events = KqueueEventsToEpoll(kev.filter, kev.flags);
++  
++  // Find the SharedFD corresponding to this file descriptor
++  std::shared_lock lock(watched_mutex_);
++  for (const auto& watched : watched_) {
++    if (watched->fd_ == static_cast<int>(kev.ident)) {
++      ret.fd = watched;
++      break;
++    }
++  }
++  
++  if (!ret.fd || !ret.fd->IsOpen()) {
++    // Couldn't find the matching SharedFD to the file descriptor. We probably
++    // lost the race to lock watched_mutex_ against a delete call. Treat this
++    // as a spurious wakeup.
++    return {};
++  }
++  return ret;
++#endif
+ }
+ 
+ }  // namespace cuttlefish
+diff --git a/common/libs/fs/shared_fd.cpp b/common/libs/fs/shared_fd.cpp
+index e8acf236e..c734eb88e 100644
+--- a/common/libs/fs/shared_fd.cpp
++++ b/common/libs/fs/shared_fd.cpp
+@@ -34,6 +34,21 @@
+ #include <unordered_map>
+ #include <string>
+ #include <mutex>
++#include <atomic>
++#include <fcntl.h>
++#endif
++
++#ifdef __APPLE__
++// Define eventfd constants for macOS
++#ifndef EFD_CLOEXEC
++#define EFD_CLOEXEC 0x80000
++#endif
++#ifndef EFD_NONBLOCK
++#define EFD_NONBLOCK 0x800
++#endif
++#ifndef EFD_SEMAPHORE
++#define EFD_SEMAPHORE 0x1
++#endif
+ 
+ // macOS kqueue-based inotify replacement
+ namespace {
+@@ -271,6 +286,7 @@ void FileInstance::Close() {
+     // Clean up eventfd emulation resources if this is an eventfd
+     static std::mutex eventfd_map_mutex;
+     static std::unordered_map<int, int> eventfd_write_fds;
++    
+     {
+       std::lock_guard<std::mutex> lock(eventfd_map_mutex);
+       auto it = eventfd_write_fds.find(fd_);
+@@ -282,19 +298,20 @@ void FileInstance::Close() {
+       }
+     }
+ #endif
+-      if (close(fd_) == -1) {
+-    errno_ = errno;
+-    if (identity_.size()) {
+-      message << __FUNCTION__ << ": " << identity_ << " failed (" << StrError() << ")";
+-      std::string message_str = message.str();
+-      Log(message_str.c_str());
+-    }
+-  } else {
+-    if (identity_.size()) {
+-      message << __FUNCTION__ << ": " << identity_ << "succeeded";
+-      std::string message_str = message.str();
+-      Log(message_str.c_str());
+-    }
++    
++    if (close(fd_) == -1) {
++      errno_ = errno;
++      if (identity_.size()) {
++        message << __FUNCTION__ << ": " << identity_ << " failed (" << StrError() << ")";
++        std::string message_str = message.str();
++        Log(message_str.c_str());
++      }
++    } else {
++      if (identity_.size()) {
++        message << __FUNCTION__ << ": " << identity_ << "succeeded";
++        std::string message_str = message.str();
++        Log(message_str.c_str());
++      }
+     }
+   }
+   fd_ = -1;
+@@ -331,7 +348,8 @@ int FileInstance::ConnectWithTimeout(const struct sockaddr* addr,
+   }
+ 
+   if (GetErrno() != EAGAIN && GetErrno() != EINPROGRESS) {
+-    LOG(DEBUG) << "Immediate connection failure: " << StrError();
++    LOG(DEBUG) << "Immediate connection failure to " << addr->sa_data << ": "
++               << StrError();
+     if (Fcntl(F_SETFL, original_flags) == -1) {
+       LOG(ERROR) << "Failed to restore original flags: " << StrError();
+     }
+@@ -510,25 +528,27 @@ bool SharedFD::Pipe(SharedFD* fd0, SharedFD* fd1) {
+ }
+ 
+ #if defined(__linux__) || defined(__APPLE__)
++
+ SharedFD SharedFD::Event(int initval, int flags) {
+ #ifdef __linux__
+   int fd = eventfd(initval, flags);
+   return std::shared_ptr<FileInstance>(new FileInstance(fd, errno));
+ #elif defined(__APPLE__)
+   // macOS doesn't have eventfd, so we use a pipe-based implementation
++  // We need to keep both ends of the pipe to properly emulate eventfd behavior
+   int pipe_fds[2];
+   if (pipe(pipe_fds) == -1) {
+     return std::shared_ptr<FileInstance>(new FileInstance(-1, errno));
+   }
+   
+   // Set non-blocking if EFD_NONBLOCK is requested
+-  if (flags & 0x800) { // EFD_NONBLOCK value
++  if (flags & EFD_NONBLOCK) {
+     fcntl(pipe_fds[0], F_SETFL, O_NONBLOCK);
+     fcntl(pipe_fds[1], F_SETFL, O_NONBLOCK);
+   }
+   
+   // Set close-on-exec if EFD_CLOEXEC is requested
+-  if (flags & 0x80000) { // EFD_CLOEXEC value
++  if (flags & EFD_CLOEXEC) {
+     fcntl(pipe_fds[0], F_SETFD, FD_CLOEXEC);
+     fcntl(pipe_fds[1], F_SETFD, FD_CLOEXEC);
+   }
+@@ -543,11 +563,12 @@ SharedFD SharedFD::Event(int initval, int flags) {
+   // This is a workaround since FileInstance only stores one fd
+   static std::mutex eventfd_map_mutex;
+   static std::unordered_map<int, int> eventfd_write_fds;
+-
++  
+   {
+     std::lock_guard<std::mutex> lock(eventfd_map_mutex);
+     eventfd_write_fds[pipe_fds[0]] = pipe_fds[1];
+   }
++  
+   return std::shared_ptr<FileInstance>(new FileInstance(pipe_fds[0], 0));
+ #endif
+ }
+@@ -698,6 +719,8 @@ SharedFD SharedFD::SocketLocalClient(const std::string& name, bool abstract,
+ 
+ SharedFD SharedFD::SocketLocalClient(const std::string& name, bool abstract,
+                                      int in_type, int timeout_seconds) {
++  // Print out the socket name as a debug log
++  LOG(DEBUG) << "Connecting to socket: " << name << (abstract ? " (abstract)" : "");
+   struct sockaddr_un addr;
+   socklen_t addrlen;
+   MakeAddress(name.c_str(), abstract, &addr, &addrlen);
+@@ -872,7 +895,7 @@ SharedFD SharedFD::VsockServer(
+         GetVhostUserVsockServerAddr(port, *vhost_user_vsock_listening_cid),
+         false /* abstract */, type, 0666 /* mode */);
+   }
+-#if defined(__linux__) || defined(__APPLE__)
++
+   auto vsock = SharedFD::Socket(AF_VSOCK, type, 0);
+   if (!vsock->IsOpen()) {
+     return vsock;
+@@ -905,9 +928,11 @@ SharedFD SharedFD::VsockServer(
+ std::string SharedFD::GetVhostUserVsockServerAddr(
+     unsigned int port, int vhost_user_vsock_listening_cid) {
+   // TODO(b/277909042): better path than /tmp/vsock_{}/vm.vsock_{}
+-  return fmt::format(
++  std::string address = fmt::format(
+       "{}_{}", GetVhostUserVsockClientAddr(vhost_user_vsock_listening_cid),
+       port);
++  LOG(WARNING) << "Vhost User Vsock Server Address: " << address;
++  return address;
+ }
+ 
+ std::string SharedFD::GetVhostUserVsockClientAddr(int cid) {
+@@ -942,6 +967,7 @@ SharedFD SharedFD::VsockClient(unsigned int cid, unsigned int port, int type,
+     }
+     return client;
+   }
++#if defined(__linux__) || defined(__APPLE__)
+   auto vsock = SharedFD::Socket(AF_VSOCK, type, 0);
+   if (!vsock->IsOpen()) {
+     return vsock;
+@@ -1053,10 +1079,21 @@ int FileInstance::Ioctl(int request, void* val) {
+ int FileInstance::LinkAtCwd(const std::string& path) {
+   LocalErrno record_errno(errno_);
+ 
++#ifdef __APPLE__
++  // On macOS, use F_GETPATH to get the path of the file descriptor
++  char fd_path[PATH_MAX];
++  if (fcntl(fd_, F_GETPATH, fd_path) != -1) {
++    return link(fd_path, path.c_str());
++  } else {
++    return -1; // Failed to get path
++  }
++#else
++  // On Linux, use /proc/self/fd/ approach
+   std::string name = "/proc/self/fd/";
+   name += std::to_string(fd_);
+   return linkat(AT_FDCWD, name.c_str(), AT_FDCWD, path.c_str(),
+                 AT_SYMLINK_FOLLOW);
++#endif
+ }
+ 
+ int FileInstance::Listen(int backlog) {
+@@ -1202,8 +1239,10 @@ int FileInstance::EventfdWrite(eventfd_t value) {
+   return eventfd_write(fd_, value);
+ #elif defined(__APPLE__)
+   // macOS doesn't have eventfd_write, so we emulate it using write()
++  // We need to write to the write end of the pipe, not the read end
+   static std::mutex eventfd_map_mutex;
+   static std::unordered_map<int, int> eventfd_write_fds;
++  
+   int write_fd;
+   {
+     std::lock_guard<std::mutex> lock(eventfd_map_mutex);
+@@ -1214,8 +1253,9 @@ int FileInstance::EventfdWrite(eventfd_t value) {
+     }
+     write_fd = it->second;
+   }
++  
+   // eventfd_t is typically uint64_t, so we write the value directly
+-  ssize_t result = write(write_fd, &value, sizeof(value));  
++  ssize_t result = write(write_fd, &value, sizeof(value));
+   if (result == sizeof(value)) {
+     return 0;  // Success
+   } else {
+diff --git a/common/libs/fs/shared_fd.h b/common/libs/fs/shared_fd.h
+index 597cd9514..c85855015 100644
+--- a/common/libs/fs/shared_fd.h
++++ b/common/libs/fs/shared_fd.h
+@@ -154,7 +154,7 @@ class SharedFD {
+   static int Fchdir(SharedFD);
+   static Result<SharedFD> Fifo(const std::string& pathname, mode_t mode);
+   static bool Pipe(SharedFD* fd0, SharedFD* fd1);
+-#if defined __linux__ || defined(__APPLE__)
++#if defined(__linux__) || defined(__APPLE__)
+   static SharedFD Event(int initval = 0, int flags = 0);
+ #ifdef CUTTLEFISH_HOST
+   static SharedFD ShmOpen(const std::string& name, int oflag, int mode);
+@@ -183,7 +183,7 @@ class SharedFD {
+                                     int in_type, mode_t mode);
+   static SharedFD SocketLocalServer(int port, int type);
+ 
+-#if defined __linux__ || defined(__APPLE__)
++#if defined(__linux__) || defined(__APPLE__)
+   // For binding in vsock, svm_cid from `cid` param would be either
+   // VMADDR_CID_ANY, VMADDR_CID_LOCAL, VMADDR_CID_HOST or their own CID, and it
+   // is used for indicating connections which it accepts from.
+@@ -214,6 +214,10 @@ class SharedFD {
+ 
+   bool operator!=(const SharedFD& rhs) const { return value_ != rhs.value_; }
+ 
++  bool operator!() const {
++    return !value_;
++  }
++
+   bool operator<(const SharedFD& rhs) const { return value_ < rhs.value_; }
+ 
+   bool operator<=(const SharedFD& rhs) const { return value_ <= rhs.value_; }
+@@ -333,7 +337,7 @@ class FileInstance {
+   int GetErrno() const { return errno_; }
+   int GetSockName(struct sockaddr* addr, socklen_t* addrlen);
+ 
+-#if defined __linux__ || defined(__APPLE__)
++#if defined(__linux__) || defined(__APPLE__)
+   unsigned int VsockServerPort();
+ #endif
+ 
+@@ -362,7 +366,7 @@ class FileInstance {
+   ssize_t Recv(void* buf, size_t len, int flags);
+   ssize_t RecvMsg(struct msghdr* msg, int flags);
+   ssize_t Read(void* buf, size_t count);
+-#if defined __linux__ || defined(__APPLE__)
++#if defined(__linux__) || defined(__APPLE__)
+   int EventfdRead(eventfd_t* value);
+ #endif
+   ssize_t Send(const void* buf, size_t len, int flags);
+@@ -395,15 +399,16 @@ class FileInstance {
+    *
+    */
+   ssize_t Write(const void* buf, size_t count);
+-#if defined __linux__ || defined(__APPLE__)
++#if defined(__linux__) || defined(__APPLE__)
+   int EventfdWrite(eventfd_t value);
+ #endif
+   bool IsATTY();
+ 
+   int Futimens(const struct timespec times[2]);
++
+ #if defined(__linux__) || defined(__APPLE__)
+   // Returns the target of "/proc/getpid()/fd/" + std::to_string(fd_)
+-  // if appropriate
++  // if appropriate (Linux), or uses fcntl F_GETPATH on macOS
+   Result<std::string> ProcFdLinkTarget() const;
+ #endif
+ 
+diff --git a/common/libs/utils/Android.bp b/common/libs/utils/Android.bp
+index c0060dc2c..936ee9fc2 100644
+--- a/common/libs/utils/Android.bp
++++ b/common/libs/utils/Android.bp
+@@ -89,6 +89,7 @@ cc_test_host {
+         "base64_test.cpp",
+         "files_test.cpp",
+         "files_test_helper.cpp",
++        "files_monitor_test.cpp",
+         "flag_parser_test.cpp",
+         "network_test.cpp",
+         "proc_file_utils_test.cpp",
+diff --git a/common/libs/utils/files.cpp b/common/libs/utils/files.cpp
+index e55ccd150..98783e933 100644
+--- a/common/libs/utils/files.cpp
++++ b/common/libs/utils/files.cpp
+@@ -21,6 +21,9 @@
+ #include <linux/fs.h>
+ #include <sys/inotify.h>
+ #include <sys/sendfile.h>
++#elif defined(__APPLE__)
++#include <sys/event.h>
++#include <sys/time.h>
+ #endif
+ 
+ #include <dirent.h>
+@@ -752,7 +755,201 @@ Result<void> WaitForUnixSocketListeningWithoutConnect(const std::string& path,
+       return CF_ERR("Timed out");
+     }
+ 
++#if defined(__APPLE__)
++    Command lsof("/usr/sbin/lsof");
++#else
+     Command lsof("/usr/bin/lsof");
++#endif
++    lsof.AddParameter(/*"format"*/ "-F", /*"connection state"*/ "TST");
++    lsof.AddParameter(path);
++    std::string lsof_out;
++    std::string lsof_err;
++    int rval =
++        RunWithManagedStdio(std::move(lsof), nullptr, &lsof_out, &lsof_err);
++    if (rval != 0) {
++      return CF_ERR("Failed to run `lsof`, stderr: " << lsof_err);
++    }
++
++    LOG(DEBUG) << "lsof stdout:|" << lsof_out << "|";
++    LOG(DEBUG) << "lsof stderr:|" << lsof_err << "|";
++
++    std::smatch socket_state_match;
++    if (std::regex_search(lsof_out, socket_state_match, socket_state_regex)) {
++      if (socket_state_match.size() == 2) {
++        const std::string& socket_state = socket_state_match[1];
++        if (socket_state == "LISTEN") {
++          return {};
++        }
++      }
++    }
++
++    sched_yield();
++  }
++
++  return CF_ERR("This shouldn't be executed");
++}
++#elif defined(__APPLE__)
++class KqueueWatcher {
++ public:
++  KqueueWatcher(int kq, const std::string& path, uint32_t filter_flags)
++      : kq_(kq), path_(path) {
++    // Open the directory to get a file descriptor
++    fd_ = open(path.c_str(), O_RDONLY);
++    if (fd_ >= 0) {
++      // Set up the kqueue event
++      struct kevent event;
++      EV_SET(&event, fd_, EVFILT_VNODE, EV_ADD | EV_CLEAR, filter_flags, 0, nullptr);
++      kevent(kq_, &event, 1, nullptr, 0, nullptr);
++    }
++  }
++  
++  virtual ~KqueueWatcher() {
++    if (fd_ >= 0) {
++      close(fd_);
++    }
++  }
++
++ private:
++  int kq_;
++  int fd_ = -1;
++  std::string path_;
++};
++
++static Result<void> WaitForFileInternal(const std::string& path, int timeoutSec,
++                                        int kq) {
++  CF_EXPECT_NE(path, "", "Path is empty");
++
++  if (FileExists(path, true)) {
++    return {};
++  }
++
++  const auto targetTime =
++      std::chrono::system_clock::now() + std::chrono::seconds(timeoutSec);
++
++  const std::string parentPath = android::base::Dirname(path);
++  const std::string filename = android::base::Basename(path);
++
++  CF_EXPECT(WaitForFile(parentPath, timeoutSec),
++            "Error while waiting for parent directory creation");
++
++  // Watch the parent directory for file creation events
++  auto watcher = KqueueWatcher(kq, parentPath, NOTE_WRITE | NOTE_EXTEND);
++
++  if (FileExists(path, true)) {
++    return {};
++  }
++
++  while (true) {
++    const auto currentTime = std::chrono::system_clock::now();
++
++    if (currentTime >= targetTime) {
++      return CF_ERR("Timed out");
++    }
++
++    const auto currentTimeRemain = targetTime - currentTime;
++    if (currentTimeRemain.count() <= 0) {
++      return CF_ERR("Timed out");
++    }
++    
++    // Convert to seconds and nanoseconds for timespec
++    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(currentTimeRemain);
++    const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(
++        currentTimeRemain - seconds);
++    
++    struct timespec timeout;
++    timeout.tv_sec = seconds.count();
++    timeout.tv_nsec = nanoseconds.count();
++
++    // Wait for events
++    struct kevent event;
++    int ret = kevent(kq, nullptr, 0, &event, 1, &timeout);
++
++    if (ret == 0) {
++      // This is just a timeout from kevent, not an error
++      // Check if the file exists now (it might have been created between our last check and now)
++      if (FileExists(path, true)) {
++        return {};
++      }
++      
++      // Continue the loop to check again or timeout if we've exceeded the total time
++      continue;
++    } else if (ret < 0) {
++      return CF_ERRNO("kevent() failed");
++    }
++
++    // Check if our file exists now
++    if (FileExists(path, true)) {
++      return {};
++    }
++  }
++
++  return CF_ERR("This shouldn't be executed");
++}
++
++auto WaitForFile(const std::string& path, int timeoutSec)
++    -> decltype(WaitForFileInternal(path, timeoutSec, 0)) {
++  android::base::unique_fd kq(kqueue());
++  CF_EXPECT(kq.get() >= 0, "Failed to create kqueue");
++
++  CF_EXPECT(WaitForFileInternal(path, timeoutSec, kq.get()));
++
++  return {};
++}
++
++Result<void> WaitForUnixSocket(const std::string& path, int timeoutSec) {
++  const auto targetTime =
++      std::chrono::system_clock::now() + std::chrono::seconds(timeoutSec);
++
++  CF_EXPECT(WaitForFile(path, timeoutSec),
++            "Waiting for socket path creation failed");
++  CF_EXPECT(FileIsSocket(path), "Specified path is not a socket");
++
++  while (true) {
++    const auto currentTime = std::chrono::system_clock::now();
++
++    if (currentTime >= targetTime) {
++      return CF_ERR("Timed out");
++    }
++
++    const auto timeRemain = std::chrono::duration_cast<std::chrono::seconds>(
++                                targetTime - currentTime)
++                                .count();
++    auto testConnect =
++        SharedFD::SocketLocalClient(path, false, SOCK_STREAM, timeRemain);
++
++    if (testConnect->IsOpen()) {
++      return {};
++    }
++
++    sched_yield();
++  }
++
++  return CF_ERR("This shouldn't be executed");
++}
++
++Result<void> WaitForUnixSocketListeningWithoutConnect(const std::string& path,
++                                                      int timeoutSec) {
++  const auto targetTime =
++      std::chrono::system_clock::now() + std::chrono::seconds(timeoutSec);
++
++  CF_EXPECT(WaitForFile(path, timeoutSec),
++            "Waiting for socket path creation failed");
++  CF_EXPECT(FileIsSocket(path), "Specified path is not a socket");
++
++  std::regex socket_state_regex("TST=(.*)");
++
++  while (true) {
++    const auto currentTime = std::chrono::system_clock::now();
++
++    if (currentTime >= targetTime) {
++      return CF_ERR("Timed out");
++    }
++
++#if defined(__APPLE__)
++    Command lsof("/usr/sbin/lsof");
++#else
++    Command lsof("/usr/bin/lsof");
++#endif
+     lsof.AddParameter(/*"format"*/ "-F", /*"connection state"*/ "TST");
+     lsof.AddParameter(path);
+     std::string lsof_out;
+diff --git a/common/libs/utils/files.h b/common/libs/utils/files.h
+index 43671cb43..9d7de3184 100644
+--- a/common/libs/utils/files.h
++++ b/common/libs/utils/files.h
+@@ -90,7 +90,7 @@ Result<void> WalkDirectory(
+     const std::string& dir,
+     const std::function<bool(const std::string&)>& callback);
+ 
+-#ifdef __linux__
++#if defined(__linux__) || defined(__APPLE__)
+ Result<void> WaitForFile(const std::string& path, int timeoutSec);
+ Result<void> WaitForUnixSocket(const std::string& path, int timeoutSec);
+ Result<void> WaitForUnixSocketListeningWithoutConnect(const std::string& path,
+diff --git a/common/libs/utils/files_monitor_test.cpp b/common/libs/utils/files_monitor_test.cpp
+new file mode 100644
+index 000000000..247518349
+--- /dev/null
++++ b/common/libs/utils/files_monitor_test.cpp
+@@ -0,0 +1,174 @@
++/*
++ * Copyright (C) 2023 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include <gtest/gtest.h>
++#include <thread>
++#include <chrono>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++#include <fcntl.h>
++
++#include "common/libs/fs/shared_fd.h"
++#include "common/libs/utils/files.h"
++#include "common/libs/utils/subprocess.h"
++
++namespace cuttlefish {
++
++class FileMonitorTest : public ::testing::Test {
++ protected:
++  void SetUp() override {
++    // Create a temporary directory for testing
++    char template_path[] = "/tmp/file_monitor_test_XXXXXX";
++    temp_dir_ = mkdtemp(template_path);
++    ASSERT_FALSE(temp_dir_.empty());
++  }
++
++  void TearDown() override {
++    // Clean up the temporary directory
++    if (!temp_dir_.empty()) {
++      RecursivelyRemoveDirectory(temp_dir_);
++    }
++  }
++
++  // Helper to create a file after a delay
++  void CreateFileAfterDelay(const std::string& path, int delay_ms) {
++    std::thread([path, delay_ms]() {
++      std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
++      int fd = open(path.c_str(), O_CREAT | O_WRONLY, 0644);
++      if (fd >= 0) {
++        close(fd);
++      }
++    }).detach();
++  }
++
++  // Helper to create a Unix socket after a delay
++  void CreateUnixSocketAfterDelay(const std::string& path, int delay_ms, bool listen = false) {
++    std::thread([path, delay_ms, listen]() {
++      std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
++      
++      int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
++      if (sock_fd < 0) return;
++      
++      struct sockaddr_un addr;
++      memset(&addr, 0, sizeof(addr));
++      addr.sun_family = AF_UNIX;
++      strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
++      
++      unlink(path.c_str());
++      if (bind(sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
++        close(sock_fd);
++        return;
++      }
++      
++      if (listen) {
++        if (::listen(sock_fd, 5) < 0) {
++          close(sock_fd);
++          return;
++        }
++      }
++      
++      // Keep the socket open for a while to allow tests to complete
++      std::this_thread::sleep_for(std::chrono::milliseconds(500));
++      close(sock_fd);
++    }).detach();
++  }
++
++  std::string temp_dir_;
++};
++
++TEST_F(FileMonitorTest, WaitForFileSuccess) {
++  std::string test_file = temp_dir_ + "/test_file";
++  
++  // Create the file after a short delay
++  CreateFileAfterDelay(test_file, 100);
++  
++  // Wait for the file to be created
++  auto result = WaitForFile(test_file, 2);
++  EXPECT_TRUE(result.ok()) << result.error().Trace();
++  EXPECT_TRUE(FileExists(test_file));
++}
++
++TEST_F(FileMonitorTest, WaitForFileTimeout) {
++  std::string test_file = temp_dir_ + "/nonexistent_file";
++  
++  // Wait for the file with a short timeout
++  auto result = WaitForFile(test_file, 1);
++  EXPECT_FALSE(result.ok());
++}
++
++TEST_F(FileMonitorTest, WaitForUnixSocketSuccess) {
++  std::string socket_path = temp_dir_ + "/test_socket";
++  
++  // Create the socket after a short delay
++  CreateUnixSocketAfterDelay(socket_path, 100);
++  
++  // Wait for the socket to be created
++  auto result = WaitForUnixSocket(socket_path, 2);
++  EXPECT_TRUE(result.ok()) << result.error().Trace();
++  EXPECT_TRUE(FileIsSocket(socket_path));
++}
++
++TEST_F(FileMonitorTest, WaitForUnixSocketTimeout) {
++  std::string socket_path = temp_dir_ + "/nonexistent_socket";
++  
++  // Wait for the socket with a short timeout
++  auto result = WaitForUnixSocket(socket_path, 1);
++  EXPECT_FALSE(result.ok());
++}
++
++TEST_F(FileMonitorTest, WaitForUnixSocketListeningSuccess) {
++  std::string socket_path = temp_dir_ + "/listening_socket";
++  
++  // Create the listening socket after a short delay
++  CreateUnixSocketAfterDelay(socket_path, 100, true);
++  
++  // Wait for the socket to be created and in listening state
++  auto result = WaitForUnixSocketListeningWithoutConnect(socket_path, 2);
++  EXPECT_TRUE(result.ok()) << result.error().Trace();
++  EXPECT_TRUE(FileIsSocket(socket_path));
++}
++
++#ifdef __APPLE__
++TEST_F(FileMonitorTest, InotifyCompatibilityOnMac) {
++  // Test the inotify compatibility layer on macOS
++  int kq = inotify_init1(0);
++  EXPECT_GE(kq, 0);
++  
++  // Add a watch on the temp directory
++  int wd = inotify_add_watch(kq, temp_dir_.c_str(), IN_CREATE);
++  EXPECT_GE(wd, 0);
++  
++  // Create a file in the directory
++  std::string test_file = temp_dir_ + "/inotify_test_file";
++  CreateFileAfterDelay(test_file, 100);
++  
++  // Wait a bit for the event to be processed
++  std::this_thread::sleep_for(std::chrono::milliseconds(200));
++  
++  // Check if we can get events
++  auto file_list = GetFileListFromInotifyFd(kq, IN_CREATE);
++  
++  // Clean up
++  inotify_rm_watch(kq, wd);
++  close(kq);
++  
++  // We should have detected at least one file
++  EXPECT_FALSE(file_list.empty());
++}
++#endif
++
++}  // namespace cuttlefish
+diff --git a/common/libs/utils/inotify.cpp b/common/libs/utils/inotify.cpp
+index cf299240a..fcdc74d7d 100644
+--- a/common/libs/utils/inotify.cpp
++++ b/common/libs/utils/inotify.cpp
+@@ -19,17 +19,20 @@
+ #include <unistd.h>
+ #include <string>
+ #include <vector>
++#include <dirent.h>
+ 
+ #ifdef __linux__
+ #include <sys/inotify.h>
+ #elif defined(__APPLE__)
+ #include <sys/event.h>
+ #include <sys/time.h>
++#include <sys/types.h>
+ #include <fcntl.h>
+ #include <errno.h>
+ #endif
+ 
+ #include <android-base/logging.h>
++#include <android-base/strings.h>
+ 
+ #include "inotify.h"
+ 
+@@ -68,17 +71,77 @@ uint32_t KqueueFilterToInotifyMask(uint32_t kqueue_filter) {
+     inotify_mask |= IN_MODIFY;
+   }
+   if (kqueue_filter & NOTE_EXTEND) {
+-    inotify_mask |= IN_ACCESS;
++    inotify_mask |= IN_ACCESS | IN_CREATE; // NOTE_EXTEND can indicate file creation
+   }
+   if (kqueue_filter & NOTE_ATTRIB) {
+     inotify_mask |= IN_ATTRIB;
+   }
+   if (kqueue_filter & NOTE_RENAME) {
+-    inotify_mask |= IN_MOVED_FROM;
++    inotify_mask |= IN_MOVED_FROM | IN_MOVED_TO;
++  }
++  if (kqueue_filter & NOTE_LINK) {
++    inotify_mask |= IN_CREATE; // Hard link creation can indicate file creation
+   }
+   
+   return inotify_mask;
+ }
++
++// Function to initialize a kqueue-based file monitoring system (inotify alternative for macOS)
++int inotify_init1(int flags) {
++  int kq = kqueue();
++  if (kq < 0) {
++    LOG(ERROR) << "Failed to create kqueue: " << strerror(errno);
++  }
++  
++  // Set CLOEXEC if requested
++  if ((flags & O_CLOEXEC) && kq >= 0) {
++    fcntl(kq, F_SETFD, FD_CLOEXEC);
++  }
++  
++  return kq;
++}
++
++// Function to add a watch to a kqueue (inotify alternative for macOS)
++int inotify_add_watch(int kq, const char* pathname, uint32_t mask) {
++  int fd = open(pathname, O_RDONLY);
++  if (fd < 0) {
++    LOG(ERROR) << "Failed to open " << pathname << ": " << strerror(errno);
++    return -1;
++  }
++  
++  // Convert inotify mask to kqueue filter flags
++  uint32_t fflags = 0;
++  if (mask & (IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO)) {
++    fflags |= NOTE_WRITE | NOTE_EXTEND | NOTE_RENAME | NOTE_LINK;
++  }
++  if (mask & IN_MODIFY) {
++    fflags |= NOTE_WRITE;
++  }
++  if (mask & IN_ATTRIB) {
++    fflags |= NOTE_ATTRIB;
++  }
++  
++  struct kevent event;
++  EV_SET(&event, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR, fflags, 0, nullptr);
++  
++  if (kevent(kq, &event, 1, nullptr, 0, nullptr) < 0) {
++    LOG(ERROR) << "Failed to add kqueue watch for " << pathname << ": " << strerror(errno);
++    close(fd);
++    return -1;
++  }
++  
++  return fd; // Return the file descriptor as the watch descriptor
++}
++
++// Function to remove a watch from a kqueue (inotify alternative for macOS)
++int inotify_rm_watch(int kq, int wd) {
++  // For kqueue, we just close the file descriptor
++  if (close(wd) < 0) {
++    LOG(ERROR) << "Failed to close watch descriptor: " << strerror(errno);
++    return -1;
++  }
++  return 0;
++}
+ #endif
+ 
+ namespace cuttlefish {
+@@ -143,21 +206,33 @@ std::vector<std::string> result;
+     return result;
+   }
+   
+-  for (int i = 0; i < num_events; i++) {
+-    struct kevent& event = events[i];
+-    
+-    // Convert kqueue filter flags to inotify mask
+-    uint32_t event_mask = KqueueFilterToInotifyMask(event.fflags);
+-    
+-    if (!(event_mask & mask)) {
+-      continue; // Event doesn't match requested mask
++  // For kqueue, we need to scan the directory to find new files
++  // This is because kqueue doesn't provide filenames in events
++  if (num_events > 0) {
++    // Get the directory path from the file descriptor
++    char path[PATH_MAX];
++    if (fcntl(events[0].ident, F_GETPATH, path) >= 0) {
++      DIR* dir = opendir(path);
++      if (dir) {
++        struct dirent* entry;
++        while ((entry = readdir(dir)) != nullptr) {
++          // Skip . and ..
++          if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
++            continue;
++          }
++          
++          // For IN_CREATE, we return all files in the directory
++          // A more sophisticated implementation would track which files are new
++          if (mask & IN_CREATE) {
++            result.push_back(std::string(entry->d_name));
++          }
++        }
++        closedir(dir);
++      }
++    } else {
++      // If we can't get the path, return a placeholder
++      result.push_back("kqueue_event_detected");
+     }
+-    
+-    // For kqueue, we don't get the filename directly in the event
+-    // This is a limitation of the kqueue-based implementation
+-    // In a full implementation, we'd need to track filenames separately
+-    // For now, we'll return a placeholder indicating an event occurred
+-    result.push_back("kqueue_event_detected");
+   }
+   
+   return result;
+diff --git a/common/libs/utils/known_paths.cpp b/common/libs/utils/known_paths.cpp
+index 795940de8..6b1437fdc 100644
+--- a/common/libs/utils/known_paths.cpp
++++ b/common/libs/utils/known_paths.cpp
+@@ -22,6 +22,13 @@
+ 
+ namespace cuttlefish {
+ 
+-std::string TempDir() { return StringFromEnv("TMPDIR", "/tmp"); }
++std::string TempDir() { 
++#ifdef __APPLE__
++  // On macOS, use /tmp directly to avoid long paths that can exceed Unix socket limits
++  return "/tmp";
++#else
++  return StringFromEnv("TMPDIR", "/tmp");
++#endif
++}
+ 
+ }  // namespace cuttlefish
+diff --git a/common/libs/utils/socket2socket_proxy.cpp b/common/libs/utils/socket2socket_proxy.cpp
+index 74e2581cd..d55594037 100644
+--- a/common/libs/utils/socket2socket_proxy.cpp
++++ b/common/libs/utils/socket2socket_proxy.cpp
+@@ -42,6 +42,7 @@ class ProxyPair {
+       LOG(FATAL) << "Failed to open eventfd: " << stop_fd_->StrError();
+       return;
+     }
++    LOG(DEBUG) << "ProxyPair created - ready for bidirectional data forwarding";
+   }
+ 
+   ProxyPair(ProxyPair&& other)
+@@ -73,10 +74,16 @@ class ProxyPair {
+     started_ = true;
+     c2t_running_ = true;
+     t2c_running_ = true;
++    
++    LOG(INFO) << "Starting ProxyPair - establishing bidirectional data forwarding";
++    LOG(DEBUG) << "ProxyPair: from socket open=" << from->IsOpen() << ", to socket open=" << to->IsOpen();
++    
+     c2t_ = std::thread(&ProxyPair::Forward, this, "c2t", from, to, stop_fd_,
+                        std::ref(c2t_running_));
+     t2c_ = std::thread(&ProxyPair::Forward, this, "t2c", to, from, stop_fd_,
+                        std::ref(t2c_running_));
++    
++    LOG(INFO) << "ProxyPair threads launched - c2t and t2c forwarding active";
+   }
+ 
+   bool Running() {
+@@ -86,19 +93,29 @@ class ProxyPair {
+  private:
+   void Forward(const std::string& label, SharedFD from, SharedFD to,
+                SharedFD stop, std::atomic<bool>& running) {
+-    LOG(DEBUG) << label << ": Proxy thread started. Starting copying data";
++    LOG(INFO) << label << ": Proxy thread started - beginning IO data forwarding";
++    LOG(DEBUG) << label << ": Source socket open=" << from->IsOpen() << ", destination socket open=" << to->IsOpen();
++    
+     auto success = to->CopyAllFrom(*from, &(*stop));
++    
+     if (!success) {
++      LOG(WARNING) << label << ": Data forwarding completed with errors";
+       if (from->GetErrno()) {
+-        LOG(ERROR) << label << ": Error reading: " << from->StrError();
++        LOG(ERROR) << label << ": IO error reading from source socket: " << from->StrError() 
++                   << " (errno: " << from->GetErrno() << ")";
+       }
+       if (to->GetErrno()) {
+-        LOG(ERROR) << label << ": Error writing: " << to->StrError();
++        LOG(ERROR) << label << ": IO error writing to destination socket: " << to->StrError()
++                   << " (errno: " << to->GetErrno() << ")";
+       }
++    } else {
++      LOG(INFO) << label << ": Data forwarding completed successfully";
+     }
++    
++    LOG(DEBUG) << label << ": Shutting down write end of destination socket";
+     to->Shutdown(SHUT_WR);
+     running = false;
+-    LOG(DEBUG) << label << ": Proxy thread completed";
++    LOG(INFO) << label << ": Proxy thread completed - IO forwarding terminated";
+   }
+ 
+   bool started_;
+@@ -117,6 +134,10 @@ ProxyServer::ProxyServer(SharedFD server, std::function<SharedFD()> clients_fact
+     LOG(FATAL) << "Failed to open eventfd: " << stop_fd_->StrError();
+     return;
+   }
++  
++  LOG(INFO) << "ProxyServer created - starting connection acceptance loop";
++  LOG(DEBUG) << "ProxyServer: server socket open=" << server->IsOpen();
++  
+   server_ = std::thread([&, server_fd = std::move(server),
+                             clients_factory = std::move(clients_factory)]() {
+     constexpr ssize_t SERVER = 0;
+@@ -128,50 +149,65 @@ ProxyServer::ProxyServer(SharedFD server, std::function<SharedFD()> clients_fact
+       {.fd = stop_fd_, .events = POLLIN}
+     };
+ 
++    LOG(INFO) << "ProxyServer: entering connection acceptance loop";
++    int connection_count = 0;
++    
+     while (server_fd->IsOpen()) {
+       server_poll[SERVER].revents = 0;
+       server_poll[STOP].revents = 0;
+ 
++      LOG(DEBUG) << "ProxyServer: polling for incoming connections (active proxy pairs: " << watched.size() << ")";
+       const int poll_result = SharedFD::Poll(server_poll, -1);
+       if (poll_result < 0) {
+-        LOG(ERROR) << "Failed to poll to wait for incoming connection";
++        LOG(ERROR) << "ProxyServer: failed to poll for incoming connections - retrying";
+         continue;
+       }
++      
+       if (server_poll[STOP].revents & POLLIN) {
+-        // Stop fd is available to read, so we received a stop event
+-        // and must stop the thread
++        LOG(INFO) << "ProxyServer: received stop signal - terminating connection acceptance";
+         break;
+       }
++      
+       if (!(server_poll[SERVER].revents & POLLIN)) {
+         continue;
+       }
+ 
+-      // Server fd is available to read, so we can accept the
+-      // connection without blocking on that
++      LOG(DEBUG) << "ProxyServer: incoming connection detected - accepting";
+       auto client = SharedFD::Accept(*server_fd);
+       if (!client->IsOpen()) {
+-        LOG(ERROR) << "Failed to accept incoming connection: " << client->StrError();
++        LOG(ERROR) << "ProxyServer: failed to accept incoming connection: " << client->StrError();
+         continue;
+       }
++      
++      connection_count++;
++      LOG(INFO) << "ProxyServer: accepted connection #" << connection_count;
++      
++      LOG(DEBUG) << "ProxyServer: creating target connection via client factory";
+       auto target = clients_factory();
+       if (target->IsOpen()) {
+-        LOG(DEBUG) << "Launching proxy threads";
++        LOG(INFO) << "ProxyServer: target connection established - launching proxy pair";
+         watched.push_back(ProxyPair());
+         watched.back().Start(client, target);
+-        LOG(DEBUG) << "Proxy is launched. Amount of currently tracked proxy pairs: "
+-                   << watched.size();
++        LOG(INFO) << "ProxyServer: proxy pair launched successfully (total active: " << watched.size() << ")";
+       } else {
+-        LOG(ERROR) << "Cannot connect to the target to setup proxying: " << target->StrError();
++        LOG(ERROR) << "ProxyServer: failed to establish target connection for proxying: " << target->StrError();
++        LOG(DEBUG) << "ProxyServer: closing client connection due to target connection failure";
+         client->Close(); // <=== Why?
+       }
++      
+       // Unwatch completed proxy pairs
++      size_t initial_size = watched.size();
+       watched.remove_if([](ProxyPair& proxy) { return !proxy.Running(); });
++      size_t cleaned_count = initial_size - watched.size();
++      if (cleaned_count > 0) {
++        LOG(DEBUG) << "ProxyServer: cleaned up " << cleaned_count << " completed proxy pairs";
++      }
+     }
+ 
+     // Making sure all launched proxy pairs are finished by triggering their destructor
+-    LOG(DEBUG) << "Waiting for proxy threads to turn down";
++    LOG(INFO) << "ProxyServer: shutting down - waiting for " << watched.size() << " proxy pairs to complete";
+     watched.clear();
+-    LOG(DEBUG) << "Proxy threads are successfully turned down";
++    LOG(INFO) << "ProxyServer: all proxy threads successfully terminated";
+   });
+ }
+ 
+@@ -182,19 +218,27 @@ void ProxyServer::Join() {
+ }
+ 
+ ProxyServer::~ProxyServer() {
++  LOG(DEBUG) << "ProxyServer destructor: initiating shutdown";
+   if (stop_fd_->EventfdWrite(1) != 0) {
+-    LOG(ERROR) << "Failed to stop proxy thread: " << stop_fd_->StrError();
++    LOG(ERROR) << "ProxyServer: failed to signal stop to proxy thread: " << stop_fd_->StrError();
+   }
+   Join();
++  LOG(DEBUG) << "ProxyServer destructor: shutdown complete";
+ }
+ 
+ void Proxy(SharedFD server, std::function<SharedFD()> conn_factory) {
++  LOG(INFO) << "Starting synchronous proxy - server socket open=" << server->IsOpen();
+   ProxyServer proxy(std::move(server), std::move(conn_factory));
++  LOG(DEBUG) << "Synchronous proxy: waiting for completion";
+   proxy.Join();
++  LOG(INFO) << "Synchronous proxy completed";
+ }
+ 
+ std::unique_ptr<ProxyServer> ProxyAsync(SharedFD server, std::function<SharedFD()> conn_factory) {
+-  return std::make_unique<ProxyServer>(std::move(server), std::move(conn_factory));
++  LOG(INFO) << "Starting asynchronous proxy - server socket open=" << server->IsOpen();
++  auto proxy_server = std::make_unique<ProxyServer>(std::move(server), std::move(conn_factory));
++  LOG(DEBUG) << "Asynchronous proxy server created and running";
++  return proxy_server;
+ }
+ 
+ }  // namespace cuttlefish
+diff --git a/host/commands/assemble_cvd/disk_builder.cpp b/host/commands/assemble_cvd/disk_builder.cpp
+index 964b0b4ba..f96ab4563 100644
+--- a/host/commands/assemble_cvd/disk_builder.cpp
++++ b/host/commands/assemble_cvd/disk_builder.cpp
+@@ -216,9 +216,6 @@ Result<bool> DiskBuilder::BuildCompositeDiskIfNecessary() {
+ }
+ 
+ Result<bool> DiskBuilder::BuildOverlayIfNecessary() {
+-#ifdef __APPLE__
+-  return false;
+-#else
+   bool can_reuse_overlay = resume_if_possible_;
+ 
+   CF_EXPECT(!overlay_path_.empty(), "Overlay path missing");
+@@ -242,7 +239,6 @@ Result<bool> DiskBuilder::BuildOverlayIfNecessary() {
+   CreateQcowOverlay(crosvm_path_, composite_disk_path_, overlay_path_);
+ 
+   return true;
+-#endif
+ }
+ 
+ }  // namespace cuttlefish
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index cf2bf198d..d38cd3ccf 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -390,6 +390,7 @@ DEFINE_vec(kgdb, fmt::format("{}", CF_DEFAULTS_KGDB),
+ DEFINE_vec(start_gnss_proxy, fmt::format("{}", CF_DEFAULTS_START_GNSS_PROXY),
+            "Whether to start the gnss proxy.");
+ 
++
+ DEFINE_vec(gnss_file_path, CF_DEFAULTS_GNSS_FILE_PATH,
+               "Local gnss raw measurement file path for the gnss proxy");
+ 
+@@ -1612,8 +1613,6 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+       }
+     } else if (vhost_user_vsock_vec[instance_index] ==
+                kVhostUserVsockModeTrue) {
+-      CHECK(tmp_config_obj.vm_manager() == VmmMode::kCrosvm)
+-          << "For now, only crosvm supports vhost_user_vsock";
+       instance.set_vhost_user_vsock(true);
+     } else if (vhost_user_vsock_vec[instance_index] ==
+                kVhostUserVsockModeFalse) {
+@@ -1666,10 +1665,6 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+     instance.set_blank_data_image_mb(blank_data_image_mb_vec[instance_index]);
+     instance.set_gdb_port(gdb_port_vec[instance_index]);
+     instance.set_fail_fast(fail_fast_vec[instance_index]);
+-    if (vhost_user_block_vec[instance_index]) {
+-      CF_EXPECT_EQ(tmp_config_obj.vm_manager(), VmmMode::kCrosvm,
+-                   "vhost-user block only supported on crosvm");
+-    }
+     instance.set_vhost_user_block(vhost_user_block_vec[instance_index]);
+ 
+     std::optional<std::vector<CuttlefishConfig::DisplayConfig>>
+diff --git a/host/commands/run_cvd/Android.bp b/host/commands/run_cvd/Android.bp
+index 107a3009e..8b5dbb516 100644
+--- a/host/commands/run_cvd/Android.bp
++++ b/host/commands/run_cvd/Android.bp
+@@ -95,6 +95,20 @@ cc_binary_host {
+     target: {
+         darwin: {
+             enabled: true,
++            required: [
++                "echo_server",
++                "gnss_grpc_proxy",
++            ],
++            srcs: [
++                // "launch/mcu.cpp",
++                // "launch/modem.cpp",
++                // "launch/open_wrt.cpp",
++                // "launch/ti50_emulator.cpp",
++                // "launch/tombstone_receiver.cpp",
++                "launch/vhost_device_vsock.cpp",
++                // "launch/vhost_input_devices.cpp",
++                // "launch/wmediumd_server.cpp",
++            ],
+         },
+         linux: {
+             required: [
+diff --git a/host/commands/run_cvd/main.cc b/host/commands/run_cvd/main.cc
+index e0ffa86a0..a2622d22d 100644
+--- a/host/commands/run_cvd/main.cc
++++ b/host/commands/run_cvd/main.cc
+@@ -132,24 +132,24 @@ fruit::Component<> runCvdComponent(
+       .bindInstance(*config)
+       .bindInstance(*instance)
+       .bindInstance(*environment)
+-#ifdef __linux__
+-      .install(AutoCmd<AutomotiveProxyService>::Component)
+-      .install(AutoCmd<ModemSimulator>::Component)
+-      .install(AutoCmd<TombstoneReceiver>::Component)
+-      .install(McuComponent)
++//#ifdef __linux__
++      // .install(AutoCmd<AutomotiveProxyService>::Component)
++      // .install(AutoCmd<ModemSimulator>::Component)
++      // .install(AutoCmd<TombstoneReceiver>::Component)
++      // .install(McuComponent)
+       .install(VhostDeviceVsockComponent)
+-      .install(VhostInputDevicesComponent)
+-      .install(WmediumdServerComponent)
+-      .install(launchStreamerComponent)
+-      .install(AutoCmd<VhalProxyServer>::Component)
+-      .install(Ti50EmulatorComponent)
+-#endif
++      // .install(VhostInputDevicesComponent)
++      // .install(WmediumdServerComponent)
++      // .install(launchStreamerComponent)
++      // .install(AutoCmd<VhalProxyServer>::Component)
++      // .install(Ti50EmulatorComponent)
++//#endif
+       .install(AdbConfigComponent)
+       .install(AdbConfigFragmentComponent)
+       .install(FastbootConfigComponent)
+       .install(FastbootConfigFragmentComponent)
+       .install(bootStateMachineComponent)
+-      .install(AutoCmd<CasimirControlServer>::Component)
++      //.install(AutoCmd<CasimirControlServer>::Component)
+       .install(AutoCmd<ScreenRecordingServer>::Component)
+       .install(ConfigFlagPlaceholder)
+       .install(CustomActionsComponent)
+@@ -170,7 +170,7 @@ fruit::Component<> runCvdComponent(
+       .install(OpenwrtControlServerComponent)
+       .install(AutoCmd<Pica>::Component)
+       .install(RootCanalComponent)
+-      .install(AutoCmd<Casimir>::Component)
++      //.install(AutoCmd<Casimir>::Component)
+       .install(NetsimServerComponent)
+       .install(AutoSnapshotControlFiles::Component)
+       .install(AutoCmd<SecureEnv>::Component)
+diff --git a/host/libs/config/cuttlefish_config.h b/host/libs/config/cuttlefish_config.h
+index e2d9e8b43..0962d5e11 100644
+--- a/host/libs/config/cuttlefish_config.h
++++ b/host/libs/config/cuttlefish_config.h
+@@ -863,6 +863,7 @@ class CuttlefishConfig {
+     void set_domkey_mapping_config(
+         const std::string& domkey_mapping_config_json_path);
+     void set_enable_usb(bool enable);
++    void set_enable_dev_qemu_monitor(const bool enable_dev_qemu_monitor);
+     void set_enable_gnss_grpc_proxy(const bool enable_gnss_grpc_proxy);
+     void set_enable_bootanimation(const bool enable_bootanimation);
+     void set_extra_bootconfig_args(const std::string& extra_bootconfig_args);
+diff --git a/host/libs/image_aggregator/image_aggregator.cc b/host/libs/image_aggregator/image_aggregator.cc
+index 4bc5940ac..5752bd891 100644
+--- a/host/libs/image_aggregator/image_aggregator.cc
++++ b/host/libs/image_aggregator/image_aggregator.cc
+@@ -607,9 +607,15 @@ void CreateQcowOverlay(const std::string& crosvm_path,
+       RunWithManagedStdio(std::move(cmd), nullptr, &stdout_str, &stderr_str);
+ 
+   if (success != 0) {
+-    LOG(ERROR) << "Failed to run `" << (use_qemu ? qemu_img_path : crosvm_path)
+-               << " create_qcow2 --backing-file " << backing_file << " "
+-               << output_overlay_path << "`";
++    if (use_qemu) {
++      LOG(ERROR) << "Failed to run `" << qemu_img_path
++                 << " create -f qcow2 -b " << backing_file << " -F raw "
++                 << output_overlay_path << "`";
++    } else {
++      LOG(ERROR) << "Failed to run `" << crosvm_path
++                 << " create_qcow2 --backing-file " << backing_file << " "
++                 << output_overlay_path << "`";
++    }
+     LOG(ERROR) << "stdout:\n###\n" << stdout_str << "\n###";
+     LOG(ERROR) << "stderr:\n###\n" << stderr_str << "\n###";
+     LOG(FATAL) << "Return code: \"" << success << "\"";
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 3989f43f7..9cadf3e0a 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -39,6 +39,7 @@
+ #include "common/libs/utils/files.h"
+ #include "common/libs/utils/result.h"
+ #include "common/libs/utils/subprocess.h"
++#include "common/libs/utils/known_paths.h"
+ #include "host/libs/config/command_source.h"
+ #include "host/libs/config/cuttlefish_config.h"
+ #include "host/libs/vm_manager/vhost_user.h"
+@@ -230,11 +231,11 @@ QemuManager::ConfigureBootDevices(
+     case Arch::Arm:
+       return {{{"androidboot.boot_devices", "3f000000.pcie"}}};
+     case Arch::Arm64:
+-#ifdef __APPLE__
+-      return {{{"androidboot.boot_devices", "3f000000.pcie"}}};
+-#else
++// #ifdef __APPLE__
++//       return {{{"androidboot.boot_devices", "3f000000.pcie"}}};
++// #else
+       return {{{"androidboot.boot_devices", "4010000000.pcie"}}};
+-#endif
++// #endif
+     case Arch::RiscV64:
+       return {{{"androidboot.boot_devices", "soc/30000000.pci"}}};
+     case Arch::X86:
+@@ -711,7 +712,7 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+       commands.emplace_back(std::move(block.device_logs_cmd));
+       auto socket_path = std::move(block.socket_path);
+       qemu_cmd.AddPrerequisite([socket_path]() -> Result<void> {
+-#ifdef __linux__
++#if defined(__linux__) || defined(__APPLE__)
+         return WaitForUnixSocketListeningWithoutConnect(socket_path,
+                                                         /*timeoutSec=*/30);
+ #else
+@@ -796,11 +797,27 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+   qemu_cmd.AddParameter("socket,path=", instance.switches_socket_path(), ",id=switches0");
+   qemu_cmd.AddParameter("-device");
+   qemu_cmd.AddParameter("vhost-user-input-pci,chardev=switches0");
++//         qemu_cmd.AddPrerequisite([socket_path]() -> Result<void> {
++// #if defined(__linux__) || defined(__APPLE__)
++//         return WaitForUnixSocketListeningWithoutConnect(instance.switches_socket_path(),
++//                                                         /*timeoutSec=*/30);
++// #else
++//         return CF_ERR("Unhandled check if vhost user block ready.");
++// #endif
++//       });
+ 
+   qemu_cmd.AddParameter("-chardev");
+   qemu_cmd.AddParameter("socket,path=", instance.rotary_socket_path(), ",id=rotary0");
+   qemu_cmd.AddParameter("-device");
+   qemu_cmd.AddParameter("vhost-user-input-pci,chardev=rotary0");
++  //         qemu_cmd.AddPrerequisite([socket_path]() -> Result<void> {
++// #if defined(__linux__) || defined(__APPLE__)
++//         return WaitForUnixSocketListeningWithoutConnect(instance.rotary_socket_path(),
++//                                                         /*timeoutSec=*/30);
++// #else
++//         return CF_ERR("Unhandled check if vhost user block ready.");
++// #endif
++//       });
+ 
+   auto vhost_net = instance.vhost_net() ? ",vhost=on" : "";
+ 
+@@ -901,11 +918,37 @@ qemu_cmd.AddParameter("user,id=hostnet2,net=10.0.2.1/24,dns=1.1.1.1");
+   qemu_cmd.AddParameter("-msg");
+   qemu_cmd.AddParameter("timestamp=on");
+ 
++  // Create vhost vsock device
++  if (instance.vsock_guest_cid() >= 2) {
++    if (instance.vhost_user_vsock()) {
++      // Vhost user is supported on all posix platforms
++      auto vsock_socket_path = fmt::format("{}/vsock_{}_{}/vhost.socket", 
++                                          TempDir(),
++                                          instance.vsock_guest_cid(), 
++                                          getuid());
++      qemu_cmd.AddParameter("-chardev");
++      qemu_cmd.AddParameter("socket,id=vhost-user-vsock,path=", vsock_socket_path);
++      qemu_cmd.AddParameter("-device");
++      qemu_cmd.AddParameter("vhost-user-vsock-pci,chardev=vhost-user-vsock");
++
++      // Wait for vhost user vsock to be ready, so QEMU doesn't error out
++      qemu_cmd.AddPrerequisite([vsock_socket_path]() -> Result<void> {
++#if defined(__linux__) || defined(__APPLE__)
++        return WaitForUnixSocketListeningWithoutConnect(vsock_socket_path,
++                                                        /*timeoutSec=*/30);
++#else
++        return CF_ERR("Unhandled check if vhost user block ready.");
++#endif
++      });
++    } else {
++      // Vhost kernel module is not fully supported on Mac
+ #ifdef __linux__
+-  qemu_cmd.AddParameter("-device");
+-  qemu_cmd.AddParameter("vhost-vsock-pci-non-transitional,guest-cid=",
+-                        instance.vsock_guest_cid());
++      qemu_cmd.AddParameter("-device");
++      qemu_cmd.AddParameter("vhost-vsock-pci-non-transitional,guest-cid=",
++                          instance.vsock_guest_cid());
+ #endif
++    }
++  }
+ 
+   qemu_cmd.AddParameter("-device");
+   qemu_cmd.AddParameter("AC97,audiodev=audio_none");

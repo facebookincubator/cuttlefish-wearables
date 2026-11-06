@@ -1,0 +1,48 @@
+From eea05411a1a45ea92bf75b1140f5e08395a8c2fb Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Sat, 10 Jan 2026 10:34:42 -1000
+Subject: [PATCH 30/63] add -g option if present in help string to provide
+ correct display info to drm on boot
+
+Summary:
+# Motivation:
+If the drm driver submits a display info request after cocoa has changed the display size surfaceflinger will ignore the display and nothing will be rendered.
+# Overview:
+- if display argument is available setup the startup display size to match the virtio-gpu-pci setup
+
+(this is backwards compatible with vanilla qemu)
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz
+```
+
+replace host tools in device download and start
+```
+ rm host/darwin-arm64/cvd-host_package.tar.gz
+cp ~/n-16/out/host/darwin-x86/cvd-host_package.tar.gz host/darwin-arm64/cvd-host_package.tar.gz
+device virtual -t device -n 11410000003761 --skip-build-hash-check
+```
+---
+ host/libs/vm_manager/qemu_manager.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index 96b549052..ef0be5388 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -555,6 +555,12 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+         gpu_device, ",id=gpu0",
+         fmt::format(",addr={:0>2x}.0", VmManager::kGpuPciSlotNum),
+         ",xres=", display_config.width, ",yres=", display_config.height);
++
++    if (qemu_help.find("-g WxH[xDEPTH]") != std::string::npos) {
++      qemu_cmd.AddParameter("-g");
++      // Default to 16 bit color depth
++      qemu_cmd.AddParameter(display_config.width, "x", display_config.height);
++    }
+   }
+ 
+   if (!instance.console()) {

@@ -1,0 +1,25 @@
+From dc6952eb0ba0413b5ce22ada447408b6d062d1a2 Mon Sep 17 00:00:00 2001
+From: Olya Arkhangelskaia <olja@meta.com>
+Date: Wed, 6 Aug 2025 15:20:45 +0100
+Subject: [PATCH 4/7] DEMO ONLY CODE bindgen fixes
+
+Summary: Define rsize_t
+
+Test Plan:
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+---
+ crates/grpcio-sys/android/bindgen_wrapper.hpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/crates/grpcio-sys/android/bindgen_wrapper.hpp b/crates/grpcio-sys/android/bindgen_wrapper.hpp
+index 411063e6..0d2dcd14 100644
+--- a/crates/grpcio-sys/android/bindgen_wrapper.hpp
++++ b/crates/grpcio-sys/android/bindgen_wrapper.hpp
+@@ -1,3 +1,5 @@
++#include <cstddef>
++typedef size_t rsize_t;
+ #include <grpc/grpc_posix.h>
+ #include <grpc/support/cpu.h>
+ #include "../grpc_wrap.cc"

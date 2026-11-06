@@ -1,0 +1,35 @@
+From 88b0838736586b205e1ed904741e04e71a0ec562 Mon Sep 17 00:00:00 2001
+From: jeffreyeffendy <jeffreyeffendy@fb.com>
+Date: Sun, 29 Mar 2026 09:41:54 -0700
+Subject: [PATCH 48/63] Re-enable Casimir NFC emulator on macOS
+
+Summary:
+Casimir was previously commented out due to an inherited_fd issue on macOS/Darwin hosts. Now that the inherited_fd issue is fixed (an earlier change), Casimir can be re-enabled.
+
+This fixes the continuous "Failed to open socket" error spam in launcher.log when the socket never existed before.
+---
+ host/commands/run_cvd/main.cc | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/host/commands/run_cvd/main.cc b/host/commands/run_cvd/main.cc
+index 311179a46..50381bfac 100644
+--- a/host/commands/run_cvd/main.cc
++++ b/host/commands/run_cvd/main.cc
+@@ -149,7 +149,7 @@ fruit::Component<> runCvdComponent(
+       .install(FastbootConfigComponent)
+       .install(FastbootConfigFragmentComponent)
+       .install(bootStateMachineComponent)
+-      //.install(AutoCmd<CasimirControlServer>::Component)
++      .install(AutoCmd<CasimirControlServer>::Component)
+       .install(AutoCmd<ScreenRecordingServer>::Component)
+       .install(ConfigFlagPlaceholder)
+       .install(CustomActionsComponent)
+@@ -170,7 +170,7 @@ fruit::Component<> runCvdComponent(
+       .install(OpenwrtControlServerComponent)
+       .install(AutoCmd<Pica>::Component)
+       .install(RootCanalComponent)
+-      //.install(AutoCmd<Casimir>::Component)
++      .install(AutoCmd<Casimir>::Component)
+       .install(NetsimServerComponent)
+       .install(AutoSnapshotControlFiles::Component)
+       .install(AutoCmd<SecureEnv>::Component)

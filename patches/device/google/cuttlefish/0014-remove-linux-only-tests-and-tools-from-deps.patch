@@ -1,0 +1,118 @@
+From 3e76b032625dc8f957b99643bd5bc8733d6014c4 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Thu, 7 Aug 2025 11:10:16 -0700
+Subject: [PATCH 14/63] remove linux only tests and tools from deps
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+- wmediumd is linux only
+-  "automotive_vsock_proxy" and vhal_proxy_server are for android auto
+- sandboxed-api is linux only
+- crosvm is not needed because we are running on qemu
+- cuttlefish_net_tests is linux only
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+
+...
+[100% 38/38 3s remaining] Install: out/host/darwin-x86/cvd-host_package.tar.gz
+
+[0;32m#### build completed successfully (05:10 (mm:ss)) ####[00m
+```
+---
+ build/Android.bp | 25 +++++++++++++++++--------
+ 1 file changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/build/Android.bp b/build/Android.bp
+index a78f30ffa..461b24207 100644
+--- a/build/Android.bp
++++ b/build/Android.bp
+@@ -97,13 +97,22 @@ qemu_x86_64_linux_gnu_resource = [
+ ]
+ // End of generated qemu_x86_64_linux_gnu_resource
+ 
++cvd_linux_host_tools = [
++    "automotive_vsock_proxy",
++    "crosvm",
++    "wmediumd",
++    "wmediumd_gen_config",
++    "vhal_proxy_server",
++    "process_sandboxer",
++    "sandboxer_proxy",
++]
++
+ cvd_host_tools = [
+     "acloud_translator",
+     "adb",
+     "adb_connector",
+     "allocd_client",
+     "assemble_cvd",
+-    "automotive_vsock_proxy",
+     "avbtool",
+     "build_super_image",
+     "casimir",
+@@ -112,7 +121,6 @@ cvd_host_tools = [
+     "common_crosvm",
+     "console_forwarder",
+     "control_env_proxy_server",
+-    "crosvm",
+     "cvd_host_bugreport",
+     "cvd_import_locations",
+     "cvd_internal_display",
+@@ -168,12 +176,10 @@ cvd_host_tools = [
+     "powerbtn_cvd",
+     "powerwash_cvd",
+     "process_restarter",
+-    "process_sandboxer",
+     "record_cvd",
+     "restart_cvd",
+     "root-canal",
+     "run_cvd",
+-    "sandboxer_proxy",
+     "screen_recording_server",
+     "secure_env",
+     "sefcontext_compile",
+@@ -187,14 +193,11 @@ cvd_host_tools = [
+     "tombstone_receiver",
+     "toybox",
+     "unpack_bootimg",
+-    "vhal_proxy_server",
+     "vhost_device_vsock",
+     "vulkan.lvp",
+     "vulkan.pastel",
+     "webRTC",
+     "webrtc_operator",
+-    "wmediumd",
+-    "wmediumd_gen_config",
+ ]
+ 
+ cvd_openwrt_images = [
+@@ -205,10 +208,13 @@ cvd_openwrt_images = [
+ ]
+ 
+ cvd_host_tests = [
+-    "cuttlefish_net_tests",
+     "modem_simulator_test",
+ ]
+ 
++cvd_linux_host_tests = [
++    "cuttlefish_net_tests",
++]
++
+ cvd_host_webrtc_assets = [
+     "webrtc_adb.js",
+     "webrtc_app.js",
+@@ -552,5 +558,8 @@ cvd_host_package_customization {
+         darwin: {
+             enabled: true,
+         },
++        linux: {
++            deps: cvd_host_tools + cvd_host_tests + cvd_linux_host_tools + cvd_linux_host_tests,
++        }
+     },
+ }

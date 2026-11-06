@@ -1,0 +1,119 @@
+From 90b96b8a1a61c68799a835755eee8a8c97248b8c Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 27 Jul 2026 16:47:24 -0700
+Subject: [PATCH] cuttlefish: add noset_fstab_suffix flag
+
+Adds a boolean assemble_cvd flag (default false) that, when set, suppresses the
+androidboot.fstab_suffix bootconfig parameter. Images that provide their own
+fstab (selected via a config preset that sets noset_fstab_suffix=true) otherwise
+boot into recovery because first-stage init looks for a cf.<fmt>.<enc> fstab that
+does not exist. Rebased onto public android-16.0.0_r1 (context differs from the
+internal flags.cc). Preset files that enable this are device-specific and are not
+part of this public series.
+---
+ .../commands/assemble_cvd/bootconfig_args.cpp | 19 ++++++++++++-------
+ host/commands/assemble_cvd/flags.cc           |  5 +++++
+ host/commands/assemble_cvd/flags_defaults.h   |  1 +
+ host/libs/config/cuttlefish_config.cpp        |  8 ++++++++
+ host/libs/config/cuttlefish_config.h          |  3 +++
+ 5 files changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/host/commands/assemble_cvd/bootconfig_args.cpp b/host/commands/assemble_cvd/bootconfig_args.cpp
+index 7180c70..1f67916 100644
+--- a/host/commands/assemble_cvd/bootconfig_args.cpp
++++ b/host/commands/assemble_cvd/bootconfig_args.cpp
+@@ -153,13 +153,18 @@ Result<std::unordered_map<std::string, std::string>> BootconfigArgsFromConfig(
+         instance.modem_simulator_ports();
+   }
+ 
+-  // Once all Cuttlefish kernel versions are at least 5.15, filename encryption
+-  // will not need to be set conditionally. HCTR2 will always be available.
+-  // At that point fstab.cf.f2fs.cts and fstab.cf.ext4.cts can be removed.
+-  std::string fstab_suffix = fmt::format("cf.{}.{}", instance.userdata_format(),
+-                                         instance.filename_encryption_mode());
+-
+-  bootconfig_args["androidboot.fstab_suffix"] = fstab_suffix;
++  // TODO: We can remove this once we do not need to support running on older
++  // images (<=SDK32)
++  if (!config.noset_fstab_suffix()) {
++    // Once all Cuttlefish kernel versions are at least 5.15, filename encryption
++    // will not need to be set conditionally. HCTR2 will always be available.
++    // At that point fstab.cf.f2fs.cts and fstab.cf.ext4.cts can be removed.
++    std::string fstab_suffix = fmt::format(
++        "cf.{}.{}", instance.userdata_format(),
++        instance.filename_encryption_mode());
++
++    bootconfig_args["androidboot.fstab_suffix"] = fstab_suffix;
++  }
+ 
+   bootconfig_args["androidboot.wifi_mac_prefix"] =
+       std::to_string(instance.wifi_mac_prefix());
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index 1e07ded..e4ffb49 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -123,6 +123,10 @@ DEFINE_string(overlays, "",
+               "List of displays to overlay. Format is: 'vm_index:display_index "
+               "vm_index2:display_index2 [...]'");
+ DEFINE_bool(use_16k, false, "Launch using 16k kernel");
++DEFINE_bool(noset_fstab_suffix, CF_DEFAULTS_NOSET_FSTAB_SUFFIX,
++            "Do not set androidboot.fstab_suffix bootconfig parameter. "
++            "Used by images that provide their own fstab (e.g. via a config "
++            "preset that sets noset_fstab_suffix=true).");
+ DEFINE_vec(kernel_path, CF_DEFAULTS_KERNEL_PATH,
+               "Path to the kernel. Overrides the one from the boot image");
+ DEFINE_vec(initramfs_path, CF_DEFAULTS_INITRAMFS_PATH,
+@@ -1128,6 +1132,7 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+   }
+ 
+   tmp_config_obj.set_root_dir(root_dir);
++  tmp_config_obj.set_noset_fstab_suffix(FLAGS_noset_fstab_suffix);
+ 
+   tmp_config_obj.set_environments_uds_dir(
+       EnvironmentUdsDir().value_or(tmp_config_obj.environments_dir()));
+diff --git a/host/commands/assemble_cvd/flags_defaults.h b/host/commands/assemble_cvd/flags_defaults.h
+index d2efad0..98b1fae 100644
+--- a/host/commands/assemble_cvd/flags_defaults.h
++++ b/host/commands/assemble_cvd/flags_defaults.h
+@@ -87,6 +87,7 @@
+ 
+ // Security default parameters
+ #define CF_DEFAULTS_GUEST_ENFORCE_SECURITY true
++#define CF_DEFAULTS_NOSET_FSTAB_SUFFIX false
+ #define CF_DEFAULTS_USE_RANDOM_SERIAL false
+ #define CF_DEFAULTS_SERIAL_NUMBER \
+   cuttlefish::ForCurrentInstance("CUTTLEFISHCVD")
+diff --git a/host/libs/config/cuttlefish_config.cpp b/host/libs/config/cuttlefish_config.cpp
+index 4ee5c02..b766be1 100644
+--- a/host/libs/config/cuttlefish_config.cpp
++++ b/host/libs/config/cuttlefish_config.cpp
+@@ -844,4 +844,12 @@ std::vector<std::string> CuttlefishConfig::environment_dirs() const {
+   return result;
+ }
+ 
++static constexpr char kNoSetFstabSuffix[] = "noset_fstab_suffix";
++void CuttlefishConfig::set_noset_fstab_suffix(bool noset_fstab_suffix) {
++  (*dictionary_)[kNoSetFstabSuffix] = noset_fstab_suffix;
++}
++bool CuttlefishConfig::noset_fstab_suffix() const {
++  return (*dictionary_)[kNoSetFstabSuffix].asBool();
++}
++
+ }  // namespace cuttlefish
+diff --git a/host/libs/config/cuttlefish_config.h b/host/libs/config/cuttlefish_config.h
+index d18ce06..ad4e814 100644
+--- a/host/libs/config/cuttlefish_config.h
++++ b/host/libs/config/cuttlefish_config.h
+@@ -327,6 +327,9 @@ class CuttlefishConfig {
+   void set_instance_names(const std::vector<std::string>& instance_names);
+   std::vector<std::string> instance_names() const;
+ 
++  void set_noset_fstab_suffix(bool value);
++  bool noset_fstab_suffix() const;
++
+   // A view into an existing CuttlefishConfig object for a particular instance.
+   class InstanceSpecific {
+     const CuttlefishConfig* config_;
+-- 
+2.50.1
+

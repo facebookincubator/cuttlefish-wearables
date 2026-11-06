@@ -1,0 +1,36 @@
+From cee6940895a7a9b9e7cec204bd38abb3d3807cac Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 27 Jul 2026 16:27:19 -0700
+Subject: [PATCH 65/67] cuttlefish: darwin: guard Linux-only crosvm arg helpers
+
+MacCrosvmArgument/PciCrosvmArgument are only called from AddTap, which is
+already #ifdef __linux__. Move the helpers under the same guard so darwin
+does not fail -Werror,-Wunused-function.
+---
+ host/libs/vm_manager/crosvm_builder.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/host/libs/vm_manager/crosvm_builder.cpp b/host/libs/vm_manager/crosvm_builder.cpp
+index 72abd10..c7611ea 100644
+--- a/host/libs/vm_manager/crosvm_builder.cpp
++++ b/host/libs/vm_manager/crosvm_builder.cpp
+@@ -31,6 +31,8 @@
+ namespace cuttlefish {
+ namespace {
+ 
++#ifdef __linux__
++// Only used by CrosvmBuilder::AddTap, which is Linux-only (see below).
+ std::string MacCrosvmArgument(std::optional<std::string_view> mac) {
+   return mac.has_value() ? fmt::format(",mac={}", mac.value()) : "";
+ }
+@@ -39,6 +41,7 @@ std::string PciCrosvmArgument(std::optional<pci::Address> pci) {
+   return pci.has_value() ? fmt::format(",pci-address={}", pci.value().Id())
+                          : "";
+ }
++#endif
+ 
+ }  // namespace
+ 
+-- 
+2.50.1
+

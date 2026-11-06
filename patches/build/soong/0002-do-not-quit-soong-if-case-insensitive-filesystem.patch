@@ -1,0 +1,36 @@
+From 1775c09143e423aade1db688e17afea76e5b2566 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 12:38:02 -0700
+Subject: [PATCH 02/11] do not quit soong if case-insensitive filesystem
+
+Summary:
+# Motivation:
+Darwin is by default case insensitive filesystem.
+# Overview:
+- don't error out if user did not mount aosp to case insensitive filesystem
+
+This branch cut is for darwin host tools only. So it's acceptable
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+---
+ ui/build/build.go | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ui/build/build.go b/ui/build/build.go
+index 781ca182f..edd754deb 100644
+--- a/ui/build/build.go
++++ b/ui/build/build.go
+@@ -192,7 +192,7 @@ func checkCaseSensitivity(ctx Context, config Config) {
+ 		ctx.Println("You are building on a case-insensitive filesystem.")
+ 		ctx.Println("Please move your source tree to a case-sensitive filesystem.")
+ 		ctx.Println("************************************************************")
+-		ctx.Fatalln("Case-insensitive filesystems not supported")
++		// ctx.Fatalln("Case-insensitive filesystems not supported")
+ 	}
+ }
+ 

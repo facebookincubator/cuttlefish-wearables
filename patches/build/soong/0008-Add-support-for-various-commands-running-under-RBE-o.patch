@@ -1,0 +1,141 @@
+From 08ac27e271ce60388646f40f024b163384b9e57c Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Fri, 31 Oct 2025 11:25:24 -0700
+Subject: [PATCH 08/11] Add support for various commands running under RBE on
+ Mac
+
+Summary:
+Add additional Mac toolchain dependencies, and turn on RBE for some actions that aren't supported in Linux RBE but seem to work in our systems (we don't use custom RE worker images.)
+
+Metalava is the only one I couldn't get going properly. It seems to be loading an older version of Java than what we want/send to the server. It will stay disabled for now.
+
+Test Plan:
+USE_RBE=true
+
+NINJA_REMOTE_NUM_JOBS=100 m out/host/darwin-x86/cvd-host_package.tar.gz -k
+---
+ bpf/bpf.go         |  2 +-
+ cc/builder.go      | 14 ++++++++++++--
+ java/builder.go    | 14 +++++++++++++-
+ java/droidstubs.go |  1 +
+ java/kotlin.go     |  4 ++--
+ 5 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/bpf/bpf.go b/bpf/bpf.go
+index deb465dd6..d8b16c2af 100644
+--- a/bpf/bpf.go
++++ b/bpf/bpf.go
+@@ -37,7 +37,7 @@ func init() {
+ var (
+ 	pctx = android.NewPackageContext("android/soong/bpf")
+ 
+-	ccRule = pctx.AndroidRemoteStaticRule("ccRule", android.RemoteRuleSupports{Goma: true},
++	ccRule = pctx.AndroidRemoteStaticRule("ccRule", android.RemoteRuleSupports{Goma: true, RBE: true},
+ 		blueprint.RuleParams{
+ 			Depfile:     "${out}.d",
+ 			Deps:        blueprint.DepsGCC,
+diff --git a/cc/builder.go b/cc/builder.go
+index 449ee9db1..3046e7b27 100644
+--- a/cc/builder.go
++++ b/cc/builder.go
+@@ -78,7 +78,12 @@ var (
+ 			Inputs:          []string{"${out}.rsp", "$implicitInputs"},
+ 			RSPFiles:        []string{"${out}.rsp"},
+ 			OutputFiles:     []string{"${out}", "$implicitOutputs"},
+-			ToolchainInputs: []string{"$ldCmd"},
++			ToolchainInputs: func() []string {
++				if runtime.GOOS == "darwin" {
++					return []string{"$ldCmd", "${config.ClangBin}/ld64.lld"}
++				}
++				return []string{"$ldCmd"}
++			}(),
+ 			Platform:        map[string]string{remoteexec.PoolKey: "${config.RECXXLinksPool}"},
+ 		}, []string{"ldCmd", "crtBegin", "libFlags", "crtEnd", "ldFlags", "extraLibFlags"}, []string{"implicitInputs", "implicitOutputs"})
+ 
+@@ -94,7 +99,12 @@ var (
+ 			ExecStrategy:    "${config.RECXXLinksExecStrategy}",
+ 			Inputs:          []string{"$inCommaList", "$implicitInputs"},
+ 			OutputFiles:     []string{"${out}", "$implicitOutputs"},
+-			ToolchainInputs: []string{"$ldCmd"},
++			ToolchainInputs: func() []string {
++				if runtime.GOOS == "darwin" {
++					return []string{"$ldCmd", "${config.ClangBin}/ld64.lld"}
++				}
++				return []string{"$ldCmd"}
++			}(),
+ 			Platform:        map[string]string{remoteexec.PoolKey: "${config.RECXXLinksPool}"},
+ 		}, []string{"ldCmd", "ldFlags"}, []string{"implicitInputs", "inCommaList", "implicitOutputs"})
+ 
+diff --git a/java/builder.go b/java/builder.go
+index dff0032d8..6c1098d1c 100644
+--- a/java/builder.go
++++ b/java/builder.go
+@@ -20,6 +20,7 @@ package java
+ 
+ import (
+ 	"path/filepath"
++	"runtime"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -72,6 +73,12 @@ var (
+ 			"$javaTemplate": &remoteexec.REParams{
+ 				Labels:       map[string]string{"type": "compile", "lang": "java", "compiler": "javac"},
+ 				ExecStrategy: "${config.REJavacExecStrategy}",
++				ToolchainInputs: func() []string {
++					if runtime.GOOS == "darwin" {
++						return []string{"${config.JavaHome}"}
++					}
++					return []string{"${config.JavacCmd}"}
++				}(),
+ 				Platform:     map[string]string{remoteexec.PoolKey: "${config.REJavaPool}"},
+ 			},
+ 			"$zipTemplate": &remoteexec.REParams{
+@@ -176,7 +183,12 @@ var (
+ 			Inputs:          []string{"${config.TurbineJar}", "${out}.rsp", "$rbeInputs"},
+ 			RSPFiles:        []string{"$out.rsp", "$rspFiles"},
+ 			OutputFiles:     []string{"$rbeOutputs"},
+-			ToolchainInputs: []string{"${config.JavaCmd}"},
++			ToolchainInputs: func() []string {
++				if runtime.GOOS == "darwin" {
++					return []string{"${config.JavaHome}"}
++				}
++				return []string{"${config.JavacCmd}"}
++			}(),
+ 			Platform:        map[string]string{remoteexec.PoolKey: "${config.REJavaPool}"},
+ 		},
+ 		[]string{"javacFlags", "turbineFlags", "outputFlags", "javaVersion", "outputs", "rbeOutputs"}, []string{"rbeInputs", "rspFiles"})
+diff --git a/java/droidstubs.go b/java/droidstubs.go
+index b30c8448a..cdee96494 100644
+--- a/java/droidstubs.go
++++ b/java/droidstubs.go
+@@ -18,6 +18,7 @@ import (
+ 	"fmt"
+ 	"path/filepath"
+ 	"regexp"
++	"runtime"
+ 	"strings"
+ 
+ 	"github.com/google/blueprint"
+diff --git a/java/kotlin.go b/java/kotlin.go
+index 308bb0305..f78784edd 100644
+--- a/java/kotlin.go
++++ b/java/kotlin.go
+@@ -26,7 +26,7 @@ import (
+ 	"github.com/google/blueprint"
+ )
+ 
+-var kotlinc = pctx.AndroidRemoteStaticRule("kotlinc", android.RemoteRuleSupports{Goma: true},
++var kotlinc = pctx.AndroidRemoteStaticRule("kotlinc", android.RemoteRuleSupports{Goma: true, RBE: true},
+ 	blueprint.RuleParams{
+ 		Command: `rm -rf "$classesDir" "$headerClassesDir" "$srcJarDir" "$kotlinBuildFile" "$emptyDir" && ` +
+ 			`mkdir -p "$classesDir" "$headerClassesDir" "$srcJarDir" "$emptyDir" && ` +
+@@ -176,7 +176,7 @@ func (j *Module) kotlinCompile(ctx android.ModuleContext, outputFile, headerOutp
+ 	}
+ }
+ 
+-var kaptStubs = pctx.AndroidRemoteStaticRule("kaptStubs", android.RemoteRuleSupports{Goma: true},
++var kaptStubs = pctx.AndroidRemoteStaticRule("kaptStubs", android.RemoteRuleSupports{Goma: true, RBE: true},
+ 	blueprint.RuleParams{
+ 		Command: `rm -rf "$srcJarDir" "$kotlinBuildFile" "$kaptDir" && ` +
+ 			`mkdir -p "$srcJarDir" "$kaptDir/sources" "$kaptDir/classes" && ` +

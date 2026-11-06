@@ -1,0 +1,87 @@
+From 0c5b86e3e4745748fcee3244625246f3c90b340a Mon Sep 17 00:00:00 2001
+From: Olya Arkhangelskaia <olja@meta.com>
+Date: Wed, 6 Aug 2025 11:34:52 +0100
+Subject: [PATCH 05/63] [DEMO CODE ONLY] chnages to image genartion to use qemu
+ instead of crossvm
+
+Summary:
+Change in image_aggregator.
+When making final image  by default it looks for crossvm path.
+
+Test Plan:
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+m libimage_aggregator
+---
+ .../libs/image_aggregator/image_aggregator.cc | 43 ++++++++++++++++---
+ 1 file changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/host/libs/image_aggregator/image_aggregator.cc b/host/libs/image_aggregator/image_aggregator.cc
+index f71207f65..4bc5940ac 100644
+--- a/host/libs/image_aggregator/image_aggregator.cc
++++ b/host/libs/image_aggregator/image_aggregator.cc
+@@ -44,6 +44,7 @@
+ #include "common/libs/utils/files.h"
+ #include "common/libs/utils/size_utils.h"
+ #include "common/libs/utils/subprocess.h"
++#include "host/libs/config/cuttlefish_config.h"
+ #include "host/libs/config/mbr.h"
+ #include "host/libs/image_aggregator/sparse_image_utils.h"
+ 
+@@ -564,11 +565,41 @@ void CreateCompositeDisk(std::vector<MultipleImagePartition> partitions,
+ void CreateQcowOverlay(const std::string& crosvm_path,
+                        const std::string& backing_file,
+                        const std::string& output_overlay_path) {
+-  Command cmd(crosvm_path);
+-  cmd.AddParameter("create_qcow2");
+-  cmd.AddParameter("--backing-file");
+-  cmd.AddParameter(backing_file);
+-  cmd.AddParameter(output_overlay_path);
++
++  const auto* config = CuttlefishConfig::Get();
++  bool use_qemu = false;
++  std::string qemu_img_path;
++
++  if (config && config->vm_manager() == VmmMode::kQemu) {
++#ifndef __linux__
++    // On non-Linux platforms (like macOS), use QEMU tools
++    auto instance = config->ForDefaultInstance();
++    std::string qemu_binary_dir = instance.qemu_binary_dir();
++    if (!qemu_binary_dir.empty()) {
++      qemu_img_path = qemu_binary_dir + "/qemu-img";
++      use_qemu = true;
++    }
++#endif
++  }
++  Command cmd(use_qemu ? qemu_img_path : crosvm_path);
++
++  if (use_qemu) {
++    // Use QEMU qemu-img command: qemu-img create -f qcow2 -b <backing_file> -F qcow2 <output_file>
++    cmd.AddParameter("create");
++    cmd.AddParameter("-f");
++    cmd.AddParameter("qcow2");
++    cmd.AddParameter("-b");
++    cmd.AddParameter(backing_file);
++    cmd.AddParameter("-F");
++    cmd.AddParameter("raw");
++    cmd.AddParameter(output_overlay_path);
++  } else {
++    // Use crosvm command: crosvm create_qcow2 --backing-file <backing_file> <output_file>
++    cmd.AddParameter("create_qcow2");
++    cmd.AddParameter("--backing-file");
++    cmd.AddParameter(backing_file);
++    cmd.AddParameter(output_overlay_path);
++  }
+ 
+   std::string stdout_str;
+   std::string stderr_str;
+@@ -576,7 +607,7 @@ void CreateQcowOverlay(const std::string& crosvm_path,
+       RunWithManagedStdio(std::move(cmd), nullptr, &stdout_str, &stderr_str);
+ 
+   if (success != 0) {
+-    LOG(ERROR) << "Failed to run `" << crosvm_path
++    LOG(ERROR) << "Failed to run `" << (use_qemu ? qemu_img_path : crosvm_path)
+                << " create_qcow2 --backing-file " << backing_file << " "
+                << output_overlay_path << "`";
+     LOG(ERROR) << "stdout:\n###\n" << stdout_str << "\n###";

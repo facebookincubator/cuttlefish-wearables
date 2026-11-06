@@ -1,0 +1,57 @@
+From 2cfac6392852a536452f50d986b1052fbddb981e Mon Sep 17 00:00:00 2001
+From: Igor Barynov <igorbarinov@fb.com>
+Date: Wed, 20 May 2026 07:50:04 -0700
+Subject: [PATCH 61/63] [cuttlefish][darwin-host-tools] Fix DNS on eth1: drop
+ dns= and disable IPv6 SLIRP
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+Use SLIRP's DNS forwarder rather than advertising a public DNS server on
+eth1. This avoids mismatched response addresses when the host network
+redirects DNS. Disable IPv6 on this IPv4-only link to avoid resolver
+timeouts before IPv4 fallback.
+
+Test Plan:
+Booted device CF emu with this change applied via wrapper, no guest
+iptables rules:
+
+  adb shell ip -6 addr show eth1
+    -> link-local fe80:: only (no fec0:: addresses)
+
+  adb shell dumpsys connectivity | grep -A2 'eth1' | grep DnsAddresses
+    -> DnsAddresses: [ /10.0.1.3 ]   (SLIRP internal forwarder)
+
+  adb shell 'iptables -t nat -L OUTPUT -n -v'
+    -> no DNAT rules
+
+  adb shell ping -c 1 8.8.8.8       -> success
+  adb shell ping -c 1 google.com    -> success (was: unknown host)
+  adb shell nslookup google.com     -> resolves via 10.0.1.3
+                                       (-> 142.251.30.102)
+
+  Android reports network state VALIDATED.
+---
+ host/libs/vm_manager/qemu_manager.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index fedb02f72..f38cb1e77 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -932,7 +932,13 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+                             ",dns=127.0.0.1");
+ 
+       qemu_cmd.AddParameter("-netdev");
+-      qemu_cmd.AddParameter("user,id=hostnet1,net=10.0.1.1/24,dns=8.8.4.4");
++      // No dns=: fall back to SLIRP's internal DNS forwarder at gateway+1
++      // (10.0.1.3). Setting dns=<external IP> breaks when the host network
++      // hijacks DNS (corp net, captive portals) — response source IP no
++      // longer matches and Android's resolver drops it.
++      // ipv6=off: suppress SLIRP's default fec0::3 IPv6 RA, which Android
++      // prefers and times out on. eth1 is IPv4-only on Cuttlefish.
++      qemu_cmd.AddParameter("user,id=hostnet1,net=10.0.1.1/24,ipv6=off");
+ 
+       if (!config.virtio_mac80211_hwsim()) {
+         qemu_cmd.AddParameter("-netdev");

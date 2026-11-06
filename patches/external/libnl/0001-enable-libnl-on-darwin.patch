@@ -1,0 +1,52 @@
+From f200f6a7f1d6e7162c2b69b858e350bb15631e96 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 10:01:44 -0700
+Subject: [PATCH] enable libnl on darwin
+
+Summary:
+# Motivation:
+This is a dependency of one of the cuttlefish host binaries.
+
+# Overview:
+- add byte swap for darwin target
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+---
+ Android.bp                   | 2 +-
+ include/base/nl-base-utils.h | 4 ++++
+ 2 files changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/Android.bp b/Android.bp
+index 5ab779a9..c5fbbb77 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -43,7 +43,7 @@ cc_library {
+ 
+     target: {
+         darwin: {
+-            enabled: false,
++            enabled: true,
+         },
+         linux_glibc: {
+             local_include_dirs: [
+diff --git a/include/base/nl-base-utils.h b/include/base/nl-base-utils.h
+index f8df1d62..34351efa 100644
+--- a/include/base/nl-base-utils.h
++++ b/include/base/nl-base-utils.h
+@@ -6,7 +6,11 @@
+ #ifndef __NETLINK_BASE_NL_BASE_UTILS_H__
+ #define __NETLINK_BASE_NL_BASE_UTILS_H__
+ 
++#ifdef __APPLE__
++#include <libkern/OSByteOrder.h>
++#else
+ #include <byteswap.h>
++#endif
+ #include <stdlib.h>
+ #include <stdarg.h>
+ #include <limits.h>

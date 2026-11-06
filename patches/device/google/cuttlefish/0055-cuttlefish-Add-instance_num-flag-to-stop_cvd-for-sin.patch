@@ -1,0 +1,194 @@
+From 858146fff04dcb66a3c9d6cbfbe0bcff301c6854 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 25 Mar 2026 16:07:49 -0700
+Subject: [PATCH 55/63] [cuttlefish] Add --instance_num flag to stop_cvd for
+ single-instance stop
+
+Summary:
+# Motivation:
+We want to make launching and stopping emulators on macOS for multi-constellation easy. Keeping track of base_instance_num argument is not easy for users and over-complicates things. The current device implementation leads to race conditions where devices fail to launch.
+
+Adding an instance registry with atomic operations allows us to provide an easy start/stop interface to users running multiple emulators.
+# Overview:
+
+Add --instance_num flag to stop_cvd for stopping a single instance via the
+instance registry, enabling independent lifecycle management.
+
+When --instance_num=N is set:
+- Load config from the registry for that specific instance
+- Stop only that instance and unregister it from the registry
+- Other running instances are unaffected
+
+When --instance_num is not set (default, stop all):
+- Try monolithic config first (existing behavior)
+- If no monolithic config exists, fall back to the registry: list all
+  registered instances and stop each one
+- For instances whose config can't be loaded, fall back to SIGKILL
+---
+ host/commands/stop/main.cc | 95 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 90 insertions(+), 5 deletions(-)
+
+diff --git a/host/commands/stop/main.cc b/host/commands/stop/main.cc
+index 5419f9a7f..3df403342 100644
+--- a/host/commands/stop/main.cc
++++ b/host/commands/stop/main.cc
+@@ -26,8 +26,9 @@
+ #include <thread>
+ #include <vector>
+ 
+-#include <android-base/strings.h>
+ #include <android-base/logging.h>
++#include <android-base/parseint.h>
++#include <android-base/strings.h>
+ 
+ #include "common/libs/fs/shared_fd.h"
+ #include "common/libs/utils/environment.h"
+@@ -39,6 +40,7 @@
+ #include "host/libs/command_util/runner/defs.h"
+ #include "host/libs/command_util/util.h"
+ #include "host/libs/config/cuttlefish_config.h"
++#include "host/libs/config/instance_registry.h"
+ #include "host/libs/metrics/metrics_receiver.h"
+ 
+ namespace cuttlefish {
+@@ -175,11 +177,13 @@ struct FlagVaules {
+   std::int32_t wait_for_launcher;
+   bool clear_instance_dirs;
+   bool helpxml;
++  std::int32_t instance_num;
+ };
+ 
+ FlagVaules GetFlagValues(int argc, char** argv) {
+   std::int32_t wait_for_launcher = 5;
+   bool clear_instance_dirs = false;
++  std::int32_t instance_num = 0;
+   std::vector<Flag> flags;
+   flags.emplace_back(
+       GflagsCompatFlag("wait_for_launcher", wait_for_launcher)
+@@ -189,6 +193,11 @@ FlagVaules GetFlagValues(int argc, char** argv) {
+       GflagsCompatFlag("clear_instance_dirs", clear_instance_dirs)
+           .Help("If provided, deletes the instance dir after attempting to "
+                 "stop each instance."));
++  flags.emplace_back(
++      GflagsCompatFlag("instance_num", instance_num)
++          .Help("Stop only this specific instance number. When set, loads "
++                "the instance config from the registry instead of the "
++                "global config. Use 0 (default) to stop all instances."));
+   flags.emplace_back(HelpFlag(flags));
+   bool helpxml = false;
+   flags.emplace_back(HelpXmlFlag(flags, std::cout, helpxml));
+@@ -198,13 +207,77 @@ FlagVaules GetFlagValues(int argc, char** argv) {
+   auto parse_res = ConsumeFlags(flags, args);
+   CHECK(parse_res.ok() || helpxml) << "Could not process command line flags.";
+ 
+-  return {wait_for_launcher, clear_instance_dirs, helpxml};
++  return {wait_for_launcher, clear_instance_dirs, helpxml, instance_num};
+ }
+ 
+ int StopCvdMain(const std::int32_t wait_for_launcher,
+-                const bool clear_instance_dirs) {
++                const bool clear_instance_dirs,
++                const std::int32_t instance_num) {
++  // If a specific instance number was requested, try to load its config
++  // from the instance registry (independent instance mode).
++  if (instance_num > 0) {
++    auto config = CuttlefishConfig::GetForInstance(instance_num);
++    if (config) {
++      int exit_code = 0;
++      for (const auto& instance : config->Instances()) {
++        int32_t id;
++        if (android::base::ParseInt(instance.id(), &id) && id == instance_num) {
++          exit_code = StopInstance(*config, instance, wait_for_launcher);
++          if (clear_instance_dirs && DirectoryExists(instance.instance_dir())) {
++            LOG(INFO) << "Deleting instance dir " << instance.instance_dir();
++            if (!RecursivelyRemoveDirectory(instance.instance_dir()).ok()) {
++              LOG(ERROR) << "Unable to rmdir " << instance.instance_dir();
++            }
++          }
++          // Unregister from the instance registry.
++          auto unreg_result = UnregisterInstance(instance_num);
++          if (!unreg_result.ok()) {
++            LOG(WARNING) << "Failed to unregister instance " << instance_num
++                         << ": " << unreg_result.error().FormatForEnv();
++          }
++          break;
++        }
++      }
++      return exit_code;
++    }
++    LOG(ERROR) << "Could not load config for instance " << instance_num
++               << " from registry";
++    return 1;
++  }
++
++  // Default behavior: stop all instances from the monolithic config.
+   auto config = CuttlefishConfig::Get();
+   if (!config) {
++    // No monolithic config. Try to stop all instances from the registry.
++    auto instances_result = ListInstances();
++    if (instances_result.ok() && !instances_result->empty()) {
++      int exit_code = 0;
++      for (const auto& entry : *instances_result) {
++        LOG(INFO) << "Stopping instance " << entry.instance_num
++                  << " (pid " << entry.run_cvd_pid << ")";
++        auto inst_config = CuttlefishConfig::GetForInstance(entry.instance_num);
++        if (inst_config) {
++          for (const auto& instance : inst_config->Instances()) {
++            exit_code |= StopInstance(*inst_config, instance, wait_for_launcher);
++          }
++        } else {
++          LOG(ERROR) << "Could not load config for instance "
++                     << entry.instance_num;
++          // Fall back to killing the process directly
++          if (kill(entry.run_cvd_pid, SIGKILL) != 0) {
++            LOG(ERROR) << "Failed to kill instance " << entry.instance_num
++                       << " (pid " << entry.run_cvd_pid
++                       << "): " << strerror(errno);
++          }
++        }
++        auto unreg_result = UnregisterInstance(entry.instance_num);
++        if (!unreg_result.ok()) {
++          LOG(WARNING) << "Failed to unregister instance "
++                       << entry.instance_num;
++        }
++      }
++      return exit_code;
++    }
+     LOG(ERROR) << "Failed to obtain config object";
+     return FallBackStop(FallbackDirs());
+   }
+@@ -247,6 +320,17 @@ int StopCvdMain(const std::int32_t wait_for_launcher,
+   for (auto& exit_status : exit_state_futures) {
+     exit_code |= exit_status.get();
+   }
++  // Unregister all stopped instances from the registry.
++  for (const auto& instance : instances) {
++    int32_t instance_id;
++    if (android::base::ParseInt(instance.id(), &instance_id)) {
++      auto unreg_result = UnregisterInstance(instance_id);
++      if (!unreg_result.ok()) {
++        LOG(WARNING) << "Failed to unregister instance " << instance_id
++                     << ": " << unreg_result.error().FormatForEnv();
++      }
++    }
++  }
+   return exit_code;
+ }
+ 
+@@ -256,7 +340,7 @@ int StopCvdMain(const std::int32_t wait_for_launcher,
+ int main(int argc, char** argv) {
+   ::android::base::InitLogging(argv, android::base::StderrLogger);
+ 
+-  const auto [wait_for_launcher, clear_instance_dirs, helpxml] =
++  const auto [wait_for_launcher, clear_instance_dirs, helpxml, instance_num] =
+       cuttlefish::GetFlagValues(argc, argv);
+ 
+   if (helpxml) {
+@@ -277,5 +361,6 @@ int main(int argc, char** argv) {
+     cuttlefish::MetricsReceiver::LogMetricsVMStop();
+   }
+ 
+-  return cuttlefish::StopCvdMain(wait_for_launcher, clear_instance_dirs);
++  return cuttlefish::StopCvdMain(wait_for_launcher, clear_instance_dirs,
++                                 instance_num);
+ }

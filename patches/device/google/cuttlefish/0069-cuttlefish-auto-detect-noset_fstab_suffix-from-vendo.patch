@@ -1,0 +1,115 @@
+From e0142c9ea0e3bfbb23c05016afe753e3afda7cf1 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 28 Jul 2026 09:24:08 -0700
+Subject: [PATCH] cuttlefish: auto-detect noset_fstab_suffix from vendor_boot
+ ramdisk
+
+Extends an earlier change so noset_fstab_suffix no longer requires an explicit flag or
+config preset. During ReadGuestConfig, unpack the guest's vendor_boot ramdisk and
+check for standard cuttlefish fstab.cf.<fmt>.<enc> files; if none are present the
+guest ships its own fstab, so androidboot.fstab_suffix is suppressed
+automatically (otherwise first-stage init can't find its fstab and boots to
+recovery). The explicit --noset_fstab_suffix flag still forces the behavior.
+---
+ host/commands/assemble_cvd/flags.cc | 55 ++++++++++++++++++++++++++++-
+ host/commands/assemble_cvd/flags.h  |  4 +++
+ 2 files changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/host/commands/assemble_cvd/flags.cc b/host/commands/assemble_cvd/flags.cc
+index e4ffb49..7528aa9 100644
+--- a/host/commands/assemble_cvd/flags.cc
++++ b/host/commands/assemble_cvd/flags.cc
+@@ -628,6 +628,27 @@ Result<std::vector<GuestConfig>> ReadGuestConfig() {
+   return rets;
+ }
+ #else
++// Returns true if the guest's vendor_boot ramdisk contains standard cuttlefish
++// fstab.cf.<userdata_format>.<encryption_mode> files. Guests that ship their own
++// fstab (no cf.* variants, e.g. wearables) must NOT get androidboot.fstab_suffix
++// set, or first-stage init can't find its fstab and boots to recovery.
++Result<bool> VendorRamdiskHasCfFstab(const std::string& vendor_boot_image,
++                                     const std::string& work_dir) {
++  CF_EXPECT(EnsureDirectoryExists(work_dir));
++  CF_EXPECT(UnpackVendorBootImageIfNotUnpacked(vendor_boot_image, work_dir),
++            "Failed to unpack vendor_boot image " << vendor_boot_image);
++  const std::string ramdisk_dir = work_dir + "/ramdisk_extracted";
++  UnpackRamdisk(work_dir + "/concatenated_vendor_ramdisk", ramdisk_dir);
++  bool found = false;
++  CF_EXPECT(WalkDirectory(ramdisk_dir, [&found](const std::string& path) {
++    if (android::base::StartsWith(android::base::Basename(path), "fstab.cf.")) {
++      found = true;
++    }
++    return true;
++  }));
++  return found;
++}
++
+ Result<std::vector<GuestConfig>> ReadGuestConfig() {
+   std::vector<GuestConfig> guest_configs;
+   std::vector<std::string> boot_image =
+@@ -806,6 +827,34 @@ Result<std::vector<GuestConfig>> ReadGuestConfig() {
+                                      << "\" for output audio stream count");
+     }
+ 
++    // Auto-detect whether androidboot.fstab_suffix should be emitted by
++    // inspecting the guest's vendor_boot ramdisk. Standard cuttlefish ships
++    // fstab.cf.<fmt>.<enc>; guests with their own fstab (no cf.* variants) must
++    // not get the suffix or first-stage init boots to recovery.
++    const std::string image_dir = instance_index >= system_image_dir.size()
++                                      ? system_image_dir[0]
++                                      : system_image_dir[instance_index];
++    const std::string vendor_boot_image = image_dir + "/vendor_boot.img";
++    if (FileExists(vendor_boot_image)) {
++      const std::string fstab_probe_dir = FLAGS_early_tmp_dir +
++                                          "/fstab_probe_" +
++                                          std::to_string(instance_index);
++      auto has_cf_fstab =
++          VendorRamdiskHasCfFstab(vendor_boot_image, fstab_probe_dir);
++      if (has_cf_fstab.ok()) {
++        guest_config.noset_fstab_suffix = !*has_cf_fstab;
++        if (guest_config.noset_fstab_suffix) {
++          LOG(INFO) << "No fstab.cf.* in vendor_boot ramdisk of "
++                    << vendor_boot_image
++                    << "; not setting androidboot.fstab_suffix (guest provides "
++                       "its own fstab).";
++        }
++      } else {
++        LOG(WARNING) << "Could not probe vendor_boot ramdisk for fstab naming: "
++                     << has_cf_fstab.error().FormatForEnv();
++      }
++    }
++
+     guest_configs.push_back(guest_config);
+   }
+   return guest_configs;
+@@ -1132,7 +1181,11 @@ Result<CuttlefishConfig> InitializeCuttlefishConfiguration(
+   }
+ 
+   tmp_config_obj.set_root_dir(root_dir);
+-  tmp_config_obj.set_noset_fstab_suffix(FLAGS_noset_fstab_suffix);
++  // Honor the explicit flag, or the value auto-detected from the guest's
++  // vendor_boot ramdisk (no fstab.cf.* -> guest ships its own fstab).
++  tmp_config_obj.set_noset_fstab_suffix(
++      FLAGS_noset_fstab_suffix ||
++      (!guest_configs.empty() && guest_configs[0].noset_fstab_suffix));
+ 
+   tmp_config_obj.set_environments_uds_dir(
+       EnvironmentUdsDir().value_or(tmp_config_obj.environments_dir()));
+diff --git a/host/commands/assemble_cvd/flags.h b/host/commands/assemble_cvd/flags.h
+index 0a786d2..50633c0 100644
+--- a/host/commands/assemble_cvd/flags.h
++++ b/host/commands/assemble_cvd/flags.h
+@@ -45,6 +45,10 @@ struct GuestConfig {
+   std::optional<std::string> domkey_mapping_config;
+   int output_audio_streams_count = 1;
+   bool virtio_soundcard_supported = false;
++  // Inferred from the vendor_boot ramdisk: true when the guest ships its own
++  // fstab (no fstab.cf.* variants), meaning androidboot.fstab_suffix must not
++  // be set or first-stage init boots to recovery.
++  bool noset_fstab_suffix = false;
+ };
+ 
+ Result<std::vector<GuestConfig>> GetGuestConfigAndSetDefaults();
+-- 
+2.50.1
+

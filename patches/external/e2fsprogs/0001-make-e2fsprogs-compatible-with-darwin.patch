@@ -1,0 +1,112 @@
+From ca2b038574f90ebdf415ee1e3af31c2aada0281c Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:54:46 -0700
+Subject: [PATCH] make e2fsprogs compatible with darwin
+
+Summary:
+# Motivation:
+This is required as a cuttlefish host binary
+
+# Overview:
+- support building on mac
+
+Test Plan:
+```
+. build/envsetup.sh
+ lunch aosp_cf_arm64_phone-userdebug
+ m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+---
+ contrib/android/Android.bp | 12 ++++++++++++
+ contrib/android/perms.c    |  8 ++++++++
+ contrib/android/perms.h    | 14 +++++++-------
+ 3 files changed, 27 insertions(+), 7 deletions(-)
+
+diff --git a/contrib/android/Android.bp b/contrib/android/Android.bp
+index 7032a2a01..f4e1a34c1 100644
+--- a/contrib/android/Android.bp
++++ b/contrib/android/Android.bp
+@@ -55,6 +55,11 @@ cc_defaults {
+                 "libcrypto",
+             ],
+         },
++        darwin: {
++            static_libs: [
++                "libcutils",
++            ],
++        },
+     },
+ }
+ 
+@@ -65,6 +70,13 @@ cc_binary {
+     ],
+     host_supported: true,
+     vendor_available: true,
++    target: {
++        darwin: {
++            static_libs: [
++                "libcutils",
++            ],
++        },
++    },
+ }
+ 
+ cc_binary {
+diff --git a/contrib/android/perms.c b/contrib/android/perms.c
+index dd05644eb..8bb636bf6 100644
+--- a/contrib/android/perms.c
++++ b/contrib/android/perms.c
+@@ -121,7 +121,9 @@ static errcode_t set_perms_and_caps(ext2_filsys fs, ext2_ino_t ino,
+ 	errcode_t retval;
+ 	uint64_t capabilities = 0;
+ 	struct ext2_inode inode;
++#ifndef __APPLE__
+ 	struct vfs_cap_data cap_data;
++#endif
+ 	unsigned int uid = 0, gid = 0, imode = 0;
+ 
+ 	retval = ext2fs_read_inode(fs, ino, &inode);
+@@ -158,12 +160,18 @@ static errcode_t set_perms_and_caps(ext2_filsys fs, ext2_ino_t ino,
+ 	/* Capabilities */
+ 	if (!capabilities)
+ 		return 0;
++#ifdef __APPLE__
++	// Stub for macOS
++	fprintf(stderr, "Setting capabilities not supported on mac.\n");
++	return -1;
++#else
+ 	memset(&cap_data, 0, sizeof(cap_data));
+ 	cap_data.magic_etc = VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE;
+ 	cap_data.data[0].permitted = (uint32_t) (capabilities & 0xffffffff);
+ 	cap_data.data[1].permitted = (uint32_t) (capabilities >> 32);
+ 	return ino_add_xattr(fs, ino,  "security." XATTR_CAPS_SUFFIX,
+ 			     &cap_data, sizeof(cap_data));
++#endif
+ }
+ 
+ static errcode_t set_timestamp(ext2_filsys fs, ext2_ino_t ino,
+diff --git a/contrib/android/perms.h b/contrib/android/perms.h
+index 9ea3f95c0..b07509735 100644
+--- a/contrib/android/perms.h
++++ b/contrib/android/perms.h
+@@ -53,13 +53,13 @@ static inline errcode_t android_configure_fs(ext2_filsys fs,
+ #  include <private/fs_config.h>
+ 
+ errcode_t android_configure_fs(ext2_filsys fs, char *src_dir,
+-			       char *target_out,
+-			       char *mountpoint,
+-			       struct selinux_opt *seopts,
+-			       unsigned int nopt,
+-			       char *fs_config_file, time_t fixed_time,
+-			       const struct ugid_map* uid_map,
+-			       const struct ugid_map* gid_map);
++	char *target_out,
++	char *mountpoint,
++	struct selinux_opt *seopts,
++	unsigned int nopt,
++	char *fs_config_file, time_t fixed_time,
++	const struct ugid_map* uid_map,
++	const struct ugid_map* gid_map);
+ 
+ # endif
+ #endif /* !ANDROID_PERMS_H */

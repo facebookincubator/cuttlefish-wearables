@@ -1,0 +1,32 @@
+From ad50605e11abf022efc1fe9d40690da834c4d22c Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Wed, 20 Aug 2025 11:06:13 -0700
+Subject: [PATCH 25/63] hardcode mask for macos slirp networking
+
+Summary:
+Provide a default SLIRP network address and mask when the configured
+network argument is empty.
+---
+ host/libs/vm_manager/qemu_manager.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/host/libs/vm_manager/qemu_manager.cpp b/host/libs/vm_manager/qemu_manager.cpp
+index fdc152b6f..6135102ba 100644
+--- a/host/libs/vm_manager/qemu_manager.cpp
++++ b/host/libs/vm_manager/qemu_manager.cpp
+@@ -852,9 +852,15 @@ Result<std::vector<MonitorCommand>> QemuManager::StartCommands(
+       break;
+     case cuttlefish::ExternalNetworkMode::kSlirp: {
+       has_network_devices = true;
++#ifndef __APPLE__
+       const std::string net =
+           fmt::format("{}/{}", instance.ril_ipaddr(), instance.ril_prefixlen());
+       const std::string& host = instance.ril_gateway();
++#else
++      const std::string net =
++        fmt::format("{}/{}", "10.0.2.15", "24");
++      const std::string& host = "10.0.2.2";
++#endif
+       qemu_cmd.AddParameter("-netdev");
+       // TODO(schuffelen): `dns` needs to match the first `nameserver` in
+       // `/etc/resolv.conf`. Implement something that generalizes beyond

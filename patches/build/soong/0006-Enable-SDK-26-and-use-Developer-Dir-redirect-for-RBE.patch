@@ -1,0 +1,102 @@
+From 4032aceec2b7a1f1e59ca1d928bec235771b56a8 Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Tue, 14 Oct 2025 14:24:44 -0700
+Subject: [PATCH 06/11] Enable SDK 26 and use Developer Dir redirect for
+ RBE/local consistency
+
+Summary:
+Most of the RBE builders are on SDK 26, so maximize the available pool and minimize the impact on infra by switching to 26.
+
+RE Mac workers have different developer dir paths than corp dev Macs (which are different to retail Macs.) To avoid adding a bunch of path rewrite logic to reclient, take advantage of the developer dir symlink in `/var/select/developer_dir` which exists on both.
+
+Leave the `xcrun` logic that finds the tool paths within a developer dir, and instead rewrite the path after we find it.
+
+Test Plan: `m out/host/darwin-x86/cvd-host_package.tar.gz` with and without USE_RBE=true
+---
+ cc/config/darwin_host.go | 44 ++++++++++++++++++++++++++++++++++------
+ 1 file changed, 38 insertions(+), 6 deletions(-)
+
+diff --git a/cc/config/darwin_host.go b/cc/config/darwin_host.go
+index 716965a3a..898bbd8b3 100644
+--- a/cc/config/darwin_host.go
++++ b/cc/config/darwin_host.go
+@@ -25,6 +25,16 @@ import (
+ 	"android/soong/android"
+ )
+ 
++const fixedDeveloperDir = "/var/select/developer_dir"
++
++// convertToFixedDeveloperDir converts a path from the actual developer directory to the fixed one
++func convertToFixedDeveloperDir(originalPath string, actualDeveloperDir string) string {
++	if strings.HasPrefix(originalPath, actualDeveloperDir) {
++		return strings.Replace(originalPath, actualDeveloperDir, fixedDeveloperDir, 1)
++	}
++	return originalPath
++}
++
+ var (
+ 	darwinCflags = []string{
+ 		"-fPIC",
+@@ -55,6 +65,7 @@ var (
+ 		"13",
+ 		"14",
+ 		"15",
++		"26",
+ 	}
+ 
+ 	darwinAvailableLibraries = append(
+@@ -70,6 +81,10 @@ var (
+ 		"-framework CoreFoundation",
+ 		"-framework Foundation",
+ 		"-framework IOKit",
++		"-framework IOSurface",
++		"-framework Metal",
++		"-framework OpenGL",
++		"-framework QuartzCore",
+ 		"-framework Security",
+ 		"-framework SystemConfiguration",
+ 	)
+@@ -80,7 +95,7 @@ func init() {
+ 		pctx.VariableFunc("macSdkRoot", func(ctx android.PackageVarContext) string {
+ 			return getMacTools(ctx).sdkRoot
+ 		})
+-		pctx.StaticVariable("macMinVersion", "10.14")
++		pctx.StaticVariable("macMinVersion", "15.7")
+ 		pctx.VariableFunc("MacArPath", func(ctx android.PackageVarContext) string {
+ 			return getMacTools(ctx).arPath
+ 		})
+@@ -152,12 +167,29 @@ func getMacTools(ctx android.PathContext) *macPlatformTools {
+ 			return
+ 		}
+ 
+-		macTools.sdkRoot = xcrun("--show-sdk-path")
++		// Get the actual developer directory from xcrun
++		actualDeveloperDir := xcrun("--show-sdk-path")
++		// Remove the Platforms/MacOSX.platform/Developer/SDKs/<version> suffix to get developer dir
++		if strings.Contains(actualDeveloperDir, "/Platforms/MacOSX.platform/Developer/SDKs/") {
++			actualDeveloperDir = strings.Split(actualDeveloperDir, "/Platforms/MacOSX.platform/Developer/SDKs/")[0]
++		}
++
++		// Get paths from xcrun and convert them to use the fixed developer directory
++		originalSdkRoot := xcrun("--show-sdk-path")
++		macTools.sdkRoot = convertToFixedDeveloperDir(originalSdkRoot, actualDeveloperDir)
++
++		originalArPath := xcrun("--find", "ar")
++		macTools.arPath = convertToFixedDeveloperDir(originalArPath, actualDeveloperDir)
++
++		originalLipoPath := xcrun("--find", "lipo")
++		macTools.lipoPath = convertToFixedDeveloperDir(originalLipoPath, actualDeveloperDir)
++
++		originalStripPath := xcrun("--find", "strip")
++		macTools.stripPath = convertToFixedDeveloperDir(originalStripPath, actualDeveloperDir)
+ 
+-		macTools.arPath = xcrun("--find", "ar")
+-		macTools.lipoPath = xcrun("--find", "lipo")
+-		macTools.stripPath = xcrun("--find", "strip")
+-		macTools.toolPath = filepath.Dir(xcrun("--find", "ld"))
++		originalLdPath := xcrun("--find", "ld")
++		originalToolPath := filepath.Dir(originalLdPath)
++		macTools.toolPath = convertToFixedDeveloperDir(originalToolPath, actualDeveloperDir)
+ 	})
+ 	if macTools.err != nil {
+ 		android.ReportPathErrorf(ctx, "%q", macTools.err)

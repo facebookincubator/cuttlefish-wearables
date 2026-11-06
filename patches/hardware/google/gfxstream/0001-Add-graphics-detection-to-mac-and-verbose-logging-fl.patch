@@ -1,0 +1,790 @@
+From bd36cbea1f228c2e40c543627c5b5bd1fc399876 Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Tue, 12 Aug 2025 13:54:15 -0700
+Subject: [PATCH] Add graphics detection to mac and --verbose logging flag
+
+Summary:
+Implement graphics detection on Mac and add verbose logging with --verbose flag. This also allows for a pause to attach a debugger to the child process after fork().
+
+This process is used in Cuttlefish initialization to detect supported graphics hardware APIs and quirks to pass to the emulator.
+
+Note: A production version of this change should improve the Metal extension detection.
+---
+ common/detector/DetectGraphics.cpp            |  44 +++++-
+ common/detector/Egl.cpp                       |  25 +++-
+ common/detector/Gles.cpp                      |  23 +++
+ common/detector/GraphicsDetectorVk.cpp        |  57 ++++++-
+ .../GraphicsDetectorVkExternalMemoryHost.cpp  | 140 +++++++++++++++++-
+ ...ctorVkPrecisionQualifiersOnYuvSamplers.cpp |  62 +++++++-
+ common/detector/Subprocess.cpp                |  47 +++++-
+ common/detector/VerboseLogging.h              |  28 ++++
+ common/detector/Vulkan.cpp                    |  14 ++
+ 9 files changed, 421 insertions(+), 19 deletions(-)
+ create mode 100644 common/detector/VerboseLogging.h
+
+diff --git a/common/detector/DetectGraphics.cpp b/common/detector/DetectGraphics.cpp
+index f31a90a85..3239ac6b1 100644
+--- a/common/detector/DetectGraphics.cpp
++++ b/common/detector/DetectGraphics.cpp
+@@ -18,10 +18,17 @@
+ 
+ #include <fstream>
+ #include <string>
++#include <iostream>
++#ifdef __APPLE__
++#include <cstdlib>  // for setenv
++#endif
+ 
+ #include "GraphicsDetector.h"
+ #include "GraphicsDetector.pb.h"
+ 
++// Global flag to control verbose logging
++bool g_verbose_logging = false;
++
+ namespace {
+ 
+ bool WriteToFile(const std::string& filename, const std::string& contents) {
+@@ -37,6 +44,34 @@ bool WriteToFile(const std::string& filename, const std::string& contents) {
+ }  // namespace
+ 
+ int main(int argc, char* argv[]) {
++#ifdef __APPLE__
++    // On macOS, disable Objective-C fork safety to prevent crashes when using MoltenVK
++    setenv("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES", 1);
++#endif
++
++    // Parse command line arguments
++    std::string output_filename;
++    for (int i = 1; i < argc; i++) {
++        std::string arg = argv[i];
++        if (arg == "--verbose" || arg == "-v") {
++            g_verbose_logging = true;
++        } else if (arg == "--help" || arg == "-h") {
++            std::cout << "Usage: " << argv[0] << " [OPTIONS] [OUTPUT_FILE]\n";
++            std::cout << "Options:\n";
++            std::cout << "  --verbose, -v    Enable verbose debug logging\n";
++            std::cout << "  --help, -h       Show this help message\n";
++            std::cout << "  OUTPUT_FILE      Write output to file instead of stdout\n";
++            return 0;
++        } else if (!arg.empty() && arg[0] != '-') {
++            // Non-option argument, treat as output filename
++            output_filename = arg;
++        } else {
++            std::cerr << "Unknown option: " << arg << std::endl;
++            std::cerr << "Use --help for usage information." << std::endl;
++            return -1;
++        }
++    }
++
+     const auto availability = ::gfxstream::DetectGraphicsAvailability();
+ 
+     std::string availabilityString;
+@@ -45,10 +80,9 @@ int main(int argc, char* argv[]) {
+         return -1;
+     }
+ 
+-    if (argc > 1) {
+-        const std::string filename = argv[1];
+-        if (!WriteToFile(filename, availabilityString)) {
+-            std::cerr << "Failed to write to '" << filename << "'.";
++    if (!output_filename.empty()) {
++        if (!WriteToFile(output_filename, availabilityString)) {
++            std::cerr << "Failed to write to '" << output_filename << "'." << std::endl;
+             return -1;
+         }
+     } else {
+@@ -56,4 +90,4 @@ int main(int argc, char* argv[]) {
+     }
+ 
+     return 0;
+-}
+\ No newline at end of file
++}
+diff --git a/common/detector/Egl.cpp b/common/detector/Egl.cpp
+index 20f9c66ec..1aab2c916 100644
+--- a/common/detector/Egl.cpp
++++ b/common/detector/Egl.cpp
+@@ -21,16 +21,39 @@
+ namespace gfxstream {
+ namespace {
+ 
++#ifdef __APPLE__
++// On macOS, use the Android emulator's dylibs
++constexpr const char kEglLib[] = "libEGL.dylib";
++constexpr const char kEglLibAlt[] = "libswiftshader_libEGL.dylib";
++#else
+ constexpr const char kEglLib[] = "libEGL.so";
+ constexpr const char kEglLibAlt[] = "libEGL.so.1";
++#endif
+ 
+ gfxstream::expected<Lib, std::string> LoadEglLib() {
++#ifdef __APPLE__
++    // Try to load from specific paths first (Android emulator dylibs)
++    for (const auto* possible_path : {kEglLib, kEglLibAlt}) {
++        auto result = Lib::Load(possible_path);
++        if (result.ok()) {
++            return std::move(result.value());
++        }
++    }
++    // Fallback to library names (in case they're in PATH)
++    for (const auto* possible_name : {kEglLib, kEglLibAlt}) {
++        auto result = Lib::Load(possible_name);
++        if (result.ok()) {
++            return std::move(result.value());
++        }
++    }
++#else
+     for (const auto* possible_name : {kEglLib, kEglLibAlt}) {
+         auto result = Lib::Load(possible_name);
+         if (result.ok()) {
+             return std::move(result.value());
+         }
+     }
++#endif
+     return gfxstream::unexpected("Failed to load libEGL.");
+ }
+ 
+@@ -132,4 +155,4 @@ gfxstream::expected<Ok, std::string> Egl::Init() {
+     return {};
+ }
+ 
+-}  // namespace gfxstream
+\ No newline at end of file
++}  // namespace gfxstream
+diff --git a/common/detector/Gles.cpp b/common/detector/Gles.cpp
+index 5b81403aa..280dd9c8e 100644
+--- a/common/detector/Gles.cpp
++++ b/common/detector/Gles.cpp
+@@ -22,7 +22,13 @@
+ namespace gfxstream {
+ namespace {
+ 
++#ifdef __APPLE__
++// On macOS, use the Android emulator's dylibs
++constexpr const char kGles2Lib[] = "libGLESv2.dylib";
++constexpr const char kGles2LibAlt[] = "libswiftshader_libGLESv2.dylib";
++#else
+ constexpr const char kGles2Lib[] = "libGLESv2.so";
++#endif
+ 
+ static void GL_APIENTRY GlDebugCallback(GLenum, GLenum, GLuint, GLenum, GLsizei,
+                                         const GLchar* message, const void*) {
+@@ -33,7 +39,24 @@ static void GL_APIENTRY GlDebugCallback(GLenum, GLenum, GLuint, GLenum, GLsizei,
+ 
+ /*static*/ gfxstream::expected<Gles, std::string> Gles::Load() {
+     Gles gles;
++    
++#ifdef __APPLE__
++    // Try to load from specific paths first (Android emulator dylibs)
++    bool loaded = false;
++    for (const auto* possible_path : {kGles2Lib, kGles2LibAlt}) {
++        auto lib_result = Lib::Load(possible_path);
++        if (lib_result.ok()) {
++            gles.lib_ = std::move(lib_result.value());
++            loaded = true;
++            break;
++        }
++    }
++    if (!loaded) {
++        return gfxstream::unexpected("Failed to load libGLESv2.");
++    }
++#else
+     gles.lib_ = GFXSTREAM_EXPECT(Lib::Load(kGles2Lib));
++#endif
+ 
+     #define LOAD_GLES_FUNCTION_POINTER(return_type, function_name, signature, \
+                                       args)                                   \
+diff --git a/common/detector/GraphicsDetectorVk.cpp b/common/detector/GraphicsDetectorVk.cpp
+index e0a89b93b..ec0d1a1d5 100644
+--- a/common/detector/GraphicsDetectorVk.cpp
++++ b/common/detector/GraphicsDetectorVk.cpp
+@@ -16,33 +16,88 @@
+ 
+ #include "GraphicsDetectorVk.h"
+ 
++#include <iostream>
++#include <signal.h>
++#include <execinfo.h>
++#include <unistd.h>
++
+ #include "Vulkan.h"
++#include "VerboseLogging.h"
+ 
+ namespace gfxstream {
+ namespace {
+ 
++// Signal handler to catch crashes and print stack trace
++void crash_handler_vulkan_main(int sig) {
++    if (g_verbose_logging) {
++        std::cerr << "[CRASH] Signal " << sig << " caught in main Vulkan detection!" << std::endl;
++        std::cerr << "[CRASH] Stack trace:" << std::endl;
++        
++        void *array[10];
++        size_t size = backtrace(array, 10);
++        char **strings = backtrace_symbols(array, size);
++        
++        for (size_t i = 0; i < size; i++) {
++            std::cerr << "[CRASH] " << strings[i] << std::endl;
++        }
++        
++        free(strings);
++        std::cerr << "[CRASH] End of stack trace" << std::endl;
++    }
++    _exit(1);
++}
++
+ gfxstream::expected<Ok, vkhpp::Result> PopulateVulkanAvailabilityImpl(
+         ::gfxstream::proto::GraphicsAvailability* availability) {
++    
++    // Install signal handler to catch crashes
++    signal(SIGSEGV, crash_handler_vulkan_main);
++    signal(SIGABRT, crash_handler_vulkan_main);
++    signal(SIGBUS, crash_handler_vulkan_main);
++    
++    VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Starting main Vulkan detection...");
++    
++    VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Loading Vulkan...");
+     auto vk = GFXSTREAM_EXPECT(Vk::Load());
++    VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Vulkan loaded successfully");
+ 
++    VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Getting vulkan availability...");
+     ::gfxstream::proto::VulkanAvailability* vulkanAvailability = availability->mutable_vulkan();
++    VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Got vulkan availability");
+ 
++    VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Enumerating physical devices...");
+     const auto physicalDevices = VK_EXPECT_RV(vk.instance().enumeratePhysicalDevices());
+-    for (const auto& physicalDevice : physicalDevices) {
++    VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Found " << physicalDevices.size() << " physical devices");
++    
++    for (size_t i = 0; i < physicalDevices.size(); i++) {
++        const auto& physicalDevice = physicalDevices[i];
++        VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Processing device " << i);
++        
+         auto* outPhysicalDevice = vulkanAvailability->add_physical_devices();
++        VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Added physical device to proto");
+ 
++        VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Getting device properties...");
+         const auto props = physicalDevice.getProperties();
++        VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Got device properties: " << props.deviceName);
++        
+         outPhysicalDevice->set_name(std::string(props.deviceName));
+         outPhysicalDevice->set_type(
+             props.deviceType == vkhpp::PhysicalDeviceType::eDiscreteGpu ?
+                 ::gfxstream::proto::VulkanPhysicalDevice::TYPE_DISCRETE_GPU :
+                 ::gfxstream::proto::VulkanPhysicalDevice::TYPE_OTHER);
++        VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Set device name and type");
+ 
++        VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Enumerating device extensions...");
+         const auto exts = VK_EXPECT_RV(physicalDevice.enumerateDeviceExtensionProperties());
++        VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Found " << exts.size() << " extensions");
++        
+         for (const auto& ext : exts) {
+             outPhysicalDevice->add_extensions(std::string(ext.extensionName));
+         }
++        VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Added all extensions for device " << i);
+     }
++    
++    VERBOSE_LOG("[DEBUG] PopulateVulkanAvailabilityImpl: Completed successfully");
+ 
+     return Ok{};
+ }
+diff --git a/common/detector/GraphicsDetectorVkExternalMemoryHost.cpp b/common/detector/GraphicsDetectorVkExternalMemoryHost.cpp
+index 5b3fad5dd..f9ba6dd1a 100644
+--- a/common/detector/GraphicsDetectorVkExternalMemoryHost.cpp
++++ b/common/detector/GraphicsDetectorVkExternalMemoryHost.cpp
+@@ -16,17 +16,48 @@
+ 
+ #include "GraphicsDetectorVkExternalMemoryHost.h"
+ 
++#include <iostream>
++#include <signal.h>
++#include <execinfo.h>
++#include <unistd.h>
+ #include "Vulkan.h"
++#include "VerboseLogging.h"
+ 
+ #if defined(__linux__)
+ #include <sys/mman.h>
+ #include <syscall.h>
+ #include <unistd.h>
++#elif defined(__APPLE__)
++#include <sys/mman.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <cstdio>  // for snprintf
++#include <ctime>   // for time
+ #endif
+ 
+ namespace gfxstream {
+ namespace {
+ 
++// Signal handler to catch crashes and print stack trace
++void crash_handler_external_memory(int sig) {
++    if (g_verbose_logging) {
++        std::cerr << "[CRASH] Signal " << sig << " caught in external memory host test!" << std::endl;
++        std::cerr << "[CRASH] Stack trace:" << std::endl;
++        
++        void *array[10];
++        size_t size = backtrace(array, 10);
++        char **strings = backtrace_symbols(array, size);
++        
++        for (size_t i = 0; i < size; i++) {
++            std::cerr << "[CRASH] " << strings[i] << std::endl;
++        }
++        
++        free(strings);
++        std::cerr << "[CRASH] End of stack trace" << std::endl;
++    }
++    _exit(1);
++}
++
+ #if defined(__linux__)
+ class ScopedFd {
+   public:
+@@ -116,10 +147,92 @@ gfxstream::expected<ScopedFd, std::string> CreateSharedMemory(vkhpp::DeviceSize
+     return ScopedFd(fd);
+ }
+ 
++#elif defined(__APPLE__)
++
++class ScopedFd {
++  public:
++    explicit ScopedFd(int fd) { Reset(fd); }
++    ~ScopedFd() { Reset(); }
++
++    ScopedFd(const ScopedFd&) = delete;
++    ScopedFd& operator=(const ScopedFd&) = delete;
++
++    ScopedFd(ScopedFd&& rhs) {
++        Reset(rhs.Release());
++        rhs.mFd = -1;
++    }
++
++    ScopedFd& operator=(ScopedFd&& rhs) {
++        Reset(rhs.Release());
++        return *this;
++    }
++
++    int Get() const {
++        return mFd;
++    }
++
++    int Release() {
++        int localFd = mFd;
++        mFd = -1;
++        return localFd;
++    }
++
++    void* Map(size_t size) {
++        if (mFd == -1) {
++            return nullptr;
++        }
++
++        mMappedAddr = mmap(nullptr, size, PROT_WRITE | PROT_READ, MAP_SHARED, mFd, 0);
++        if (mMappedAddr == MAP_FAILED) {
++            mMappedAddr = nullptr;
++            return nullptr;
++        }
++
++        mMappedSize = size;
++        return mMappedAddr;
++    }
++
++    void Unmap() {
++        if (mMappedAddr != nullptr) {
++            munmap(mMappedAddr, mMappedSize);
++            mMappedAddr = nullptr;
++            mMappedSize = 0;
++        }
++    }
++
++  private:
++    void Reset(int newFd = -1) {
++        if (mFd != -1) {
++            //Unmap();
++            close(mFd);
++        }
++        mFd = newFd;
++    }
++
++    int mFd = -1;
++    void* mMappedAddr = nullptr;
++    size_t mMappedSize = 0;
++};
++
++gfxstream::expected<ScopedFd, std::string> CreateSharedMemory(vkhpp::DeviceSize size) {
++    // On macOS, MoltenVK may not fully support VK_EXT_external_memory_host
++    // Return an error to indicate this feature is not supported
++    return gfxstream::unexpected("VK_EXT_external_memory_host not fully supported on macOS/MoltenVK");
++}
++
+ gfxstream::expected<Ok, std::string> CheckImportingSharedMemory(
+         vkhpp::PhysicalDevice& physicalDevice) {
++    
++    // Install signal handler to catch crashes
++    signal(SIGSEGV, crash_handler_external_memory);
++    signal(SIGABRT, crash_handler_external_memory);
++    signal(SIGBUS, crash_handler_external_memory);
++    
++    VERBOSE_LOG("[DEBUG] CheckImportingSharedMemory: Starting external memory host test...");
++    
+     const vkhpp::PhysicalDeviceMemoryProperties physicalDeviceMemoryProperties =
+         physicalDevice.getMemoryProperties();
++    VERBOSE_LOG("[DEBUG] CheckImportingSharedMemory: Got physical device memory properties");
+ 
+     const auto properties2 =
+         physicalDevice
+@@ -151,7 +264,7 @@ gfxstream::expected<Ok, std::string> CheckImportingSharedMemory(
+     auto shm = GFXSTREAM_EXPECT(CreateSharedMemory(kSize));
+ 
+     void* mappedShm = shm.Map(kSize);
+-    if (mappedShm == MAP_FAILED) {
++    if (mappedShm == nullptr) {
+         return gfxstream::unexpected("Failed to mmap shared memory: " +
+                                      std::string(strerror(errno)));
+     }
+@@ -185,10 +298,30 @@ gfxstream::expected<Ok, std::string> CheckImportingSharedMemory(
+     auto memory = VK_EXPECT_RV_OR_STRING(device->allocateMemoryUnique(memoryAllocateInfo));
+     return Ok{};
+ }
+-#endif  // defined(__linux__)
++
++#endif  // defined(__linux__) || defined(__APPLE__)
+ 
+ gfxstream::expected<Ok, vkhpp::Result> PopulateVulkanExternalMemoryHostQuirkImpl(
+         ::gfxstream::proto::GraphicsAvailability* availability) {
++    VERBOSE_LOG("[DEBUG] PopulateVulkanExternalMemoryHostQuirkImpl: Starting external memory host test...");
++    
++#ifdef __APPLE__
++    // On macOS with MoltenVK, external memory host functionality is not fully supported
++    // Set conservative defaults without attempting to test the functionality
++    VERBOSE_LOG("[DEBUG] PopulateVulkanExternalMemoryHostQuirkImpl: Using macOS fallback");
++    ::gfxstream::proto::VulkanAvailability* vulkanAvailability = availability->mutable_vulkan();
++    
++    if (vulkanAvailability->physical_devices_size() > 0) {
++        auto* outPhysicalDevice = vulkanAvailability->mutable_physical_devices(0);
++        auto* quirks = outPhysicalDevice->mutable_quirks()
++                                        ->mutable_external_memory_host_quirks();
++        quirks->set_can_import_shm(false);
++        quirks->add_errors("External memory host not supported on macOS/MoltenVK");
++    }
++    
++    return Ok{};
++#else
++    std::cerr << "[DEBUG] PopulateVulkanExternalMemoryHostQuirkImpl: Running full Linux test..." << std::endl;
+     auto vk = GFXSTREAM_EXPECT(Vk::Load());
+ 
+     ::gfxstream::proto::VulkanAvailability* vulkanAvailability = availability->mutable_vulkan();
+@@ -211,7 +344,6 @@ gfxstream::expected<Ok, vkhpp::Result> PopulateVulkanExternalMemoryHostQuirkImpl
+         auto* quirks = outPhysicalDevice->mutable_quirks()
+                                         ->mutable_external_memory_host_quirks();
+ 
+-#if defined(__linux__)
+         const auto shmResult = CheckImportingSharedMemory(physicalDevice);
+         if (shmResult.ok()) {
+             quirks->set_can_import_shm(true);
+@@ -219,10 +351,10 @@ gfxstream::expected<Ok, vkhpp::Result> PopulateVulkanExternalMemoryHostQuirkImpl
+             quirks->add_errors("can_import_shm error: " + shmResult.error());
+             quirks->set_can_import_shm(false);
+         }
+-#endif  // defined(__linux__)
+     }
+ 
+     return Ok{};
++#endif
+ }
+ 
+ }  // namespace
+diff --git a/common/detector/GraphicsDetectorVkPrecisionQualifiersOnYuvSamplers.cpp b/common/detector/GraphicsDetectorVkPrecisionQualifiersOnYuvSamplers.cpp
+index b510a738c..01227e0e5 100644
+--- a/common/detector/GraphicsDetectorVkPrecisionQualifiersOnYuvSamplers.cpp
++++ b/common/detector/GraphicsDetectorVkPrecisionQualifiersOnYuvSamplers.cpp
+@@ -16,14 +16,39 @@
+ 
+ #include "GraphicsDetectorVkPrecisionQualifiersOnYuvSamplers.h"
+ 
++#include <iostream>
+ #include <vector>
++#include <signal.h>
++#include <execinfo.h>
++#include <unistd.h>
+ 
+ #include "Image.h"
+ #include "Vulkan.h"
++#include "VerboseLogging.h"
+ 
+ namespace gfxstream {
+ namespace {
+ 
++// Signal handler to catch crashes and print stack trace
++void crash_handler(int sig) {
++    if (g_verbose_logging) {
++        std::cerr << "[CRASH] Signal " << sig << " caught in child process!" << std::endl;
++        std::cerr << "[CRASH] Stack trace:" << std::endl;
++        
++        void *array[10];
++        size_t size = backtrace(array, 10);
++        char **strings = backtrace_symbols(array, size);
++        
++        for (size_t i = 0; i < size; i++) {
++            std::cerr << "[CRASH] " << strings[i] << std::endl;
++        }
++        
++        free(strings);
++        std::cerr << "[CRASH] End of stack trace" << std::endl;
++    }
++    _exit(1);
++}
++
+ // kBlitTextureVert
+ #include "shaders/blit_texture.vert.inl"
+ // kBlitTextureFrag
+@@ -39,6 +64,15 @@ gfxstream::expected<bool, vkhpp::Result>
+ CanHandlePrecisionQualifierWithYuvSampler(
+         const std::vector<uint8_t>& blitVertShaderSpirv,
+         const std::vector<uint8_t>& blitFragShaderSpirv) {
++    
++    // Install signal handler to catch crashes
++    signal(SIGSEGV, crash_handler);
++    signal(SIGABRT, crash_handler);
++    signal(SIGBUS, crash_handler);
++    
++    VERBOSE_LOG("[DEBUG] CanHandlePrecisionQualifierWithYuvSampler: Starting YUV sampler test...");
++    
++    VERBOSE_LOG("[DEBUG] CanHandlePrecisionQualifierWithYuvSampler: Loading Vulkan...");
+     auto vk = VK_EXPECT(Vk::Load(
+         /*instance_extensions=*/{},
+         /*instance_layers=*/{},
+@@ -46,7 +80,9 @@ CanHandlePrecisionQualifierWithYuvSampler(
+         {
+             VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME,
+         }));
++    VERBOSE_LOG("[DEBUG] CanHandlePrecisionQualifierWithYuvSampler: Vulkan loaded successfully");
+ 
++    VERBOSE_LOG("[DEBUG] CanHandlePrecisionQualifierWithYuvSampler: Creating texture data...");
+     uint32_t textureWidth = 32;
+     uint32_t textureHeight = 32;
+     RGBAImage textureDataRgba = FillWithColor(textureWidth,
+@@ -55,13 +91,16 @@ CanHandlePrecisionQualifierWithYuvSampler(
+                                               /*green=*/0x00,
+                                               /*blue=*/0x00,
+                                               /*alpha=*/0xFF);
++    VERBOSE_LOG("[DEBUG] CanHandlePrecisionQualifierWithYuvSampler: RGBA image created successfully");
+ 
+     YUV420Image textureDataYuv = ConvertRGBA8888ToYUV420(textureDataRgba);
++    VERBOSE_LOG("[DEBUG] CanHandlePrecisionQualifierWithYuvSampler: YUV conversion completed");
+     #if 0
+         // Debugging can be easier with a larger image with more details.
+         textureDataYuv = GFXSTREAM_EXPECT(LoadYUV420FromBitmapFile("custom.bmp"));
+     #endif
+ 
++    VERBOSE_LOG("[DEBUG] CanHandlePrecisionQualifierWithYuvSampler: Creating YUV image...");
+     Vk::YuvImageWithMemory sampledImage = VK_EXPECT(vk.CreateYuvImage(
+         textureWidth,
+         textureHeight,
+@@ -70,6 +109,7 @@ CanHandlePrecisionQualifierWithYuvSampler(
+             vkhpp::ImageUsageFlagBits::eTransferSrc,
+         vkhpp::MemoryPropertyFlagBits::eDeviceLocal,
+         vkhpp::ImageLayout::eTransferDstOptimal));
++    VERBOSE_LOG("[DEBUG] CanHandlePrecisionQualifierWithYuvSampler: YUV image created successfully");
+ 
+     VK_EXPECT_RESULT(vk.LoadYuvImage(sampledImage.image,
+                                      textureWidth,
+@@ -386,6 +426,12 @@ CanHandlePrecisionQualifierWithYuvSampler(
+ gfxstream::expected<Ok, std::string>
+ PopulateVulkanPrecisionQualifiersOnYuvSamplersQuirk(
+         ::gfxstream::proto::GraphicsAvailability* availability) {
++    VERBOSE_LOG("[DEBUG] PopulateVulkanPrecisionQualifiersOnYuvSamplersQuirk: Starting YUV samplers precision test...");
++    
++#ifdef __APPLE__
++    VERBOSE_LOG("[DEBUG] PopulateVulkanPrecisionQualifiersOnYuvSamplersQuirk: DEBUGGING - Running actual test to see crash...");
++#endif
++    VERBOSE_LOG("[DEBUG] PopulateVulkanPrecisionQualifiersOnYuvSamplersQuirk: Running full test...");
+     struct ShaderCombo {
+         std::string name;
+         const std::vector<uint8_t>& vert;
+@@ -430,11 +476,17 @@ PopulateVulkanPrecisionQualifiersOnYuvSamplersQuirk(
+     }
+ 
+     // TODO: Run this test per device.
+-    availability->mutable_vulkan()
+-                ->mutable_physical_devices(0)
+-                ->mutable_quirks()
+-                ->set_has_issue_with_precision_qualifiers_on_yuv_samplers(anyTestFailed);
++    auto* vulkanAvailability = availability->mutable_vulkan();
++    
++    // Ensure we have at least one physical device entry
++    if (vulkanAvailability->physical_devices_size() == 0) {
++        vulkanAvailability->add_physical_devices();
++    }
++    
++    vulkanAvailability->mutable_physical_devices(0)
++                      ->mutable_quirks()
++                      ->set_has_issue_with_precision_qualifiers_on_yuv_samplers(anyTestFailed);
+     return Ok{};
+ }
+ 
+-}  // namespace gfxstream
+\ No newline at end of file
++}  // namespace gfxstream
+diff --git a/common/detector/Subprocess.cpp b/common/detector/Subprocess.cpp
+index 8fb35e0c9..bcae92f83 100644
+--- a/common/detector/Subprocess.cpp
++++ b/common/detector/Subprocess.cpp
+@@ -17,12 +17,29 @@
+ #include "Subprocess.h"
+ 
+ #include <dlfcn.h>
++#include <iostream>
+ #include <poll.h>
++#include <signal.h>
+ #include <string.h>
++#ifdef __linux__
+ #include <sys/prctl.h>
++#endif
+ #include <sys/wait.h>
+ #include <unistd.h>
+ 
++#include "VerboseLogging.h"
++
++// TEMP_FAILURE_RETRY is not available on macOS
++#ifndef TEMP_FAILURE_RETRY
++#define TEMP_FAILURE_RETRY(exp) ({         \
++    __typeof__(exp) _rc;                   \
++    do {                                   \
++        _rc = (exp);                       \
++    } while (_rc == -1 && errno == EINTR); \
++    _rc;                                   \
++})
++#endif
++
+ #include <condition_variable>
+ #include <mutex>
+ #include <thread>
+@@ -50,11 +67,16 @@ class ScopedCloser {
+ 
+ 
+ int PidfdOpen(pid_t pid) {
++#ifdef __linux__
+   // There is no glibc wrapper for pidfd_open.
+ #ifndef SYS_pidfd_open
+   constexpr int SYS_pidfd_open = 434;
+ #endif
+   return syscall(SYS_pidfd_open, pid, /*flags=*/0);
++#else
++  // pidfd_open is not available on macOS, return -1 to trigger fallback
++  return -1;
++#endif
+ }
+ 
+ gfxstream::expected<Ok, std::string> WaitForChild(pid_t pid) {
+@@ -139,20 +161,39 @@ gfxstream::expected<Ok, std::string> WaitForChildWithTimeout(
+ gfxstream::expected<Ok, std::string> DoWithSubprocessCheck(
+         const std::function<gfxstream::expected<Ok, std::string>()>& function,
+         std::chrono::milliseconds timeout) {
++#ifdef __APPLE__
++    // On macOS, disable Objective-C fork safety to prevent crashes when using MoltenVK
++    setenv("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES", 1);
++#endif
++    
++    VERBOSE_LOG("[DEBUG] DoWithSubprocessCheck: Creating subprocess for graphics test...");
++    VERBOSE_LOG("[DEBUG] DoWithSubprocessCheck: Parent PID = " << getpid());
++    
+     pid_t pid = fork();
+     if (pid == 0) {
++        VERBOSE_LOG("[DEBUG] DoWithSubprocessCheck: Child process started, PID = " << getpid());
++        VERBOSE_LOG("[DEBUG] DoWithSubprocessCheck: About to execute graphics test function...");
++        VERBOSE_LOG("[DEBUG] DoWithSubprocessCheck: CHILD PROCESS - You can attach debugger to PID " << getpid());
++        
++        // Give you time to attach debugger if needed
++        if (g_verbose_logging) {
++            sleep(2);
++        }
++        
+         function();
++        
++        VERBOSE_LOG("[DEBUG] DoWithSubprocessCheck: Child process completed successfully");
+         _exit(0);
+     }
+ 
+     int pidfd = PidfdOpen(pid);
+     if (pidfd >= 0) {
+-        GFXSTREAM_EXPECT(WaitForChildWithTimeout(pid, pidfd, timeout));
++        GFXSTREAM_EXPECT(WaitForChildWithTimeout(pid, pidfd, timeout * 1000));
+     } else {
+-        GFXSTREAM_EXPECT(WaitForChildWithTimeoutFallback(pid, timeout));
++        GFXSTREAM_EXPECT(WaitForChildWithTimeoutFallback(pid, timeout * 1000));
+     }
+ 
+     return function();
+ }
+ 
+-}  // namespace gfxstream
+\ No newline at end of file
++}  // namespace gfxstream
+diff --git a/common/detector/VerboseLogging.h b/common/detector/VerboseLogging.h
+new file mode 100644
+index 000000000..a6d51e802
+--- /dev/null
++++ b/common/detector/VerboseLogging.h
+@@ -0,0 +1,28 @@
++/*
++ * Copyright (C) 2023 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++// Global flag to control verbose logging
++extern bool g_verbose_logging;
++
++// Macro for conditional verbose logging
++#define VERBOSE_LOG(msg) \
++    do { \
++        if (g_verbose_logging) { \
++            std::cerr << msg << std::endl; \
++        } \
++    } while (0)
+diff --git a/common/detector/Vulkan.cpp b/common/detector/Vulkan.cpp
+index c38cbf59a..15905f495 100644
+--- a/common/detector/Vulkan.cpp
++++ b/common/detector/Vulkan.cpp
+@@ -20,6 +20,9 @@
+ #include <string>
+ #include <unordered_set>
+ #include <vector>
++#ifdef __APPLE__
++#include <unistd.h>  // for access()
++#endif
+ 
+ VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
+ 
+@@ -104,6 +107,17 @@ gfxstream::expected<Vk, vkhpp::Result> Vk::Load(
+         const std::vector<std::string>& requestedDeviceExtensions) {
+     vkhpp::DynamicLoader loader;
+ 
++#ifdef __APPLE__
++    // On macOS, try to load MoltenVK first
++    // Check if MoltenVK library exists before attempting to load
++    if (access("/opt/homebrew/lib/libMoltenVK.dylib", F_OK) == 0) {
++        loader = vkhpp::DynamicLoader("/opt/homebrew/lib/libMoltenVK.dylib");
++    } else {
++        // Fallback to system Vulkan loader if MoltenVK is not found
++        loader = vkhpp::DynamicLoader();
++    }
++#endif
++
+     VULKAN_HPP_DEFAULT_DISPATCHER.init(
+         loader.getProcAddress<PFN_vkGetInstanceProcAddr>(
+             "vkGetInstanceProcAddr"));

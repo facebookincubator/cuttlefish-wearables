@@ -1,0 +1,85 @@
+From 2b6a9afa2cb95926ea13a5e96a2871237731e6ad Mon Sep 17 00:00:00 2001
+From: Tom Care <tcare@meta.com>
+Date: Thu, 10 Jul 2025 17:06:21 -0700
+Subject: [PATCH 1/2] [DEMO CODE ONLY] Nerf duplicate descriptor check & add a
+ bunch of debugging info
+
+Summary: Nerf duplicate descriptor check & add a bunch of debugging info. We need to figure out what the underlying problem is, probably to do with dyld triggering the built in prototypes twice.
+
+Test Plan: m libprotobuf
+---
+ src/google/protobuf/descriptor.cc | 38 ++++++++++++++++++++++++++++++-
+ src/google/protobuf/message.cc    |  4 +++-
+ 2 files changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/src/google/protobuf/descriptor.cc b/src/google/protobuf/descriptor.cc
+index 5f3427dc7..4dc1333d0 100644
+--- a/src/google/protobuf/descriptor.cc
++++ b/src/google/protobuf/descriptor.cc
+@@ -48,6 +48,10 @@
+ #include <unordered_set>
+ #include <vector>
+ 
++#ifdef __APPLE__
++#include <dlfcn.h>
++#endif
++
+ #include <google/protobuf/stubs/common.h>
+ #include <google/protobuf/stubs/logging.h>
+ #include <google/protobuf/stubs/strutil.h>
+@@ -1983,7 +1987,39 @@ void DescriptorPool::InternalAddGeneratedFile(
+   // Therefore, when we parse one, we have to be very careful to avoid using
+   // any descriptor-based operations, since this might cause infinite recursion
+   // or deadlock.
+-  GOOGLE_CHECK(GeneratedDatabase()->Add(encoded_file_descriptor, size));
++  // Parse the descriptor to get the file name for debugging
++  FileDescriptorProto temp_proto;
++  std::string file_name = "unknown";
++  if (temp_proto.ParseFromArray(encoded_file_descriptor, size)) {
++    file_name = temp_proto.name();
++  }
++  
++  // Get library information using dladdr (macOS/Unix specific)
++  void* caller_addr = __builtin_return_address(0);
++  Dl_info dl_info;
++  std::string library_name = "unknown";
++  if (dladdr(caller_addr, &dl_info) && dl_info.dli_fname) {
++    library_name = dl_info.dli_fname;
++    // Extract just the filename from the full path
++    const char* last_slash = strrchr(dl_info.dli_fname, '/');
++    if (last_slash) {
++      library_name = last_slash + 1;
++    }
++  }
++  
++  // GOOGLE_LOG(INFO) << "Attempting to register protobuf descriptor: " << file_name 
++  //                  << " from library: " << library_name;
++  
++  if (!GeneratedDatabase()->Add(encoded_file_descriptor, size)) {
++    // On macOS, multiple libraries may try to register the same descriptors
++    // due to different dynamic linking behavior. Just log a warning instead of crashing.
++    GOOGLE_LOG(WARNING) << "Failed to add descriptor '" << file_name 
++                        << "' from library '" << library_name 
++                        << "' to GeneratedDatabase - likely already exists";
++  } else {
++    // GOOGLE_LOG(INFO) << "Successfully registered protobuf descriptor: " << file_name 
++    //                  << " from library: " << library_name;
++  }
+ }
+ 
+ 
+diff --git a/src/google/protobuf/message.cc b/src/google/protobuf/message.cc
+index 6cdc6c839..2279ed256 100644
+--- a/src/google/protobuf/message.cc
++++ b/src/google/protobuf/message.cc
+@@ -255,7 +255,9 @@ GeneratedMessageFactory* GeneratedMessageFactory::singleton() {
+ void GeneratedMessageFactory::RegisterFile(
+     const google::protobuf::internal::DescriptorTable* table) {
+   if (!InsertIfNotPresent(&file_map_, table->filename, table)) {
+-    GOOGLE_LOG(FATAL) << "File is already registered: " << table->filename;
++    // On macOS, multiple libraries may try to register the same files
++    // due to different dynamic linking behavior. Just log a warning instead of crashing.
++    GOOGLE_LOG(WARNING) << "File is already registered: " << table->filename;
+   }
+ }
+ 

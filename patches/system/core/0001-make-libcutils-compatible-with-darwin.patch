@@ -1,0 +1,68 @@
+From 7fb038ab7eb8076c8c2a4d593acc034dba7bc030 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Mon, 4 Aug 2025 09:53:26 -0700
+Subject: [PATCH 1/2] make libcutils compatible with darwin
+
+Summary:
+# Motivation:
+libcutils is needed for mac cuttlefish host utils
+
+# Overview:
+- support building libcutils on mac
+
+Test Plan:
+```
+. build/envsetup.sh
+lunch aosp_cf_arm64_phone-userdebug
+m out/host/darwin-x86/cvd-host_package.tar.gz -k &> ~/build.logs.txt
+```
+---
+ libcutils/Android.bp    | 10 ++++++++++
+ libcutils/fs_config.cpp |  6 ++++++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/libcutils/Android.bp b/libcutils/Android.bp
+index ec9b75493..357ddc7f2 100644
+--- a/libcutils/Android.bp
++++ b/libcutils/Android.bp
+@@ -74,6 +74,9 @@ cc_library_headers {
+         windows: {
+             enabled: true,
+         },
++        darwin: {
++            enabled: true,
++        },
+     },
+ }
+ 
+@@ -180,6 +183,13 @@ cc_library {
+             enabled: true,
+             host_ldlibs: ["-lws2_32"],
+         },
++        darwin: {
++            enabled: true,
++            srcs: [
++                "canned_fs_config.cpp",
++                "fs_config.cpp",
++            ],
++        },
+         android: {
+             sanitize: {
+                 misc_undefined: ["integer"],
+diff --git a/libcutils/fs_config.cpp b/libcutils/fs_config.cpp
+index 0d1b7fe12..9bb4367cb 100644
+--- a/libcutils/fs_config.cpp
++++ b/libcutils/fs_config.cpp
+@@ -41,6 +41,12 @@
+ 
+ #include "fs_config.h"
+ 
++#ifdef __APPLE__
++#define CAP_SETUID 7
++#define CAP_SETGID 6
++#define CAP_BLOCK_SUSPEND 36
++#endif
++
+ using android::base::EndsWith;
+ using android::base::StartsWith;
+ 

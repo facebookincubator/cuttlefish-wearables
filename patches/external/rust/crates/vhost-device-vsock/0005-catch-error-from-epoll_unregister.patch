@@ -1,0 +1,69 @@
+From 6cff80afb231de3e721a24009907194c508acbb2 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Tue, 30 Dec 2025 11:13:00 -1000
+Subject: [PATCH 5/6] catch error from epoll_unregister
+
+Summary:
+# Motivation:
+call to epoll_unregister is causing device to be unreachable
+# Overview:
+- remove unwrap
+---
+ src/vhu_vsock_thread.rs | 16 +++++++++++-----
+ 1 file changed, 11 insertions(+), 5 deletions(-)
+
+diff --git a/src/vhu_vsock_thread.rs b/src/vhu_vsock_thread.rs
+index 5764c7f..797cedc 100644
+--- a/src/vhu_vsock_thread.rs
++++ b/src/vhu_vsock_thread.rs
+@@ -400,7 +400,13 @@ impl VhostUserVsockThread {
+ 
+                 // Unregister stream from the epoll, register when connection is
+                 // established with the guest
+-                Self::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap();
++                Self::epoll_unregister(self.epoll_file.as_raw_fd(), fd).unwrap_or_else(|err| {
++                    warn!(
++                        "Could not remove epoll listener for fd {:?}: {:?}",
++                        fd,
++                        err
++                    )
++                });
+ 
+                 // Enqueue a read request
+                 conn.rx_queue.enqueue(RxOps::Rw);
+@@ -698,7 +704,7 @@ impl VhostUserVsockThread {
+                 })
+                 .unwrap();
+         }
+-        
++
+         // If many connections have high buffer utilization, perform aggressive drain
+         if high_buffer_utilization_count > 0 {
+             debug!(
+@@ -715,7 +721,7 @@ impl VhostUserVsockThread {
+     fn aggressive_tx_drain(&mut self) {
+         let mut drained_connections = 0;
+         let mut total_bytes_drained = 0;
+-        
++
+         // Drain all connections with pending TX data
+         for conn in self.thread_backend.conn_map.values_mut() {
+             if !conn.tx_buf.is_empty() {
+@@ -726,7 +732,7 @@ impl VhostUserVsockThread {
+                             conn.rx_queue.enqueue(RxOps::CreditUpdate);
+                             drained_connections += 1;
+                             total_bytes_drained += bytes_drained;
+-                            
++
+                             // Add to RX queue for processing credit update
+                             self.thread_backend.backend_rxq.push_back(
+                                 ConnMapKey::new(conn.local_port, conn.peer_port)
+@@ -739,7 +745,7 @@ impl VhostUserVsockThread {
+                 }
+             }
+         }
+-        
++
+         if total_bytes_drained > 0 {
+             debug!(
+                 "Aggressive TX drain: {} connections, {} bytes drained",

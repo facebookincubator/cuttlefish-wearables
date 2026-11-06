@@ -1,0 +1,126 @@
+From 71baf71e8940f435c8351f0a395bc50808d455e2 Mon Sep 17 00:00:00 2001
+From: Alex Chong <achong@meta.com>
+Date: Fri, 10 Apr 2026 12:50:40 -0700
+Subject: [PATCH 7/7] epoll-kqueue shim: fix EPOLL_CTL_MOD and use
+ edge-triggered mode
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Summary:
+## Problem 1: EPOLL_CTL_MOD leaves stale filters
+
+kqueue uses separate filters for read (`EVFILT_READ`) and write
+(`EVFILT_WRITE`), unlike epoll which has a single event mask per fd.
+The macOS epoll shim implemented `EPOLL_CTL_MOD` as just `EV_ADD`,
+which adds new filters but never removes old ones:
+
+```
+ Linux epoll                      macOS kqueue shim (before fix)
+      |                                    |
+ CTL_ADD(EPOLLIN|EPOLLOUT)         EV_ADD EVFILT_READ
+      |                            EV_ADD EVFILT_WRITE
+      |                                    |
+ CTL_MOD(EPOLLIN)                  EV_ADD EVFILT_READ
+      |                            (EVFILT_WRITE still registered!)
+      |                                    |
+ epoll_wait: only EPOLLIN          kevent: EPOLLIN + spurious EPOLLOUT
+```
+
+This causes spurious EPOLLOUT events for connections that were modified
+to only listen for EPOLLIN, waking up the daemon unnecessarily.
+
+## Fix 1
+
+Delete both `EVFILT_READ` and `EVFILT_WRITE` before re-adding the
+requested filters. Errors from deletion are ignored since the filter
+may not have been previously registered.
+
+## Problem 2: Level-triggered kqueue causes spin loops
+
+Linux epoll is level-triggered by default, and the vsock daemon's code
+relies on this working correctly. However, kqueue's level-triggered
+behavior on listener sockets is more aggressive — it refires
+`EVFILT_READ` on every `kevent()` call while connections are pending
+in the backlog, even if the caller hasn't called `accept()` yet. This
+causes tight spin loops in the daemon's `process_backend_evt` path.
+
+## Fix 2
+
+Use `EV_CLEAR` (kqueue's edge-triggered equivalent) on all filter
+registrations by default. This makes kqueue report each state change
+once, matching the practical behavior that the daemon code expects.
+`EV_CLEAR` was previously only applied when `EPOLLET` was explicitly
+requested, but the daemon never requests it.
+
+Test Plan:
+Rebuilt vhost_device_vsock. Verified daemon no longer spins on startup
+when host proxies connect before vring initialization.
+---
+ crates/epoll/src/macos.rs | 47 ++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 41 insertions(+), 6 deletions(-)
+
+diff --git a/crates/epoll/src/macos.rs b/crates/epoll/src/macos.rs
+index 79e31659..9522d641 100644
+--- a/crates/epoll/src/macos.rs
++++ b/crates/epoll/src/macos.rs
+@@ -163,18 +163,53 @@ pub fn ctl(
+     // Determine base flags based on operation
+     let base_flags: u16 = match op {
+         ControlOptions::EPOLL_CTL_ADD => {
+-            let mut flags = EV_ADD as u16;
++            // Always use EV_CLEAR (edge-triggered) on macOS. Linux epoll is
++            // level-triggered by default, but kqueue level-triggered behavior
++            // on listener sockets causes spin loops because it re-fires on
++            // every kevent() call while connections are pending. EV_CLEAR
++            // makes kqueue report each new event only once, which matches
++            // the expected behavior of the daemon's epoll usage pattern.
++            let mut flags = (EV_ADD | EV_CLEAR) as u16;
+             if event.events & EPOLLONESHOT != 0 {
+                 flags |= EV_ONESHOT as u16;
+             }
+-            if event.events & EPOLLET != 0 {
+-                flags |= EV_CLEAR as u16;
+-            }
+             flags
+         }
+         ControlOptions::EPOLL_CTL_MOD => {
+-            // Modify is similar to add in kqueue
+-            EV_ADD as u16
++            // kqueue has separate filters for read/write, so modifying the
++            // event set requires deleting both existing filters first, then
++            // re-adding only the requested ones. Without this, stale filters
++            // (e.g. EVFILT_WRITE) remain registered and cause spurious events.
++            let del_events = [
++                kevent {
++                    ident: fd as usize,
++                    filter: EVFILT_READ,
++                    flags: EV_DELETE as u16,
++                    fflags: 0,
++                    data: 0,
++                    udata: std::ptr::null_mut(),
++                },
++                kevent {
++                    ident: fd as usize,
++                    filter: EVFILT_WRITE,
++                    flags: EV_DELETE as u16,
++                    fflags: 0,
++                    data: 0,
++                    udata: std::ptr::null_mut(),
++                },
++            ];
++            // Ignore errors — the filter may not have been registered.
++            unsafe {
++                kevent(
++                    epfd,
++                    del_events.as_ptr(),
++                    del_events.len() as i32,
++                    std::ptr::null_mut(),
++                    0,
++                    std::ptr::null(),
++                );
++            }
++            (EV_ADD | EV_CLEAR) as u16
+         }
+         ControlOptions::EPOLL_CTL_DEL => {
+             EV_DELETE as u16

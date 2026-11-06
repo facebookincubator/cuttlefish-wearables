@@ -1,0 +1,346 @@
+From 912df85d11b3d88330630fcaf9dbb9143942fd43 Mon Sep 17 00:00:00 2001
+From: Olya Arkhangelskaia <olja@meta.com>
+Date: Mon, 4 Aug 2025 19:42:25 +0100
+Subject: [PATCH 1/6] vhost-user-vsock implementaion for mac os
+
+Summary: This is the part of adb enabling for cuttlefish on mac os.
+
+Test Plan: m vhost_device_vsock
+---
+ Android.bp              |   3 +-
+ Cargo.toml              |   1 +
+ src/thread_backend.rs   |   9 +-
+ src/vhu_vsock.rs        |   2 +
+ src/vhu_vsock_thread.rs | 188 +++++++++++++++++++++++++++++++++++++++-
+ src/vsock_conn.rs       |   8 ++
+ 6 files changed, 204 insertions(+), 7 deletions(-)
+
+diff --git a/Android.bp b/Android.bp
+index 88882d7..bdd82eb 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -25,7 +25,8 @@ rust_binary_host {
+         "libclap",
+         "libconfig_rust",
+         "libenv_logger",
+-        "libepoll",
++       // "libepoll", - NEEDED for VSOCK but not suppoted on BSD
++        "liblazy_static",
+         "liblog_rust",
+         "libserde",
+         "libserde_yaml",
+diff --git a/Cargo.toml b/Cargo.toml
+index ec90f38..b7d5251 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,6 +17,7 @@ byteorder = "1"
+ clap = { version = "4.4",  features = ["derive"] }
+ env_logger = "0.10"
+ epoll = "4.3.2"
++lazy_static = "1.4"
+ log = "0.4"
+ thiserror = "1.0"
+ vhost = { version = "0.8", features = ["vhost-user-slave"] }
+diff --git a/src/thread_backend.rs b/src/thread_backend.rs
+index 6d5e80e..841f2d0 100644
+--- a/src/thread_backend.rs
++++ b/src/thread_backend.rs
+@@ -23,6 +23,11 @@ use crate::{
+     vhu_vsock_thread::VhostUserVsockThread,
+     vsock_conn::*,
+ };
++#[cfg(target_os = "linux")]
++use epoll;
++
++#[cfg(target_os = "macos")]
++use crate::vhu_vsock_thread::epoll;
+ 
+ pub(crate) type RawPktsQ = VecDeque<RawVsockPacket>;
+ 
+@@ -341,8 +346,8 @@ impl VsockThreadBackend {
+ 
+     /// Enqueue RST packets to be sent to guest.
+     fn enq_rst(&mut self) {
+-        // TODO
+-        dbg!("New guest conn error: Enqueue RST");
++        // TODO: Implement proper RST packet enqueueing
++        warn!("New guest connection failed, should enqueue RST packet");
+     }
+ }
+ 
+diff --git a/src/vhu_vsock.rs b/src/vhu_vsock.rs
+index 207a9b5..6d5ac58 100644
+--- a/src/vhu_vsock.rs
++++ b/src/vhu_vsock.rs
+@@ -236,6 +236,8 @@ pub(crate) struct VhostUserVsockBackend {
+ 
+ impl VhostUserVsockBackend {
+     pub fn new(config: VsockConfig, cid_map: Arc<RwLock<CidMap>>) -> Result<Self> {
++        log::info!("VhostUserVsockBackend::new: Creating backend with guest_cid={}, socket={}, uds_path={}",
++            config.get_guest_cid(), config.get_socket_path(), config.get_uds_path());
+         let thread = Mutex::new(VhostUserVsockThread::new(
+             config.get_uds_path(),
+             config.get_guest_cid(),
+diff --git a/src/vhu_vsock_thread.rs b/src/vhu_vsock_thread.rs
+index 5cce0a8..0d5c97e 100644
+--- a/src/vhu_vsock_thread.rs
++++ b/src/vhu_vsock_thread.rs
+@@ -17,7 +17,7 @@ use std::{
+     thread,
+ };
+ 
+-use log::warn;
++use log::{warn, info};
+ use vhost_user_backend::{VringEpollHandler, VringRwLock, VringT};
+ use virtio_queue::QueueOwnedT;
+ use virtio_vsock::packet::{VsockPacket, PKT_HEADER_SIZE};
+@@ -26,6 +26,178 @@ use vmm_sys_util::{
+     epoll::EventSet,
+     eventfd::{EventFd, EFD_NONBLOCK},
+ };
++#[cfg(target_os = "linux")]
++use epoll;
++
++#[cfg(target_os = "macos")]
++pub mod epoll {
++    use super::*;
++    use std::collections::HashMap;
++    use std::os::unix::io::RawFd;
++    use std::sync::Mutex;
++    use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
++    use log::{debug, warn, error};
++
++    pub struct Events(u32);
++
++    impl Events {
++        pub const EPOLLIN: Events = Events(EventSet::IN.bits());
++        pub const EPOLLOUT: Events = Events(EventSet::OUT.bits());
++
++        pub fn empty() -> Self {
++            Events(0)
++        }
++
++        pub fn bits(&self) -> u32 {
++            self.0
++        }
++
++        pub fn from_bits(bits: u32) -> Option<Self> {
++            Some(Events(bits))
++        }
++    }
++
++    impl std::ops::BitOr for Events {
++        type Output = Self;
++
++        fn bitor(self, rhs: Self) -> Self::Output {
++            Events(self.0 | rhs.0)
++        }
++    }
++
++    #[derive(Clone)]
++    pub struct Event {
++        pub events: u32,
++        pub data: u64,
++    }
++
++    impl Event {
++        pub fn new(events: Events, data: u64) -> Self {
++            Event {
++                events: events.0,
++                data,
++            }
++        }
++    }
++
++    #[derive(Debug)]
++    pub enum ControlOptions {
++        EPOLL_CTL_ADD,
++        EPOLL_CTL_MOD,
++        EPOLL_CTL_DEL,
++    }
++
++    // Thread-safe storage for epoll instances - use Box to avoid moving the Epoll
++    lazy_static::lazy_static! {
++        static ref EPOLL_INSTANCES: Mutex<HashMap<RawFd, Box<Epoll>>> = Mutex::new(HashMap::new());
++    }
++
++    pub fn create(_close_on_exec: bool) -> std::io::Result<RawFd> {
++        debug!("Creating new epoll instance");
++        let epoll = Epoll::new()?;
++        let fd = epoll.as_raw_fd();
++        debug!("Created epoll instance with fd: {}", fd);
++
++        // Store the epoll instance in our global map
++        let mut instances = EPOLL_INSTANCES.lock().unwrap();
++        instances.insert(fd, Box::new(epoll));
++        debug!("Stored epoll instance in global map, total instances: {}", instances.len());
++
++        Ok(fd)
++    }
++
++    pub fn ctl(epoll_fd: RawFd, op: ControlOptions, fd: RawFd, event: Event) -> std::io::Result<()> {
++        debug!("epoll_ctl: epoll_fd={}, op={:?}, fd={}, events={}",
++               epoll_fd, op, fd, event.events);
++
++        let control_op = match op {
++            ControlOptions::EPOLL_CTL_ADD => ControlOperation::Add,
++            ControlOptions::EPOLL_CTL_MOD => ControlOperation::Modify,
++            ControlOptions::EPOLL_CTL_DEL => ControlOperation::Delete,
++        };
++
++        let event_set = EventSet::from_bits(event.events).unwrap_or_else(|| {
++            warn!("Invalid event bits: {}, using empty", event.events);
++            EventSet::empty()
++        });
++        let epoll_event = EpollEvent::new(event_set, event.data);
++
++        let instances = EPOLL_INSTANCES.lock().unwrap();
++        if let Some(epoll) = instances.get(&epoll_fd) {
++            debug!("Found epoll instance for fd: {}", epoll_fd);
++            let result = epoll.ctl(control_op, fd, epoll_event);
++            if let Err(ref e) = result {
++                error!("epoll.ctl failed: {:?}", e);
++            } else {
++                debug!("epoll.ctl succeeded");
++            }
++            result
++        } else {
++            error!("Epoll instance not found for fd: {}, available instances: {:?}",
++                   epoll_fd, instances.keys().collect::<Vec<_>>());
++            Err(std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                format!("Epoll instance not found for fd: {}", epoll_fd)
++            ))
++        }
++    }
++
++    pub fn wait(epoll_fd: RawFd, timeout: i32, events: &mut [Event]) -> std::io::Result<usize> {
++        debug!("epoll_wait: epoll_fd={}, timeout={}, max_events={}",
++               epoll_fd, timeout, events.len());
++
++        let mut epoll_events: Vec<EpollEvent> = vec![EpollEvent::default(); events.len()];
++
++        let instances = EPOLL_INSTANCES.lock().unwrap();
++        let num_events = if let Some(epoll) = instances.get(&epoll_fd) {
++            let result = epoll.wait(timeout, &mut epoll_events);
++            match result {
++                Ok(n) => {
++                    debug!("epoll_wait returned {} events", n);
++                    n
++                }
++                Err(ref e) => {
++                    error!("epoll_wait failed: {:?}", e);
++                    return Err(e.kind().into());
++                }
++            }
++        } else {
++            error!("Epoll instance not found for fd: {} during wait", epoll_fd);
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                format!("Epoll instance not found for fd: {} during wait", epoll_fd)
++            ));
++        };
++
++        for i in 0..num_events {
++            events[i] = Event {
++                events: epoll_events[i].events(),
++                data: epoll_events[i].data(),
++            };
++            debug!("Event {}: events={}, data={}", i, events[i].events, events[i].data);
++        }
++
++        Ok(num_events)
++    }
++
++    pub fn close(epoll_fd: RawFd) {
++        debug!("Closing epoll instance: {}", epoll_fd);
++        let mut instances = EPOLL_INSTANCES.lock().unwrap();
++        if instances.remove(&epoll_fd).is_some() {
++            debug!("Removed epoll instance: {}", epoll_fd);
++        } else {
++            warn!("Attempted to close non-existent epoll instance: {}", epoll_fd);
++        }
++    }
++}
++
++#[derive(Debug, Copy, Clone)]
++pub enum ControlOptions {
++    Add = 1,
++    Delete = 2,
++    Modify = 3,
++}
++
+ 
+ use crate::{
+     rxops::*,
+@@ -92,6 +264,8 @@ impl VhostUserVsockThread {
+         groups: Vec<String>,
+         cid_map: Arc<RwLock<CidMap>>,
+     ) -> Result<Self> {
++        log::info!("VhostUserVsockThread::new: Creating thread with uds_path={}, guest_cid={}, tx_buffer_size={}, groups={:?}",
++            uds_path, guest_cid, tx_buffer_size, groups);
+         // TODO: better error handling, maybe add a param to force the unlink
+         let _ = std::fs::remove_file(uds_path.clone());
+         let host_sock = UnixListener::bind(&uds_path)
+@@ -262,10 +436,14 @@ impl VhostUserVsockThread {
+         'epoll: loop {
+             match epoll::wait(self.epoll_file.as_raw_fd(), 0, epoll_events.as_mut_slice()) {
+                 Ok(ev_cnt) => {
++                    if ev_cnt == 0 {
++                        // No events available, break out of loop
++                        break 'epoll;
++                    }
+                     for evt in epoll_events.iter().take(ev_cnt) {
+                         self.handle_event(
+                             evt.data as RawFd,
+-                            epoll::Events::from_bits(evt.events).unwrap(),
++                            epoll::Events::from_bits(evt.events).unwrap_or(epoll::Events::empty()),
+                         );
+                     }
+                 }
+@@ -273,7 +451,9 @@ impl VhostUserVsockThread {
+                     if e.kind() == io::ErrorKind::Interrupted {
+                         continue;
+                     }
+-                    warn!("failed to consume new epoll event");
++                    warn!("failed to consume new epoll event: {:?}", e);
++                    // Break out of loop to prevent infinite error loop
++                    break 'epoll;
+                 }
+             }
+             break 'epoll;
+@@ -542,7 +722,7 @@ impl VhostUserVsockThread {
+ 
+             let vring = vring.clone();
+             let event_idx = self.event_idx;
+-            self.sender
++             self.sender
+                 .send(EventData {
+                     vring,
+                     event_idx,
+diff --git a/src/vsock_conn.rs b/src/vsock_conn.rs
+index 0a766df..9f13dc8 100644
+--- a/src/vsock_conn.rs
++++ b/src/vsock_conn.rs
+@@ -22,6 +22,12 @@ use crate::{
+     vhu_vsock_thread::VhostUserVsockThread,
+ };
+ 
++#[cfg(target_os = "linux")]
++use epoll;
++
++#[cfg(target_os = "macos")]
++use crate::vhu_vsock_thread::epoll;
++
+ #[derive(Debug)]
+ pub(crate) struct VsockConnection<S> {
+     /// Host-side stream corresponding to this vsock connection.
+@@ -68,6 +74,8 @@ impl<S: AsRawFd + Read + Write> VsockConnection<S> {
+         epoll_fd: RawFd,
+         tx_buffer_size: u32,
+     ) -> Self {
++        log::info!("VsockConnection::new_local_init: Creating connection with local_cid={}, local_port={}, guest_cid={}, guest_port={}, tx_buffer_size={}",
++            local_cid, local_port, guest_cid, guest_port, tx_buffer_size);
+         Self {
+             stream,
+             connect: false,
