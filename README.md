@@ -14,9 +14,7 @@ time. See [CONTRIBUTING.md](CONTRIBUTING.md) for upstream contribution guidance.
   with `--sync` before applying.
 - **`apply-robust.sh`** — uses `git am --3way`; conflicts still need manual review.
 
-The patches were developed against BP2A.250325.001 / Android 16 beta. A source-only
-check found that SwiftShader's first patch fails at `Android.bp:93` on the
-manifest's release tag; that series needs rebasing before the full bundle applies.
+The patches were developed against BP2A.250325.001 / Android 16 beta.
 
 ## Prerequisites
 

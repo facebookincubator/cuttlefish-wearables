@@ -1,4 +1,4 @@
-From 20a6f37e4990caaae96c286e1176bda2542582ae Mon Sep 17 00:00:00 2001
+From 0aef422f5e97062f6c4dcfd85c6744bb323a2e0e Mon Sep 17 00:00:00 2001
 From: Tom Care <tcare@meta.com>
 Date: Fri, 11 Jul 2025 14:51:00 -0700
 Subject: [PATCH 1/2] Swiftshader darwin fixes
@@ -22,7 +22,7 @@ Differential Revision: https://phabricator.intern.facebook.com/D78192203
  2 files changed, 14 insertions(+), 3 deletions(-)
 
 diff --git a/Android.bp b/Android.bp
-index e7bbb302f..75d347682 100644
+index 99be59483..3045b4f40 100644
 --- a/Android.bp
 +++ b/Android.bp
 @@ -93,9 +93,9 @@ cc_defaults {
@@ -36,7 +36,7 @@ index e7bbb302f..75d347682 100644
 +            enabled: true,
          },
      },
-     sdclang: false,
+ }
 diff --git a/third_party/llvm-16.0/Android.bp b/third_party/llvm-16.0/Android.bp
 index 35ab101f5..61a0d3b61 100644
 --- a/third_party/llvm-16.0/Android.bp
